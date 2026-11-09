@@ -55,6 +55,8 @@ blake2 = "0.10"
 blake3 = "1"
 dirs = "6"
 chrono = { version = "0.4.35", default-features = false, features = ["clock"] }
+wry = "0.57"
+tao = "0.37"
 
 [profile.dev]
 opt-level = 1

@@ -472,6 +472,19 @@ impl AccountUi {
         self.check_session();
     }
 
+    /// Sign in on roblox.com's own login page in a window (login_window.rs);
+    /// the cookie it ends with is added like a pasted one.
+    fn browser_sign_in(&mut self) {
+        self.add_error = None;
+        self.adding_pending = true;
+        self.state = SessionState::Checking(None);
+        self.connect("Signing in with Roblox", true, |cfg| match crate::login_window::sign_in() {
+            Ok(Some(raw)) => Client::sign_in_with(cfg, &raw),
+            Ok(None) => Err(SignedOut::Rejected("the sign-in window was closed".into())),
+            Err(e) => Err(SignedOut::Rejected(format!("couldn't open the sign-in window: {e}"))),
+        });
+    }
+
     /// Signs the active account out and forgets it on this computer; other
     /// saved accounts stay for switching.
     pub fn sign_out(&mut self) {
@@ -688,6 +701,7 @@ impl Editor {
             Remove(u64),
             SignOut,
             Retry,
+            BrowserSignIn,
         }
         let mut todo: Option<Do> = None;
         let a = &mut self.account;
@@ -767,6 +781,16 @@ impl Editor {
                 if let Some(e) = &a.add_error {
                     ui.add_space(6.0);
                     ui.label(RichText::new(e).size(12.0).color(theme::ERROR));
+                }
+                ui.separator();
+                let login_button = ui.add_enabled(
+                    !a.busy(),
+                    egui::Button::new(RichText::new("Sign in with Roblox").color(egui::Color32::WHITE))
+                        .fill(theme::ACCENT),
+                );
+                ui.label(RichText::new("Opens Roblox's login page in a window").size(11.5).color(theme::TEXT_DIM));
+                if login_button.clicked() {
+                    todo = Some(Do::BrowserSignIn);
                 }
                 ui.add_space(10.0);
                 let mut go = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -895,6 +919,7 @@ impl Editor {
             }
             Some(Do::SignOut) => a.sign_out(),
             Some(Do::Retry) => a.sign_in(),
+            Some(Do::BrowserSignIn) => a.browser_sign_in(),
             None => {}
         }
     }

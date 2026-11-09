@@ -40,7 +40,10 @@ quite yet.
 
 ## Install
 
-You need a Rust toolchain (1.85+) and a GPU with Vulkan (or OpenGL).
+You need a Rust toolchain (1.85+) and a GPU with Vulkan (or OpenGL). On
+Linux, the sign-in window also needs WebKitGTK 4.1 (`webkit2gtk-4.1` on Arch,
+`libwebkit2gtk-4.1-dev` on Debian/Ubuntu); Windows uses the WebView2 runtime
+it already has.
 
 ```sh
 git clone https://github.com/rippelz/rustudio
@@ -92,7 +95,8 @@ Windows is new, so a few things don't work there yet:
 
 Everything above works signed out. To open your own places or load private
 assets, sign in with your Roblox session: use the account button at the top
-right, or put the `.ROBLOSECURITY` cookie in `~/.config/rustudio/roblox-cookie`
+right and **Sign in with Roblox** (Roblox's own login page, in a window), paste
+the `.ROBLOSECURITY` cookie there, or put it in `~/.config/rustudio/roblox-cookie`
 (`chmod 600`). rustudio stores it in your login keyring. Details are in
 [docs/AUTH.md](docs/AUTH.md).
 

@@ -1,6 +1,7 @@
 //! rustudio: a native Linux editor for Roblox place and model files.
 
 mod account_ui;
+mod login_window;
 mod ribbon_quick;
 mod cmeta;
 mod studio_content;
@@ -297,6 +298,10 @@ fn main() -> eframe::Result<()> {
     restore_parent_fds();
     // First: a panic or fatal signal from here on leaves a report.
     crash::install();
+    // `--roblox-login`: the sign-in window (login_window.rs), then exit.
+    if std::env::args().any(|a| a == "--roblox-login") {
+        login_window::run();
+    }
     // RUSTUDIO_CRASH_TEST=panic|segv|thread: check the reports themselves.
     match std::env::var("RUSTUDIO_CRASH_TEST").as_deref() {
         Ok("panic") => panic!("RUSTUDIO_CRASH_TEST panic"),
