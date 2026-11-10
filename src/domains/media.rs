@@ -436,13 +436,18 @@ fn decode(id: &str, bytes: Arc<Vec<u8>>) -> Got {
 }
 
 fn start_load(id: &str) -> Got {
+    // Audio is script-readable through GetWaveformAsync and AudioAnalyzer.
+    // Check before the PCM cache too: cached data must not bypass policy.
+    if !crate::assets::script_content_allowed(id) {
+        return Got::Failed("Local filesystem audio is not available to scripts".into());
+    }
     if let Some(p) = pcm_cached(id) {
         return Got::Ready(p);
     }
-    if let Some(path) = crate::assets::resolve(id, None) {
-        return match std::fs::read(&path) {
-            Ok(b) => decode(id, Arc::new(b)),
-            Err(e) => Got::Failed(format!("{}: {e}", path.display())),
+    if crate::assets::asset_ref(id).is_none() {
+        return match crate::assets::script_content_blocking(id) {
+            Ok(bytes) => decode(id, bytes),
+            Err(e) => Got::Failed(e),
         };
     }
     match crate::assets::asset_ref(id) {
@@ -2089,6 +2094,20 @@ mod curve_tests {
     use super::*;
 
     /// Byte-for-byte what Studio saved (curves.rbxlx, 2026-11-08).
+    #[test]
+    fn local_audio_is_denied_even_if_pcm_is_cached() {
+        let path = std::env::temp_dir().join(format!("rustudio-private-audio-{}.wav", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        let ids = [format!("file://{path}"), path];
+        for id in ids {
+            // Simulate decoded audio already cached by another engine path.
+            pcm_store(&id, Arc::new(Pcm { rate: 8000, chans: vec![vec![0.25, -0.25]] }));
+            let denied = matches!(start_load(&id), Got::Failed(_));
+            PCM.lock().unwrap().as_mut().unwrap().remove(&id);
+            assert!(denied, "local audio cache bypass: {id}");
+        }
+    }
+
     #[test]
     fn curve_encoding_matches_studio() {
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();

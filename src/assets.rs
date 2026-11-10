@@ -26,13 +26,6 @@ static CONTENT_STATUS: std::sync::LazyLock<Mutex<HashMap<String, u8>>> = std::sy
 fn content_key(id: &str) -> String {
     match asset_ref(id) { Some(a) => format!("rbxassetid://{}{}",a.id,a.version.map(|v|format!("?version={v}")).unwrap_or_default()), None => id.to_string() }
 }
-/// Counts every change of a content status: who polls statuses (the
-/// AssetFetchStatus signals, domains/assets_cloud.rs) looks again only when
-/// this moved.
-static CONTENT_STATUS_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-pub fn content_status_generation() -> u64 {
-    CONTENT_STATUS_GEN.load(std::sync::atomic::Ordering::Relaxed)
-}
 pub fn content_fetch_status(id: &str) -> u8 {
     if id.is_empty() {return 3}
     CONTENT_STATUS.lock().ok().and_then(|s|s.get(&content_key(id)).copied()).unwrap_or(0)
@@ -48,9 +41,6 @@ pub fn content_failures_since(cursor: u64) -> (u64,Vec<String>) {
 pub fn content_track(id: &str, status: u8) {
     if let Ok(mut s)=CONTENT_STATUS.lock(){
         let old=s.insert(content_key(id),status);
-        if old!=Some(status) {
-            CONTENT_STATUS_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         if status==3 && old!=Some(3) && asset_ref(id).is_some() {
             let mut f=CONTENT_FAILURES.lock().unwrap_or_else(|e|e.into_inner());
             f.0+=1;let seq=f.0;f.1.push((seq,id.to_string()));
@@ -484,6 +474,16 @@ pub fn content_blocking(id: &str) -> Result<Arc<Vec<u8>>, String> {
     content_tracked(id, true)
 }
 
+/// Content that a place may load or render: generated assets, Roblox asset
+/// IDs, and files inside the built-in content namespace. Raw filesystem paths
+/// are editor inputs, not place-controlled content IDs. This follows the same
+/// policy as script_content_blocking, including before cache lookups.
+pub fn script_content_allowed(id: &str) -> bool {
+    generated(id).is_some()
+        || asset_ref(id).is_some()
+        || (id.trim().starts_with("rbxasset://") && resolve(id, None).is_some())
+}
+
 /// [`content_blocking`] for a running script that gets back what it loads
 /// (EditableImage pixels, EditableMesh vertices, video frames): Roblox content
 /// only. `file://` and plain paths would let a place's scripts read the
@@ -762,6 +762,12 @@ impl AssetStore {
         result
     }
     fn content_inner(&mut self, id: &str, doc_dir: Option<&Path>) -> Fetch {
+        // Rendered assets can be read back through CaptureService. Enforce
+        // the script content boundary here, including nested Decal textures,
+        // rather than laundering local file pixels into generated captures.
+        if !script_content_allowed(id) {
+            return Fetch::Unavailable("Local filesystem content is not available to places".into());
+        }
         if let Some(b) = generated(id) {
             return Fetch::Ready(b);
         }
@@ -1428,6 +1434,34 @@ mod tests {
         assert_eq!(id("rbxasset://fonts/clonewand.mesh"), Some(12221344));
         // Old models spell the query `?ID=`.
         assert_eq!(id("http://www.roblox.com/asset/?ID=94746105"), Some(94746105));
+    }
+
+    #[test]
+    fn rendered_content_rejects_local_files_but_keeps_generated_images() {
+        let dir = std::env::temp_dir().join(format!("rustudio-render-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("private.png");
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1, 1, image::Rgba([12, 34, 56, 255]),
+        )).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let bytes = png.into_inner();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut store = AssetStore::default();
+        for id in [format!("file://{}", path.display()), path.display().to_string(), "private.png".into()] {
+            assert!(matches!(store.content(&id, Some(&dir)), Fetch::Unavailable(_)), "{id}");
+        }
+        // Capture PNGs and other engine-generated images remain readable.
+        let id = "rbxtemp://rustudio/test-render-policy.png";
+        register_generated(id, bytes.clone());
+        let rendered = matches!(store.content(id, None), Fetch::Ready(b) if *b == bytes);
+        let readable = script_content_blocking(id).is_ok();
+        unregister_generated(id);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(rendered && readable);
+        assert!(script_content_allowed("rbxassetid://12345"));
+        assert!(script_content_allowed("rbxasset://textures/white.png"));
+        assert!(!script_content_allowed("rbxasset://../private.png"));
     }
 
     #[test]
