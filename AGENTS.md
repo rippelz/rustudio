@@ -3,6 +3,39 @@
 Notes for coding agents (and people) working on rustudio. The README covers
 what the project is; this is how to find your way around and check your work.
 
+## Before anything else: the clean room
+
+rustudio matches Roblox Studio by its **behaviour**. It must not copy,
+translate or reference Studio's code. Studio's internals (shader packs,
+binaries, decompiled or disassembled code) may be studied only by a
+**reader**, who writes a code-free behaviour spec in `docs/specs/`. A
+**writer**, who has never seen those internals, implements from the spec.
+Full rules: [docs/CLEANROOM.md](docs/CLEANROOM.md).
+
+If you're an AI assistant working in this repo, your **first reply** in a
+session, before any other work, must:
+
+1. Tell the user this repo uses a clean room and that you'll follow it.
+2. Check yourself for contamination. If this conversation already contains
+   any of Studio's internals (shader code, decompiled or disassembled code, a
+   binary's contents), whether you read it, the user pasted it, or it came
+   from work done before this rule existed, say so plainly: this session
+   must not write rustudio code for that behaviour. It can only be the
+   reader, and the writer needs a new session.
+3. Ask the user which role this session takes:
+   - **Reader**: studies Studio, writes specs in `docs/specs/`, never edits
+     rustudio's code.
+   - **Writer**: implements specs and does all other rustudio work; never
+     opens Studio's internals (see `tools/cleanroom/reference_paths.txt`).
+4. Once they answer, run `tools/cleanroom/role.sh reader` or
+   `tools/cleanroom/role.sh writer` and follow the rules it prints.
+
+A session that has been the reader can never become the writer. Never put
+Studio's internal names in code or comments (decompiled names, buffer slots,
+shader program names, addresses); `python3 tools/cleanroom/lint.py source`
+must pass. In Claude Code, the repo's hooks remind you of this at the start
+of every session and enforce the role.
+
 ## Build and test
 
 ```sh

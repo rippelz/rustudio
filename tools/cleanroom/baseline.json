@@ -1,0 +1,22 @@
+{
+ "crates/rustudio-account/src/avatar.rs|disassembly-name": 1,
+ "src/avatar.rs|disassembly-name": 1,
+ "src/effects.rs|shader-program": 10,
+ "src/lightgrid.rs|disassembly-name": 18,
+ "src/lightgrid.rs|shader-program": 1,
+ "src/lighting.rs|shader-program": 3,
+ "src/matpack.rs|shader-program": 1,
+ "src/mech.rs|constant-buffer": 6,
+ "src/mech.rs|shader-program": 14,
+ "src/mech.rs|shader-varying": 1,
+ "src/render.rs|constant-buffer": 1,
+ "src/render.rs|shader-program": 4,
+ "src/scene.rs|disassembly-name": 1,
+ "src/scene.rs|shader-program": 2,
+ "src/selftest/material.rs|shader-program": 2,
+ "src/shader.wgsl|constant-buffer": 5,
+ "src/shader.wgsl|decompiled-temp": 4,
+ "src/shader.wgsl|shader-program": 27,
+ "src/shader.wgsl|shader-varying": 3,
+ "src/world_gui.rs|shader-program": 10
+}

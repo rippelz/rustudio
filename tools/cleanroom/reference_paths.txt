@@ -1,0 +1,19 @@
+# Studio internals the clean-room WRITER must never open (docs/CLEANROOM.md).
+# One Python regex per line, matched (case-insensitively) against absolute file
+# paths and against Bash command text. Add the places your own Studio install
+# or dumps live; keep entries generic enough to be shared.
+
+# Studio's shader packs and binaries
+shaders_[^/\\]*\.pack
+\.pack\b
+RobloxStudio[^/\\]*\.(exe|dll)
+(^|[/\\])Roblox[/\\]Versions([/\\]|$)
+(^|[/\\])Roblox Studio([/\\]|$)
+# Studio installs managed by Linux launchers (Vinegar, roblox-studio-wine, Grapejuice)
+vinegar[/\\]versions([/\\]|$)
+roblox-studio-wine([/\\]|$)
+grapejuice([/\\]|$)
+# Decompiler / disassembler output and projects
+\.(gpr|rep|i64|idb|bndb)\b
+(^|[/\\])cleanroom-reference([/\\]|$)
+# A reader's notes and dumps go in cleanroom-reference/ (gitignored)

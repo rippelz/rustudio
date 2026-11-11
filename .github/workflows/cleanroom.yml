@@ -1,0 +1,26 @@
+name: Clean-room
+
+# Runs on every change, docs included (specs live in docs/specs/).
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Lint and hook tests
+        run: python3 tools/cleanroom/test_cleanroom.py
+      - name: Specs carry no code or Studio internals
+        run: python3 tools/cleanroom/lint.py spec
+      - name: Source adds no new references to Studio internals
+        run: python3 tools/cleanroom/lint.py source
+      - name: Tainted code is marked, documented and indexed
+        run: python3 tools/cleanroom/taint.py check
+      - name: The taint register doesn't leak Studio internals
+        run: python3 tools/cleanroom/lint.py taint

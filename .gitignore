@@ -1,3 +1,8 @@
 target/
 shots/
 __pycache__/
+
+# clean-room readers keep Studio dumps and notes here (docs/CLEANROOM.md)
+cleanroom-reference/
+.claude/settings.local.json
+.claude/cleanroom-state/

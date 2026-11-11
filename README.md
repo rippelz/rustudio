@@ -141,6 +141,15 @@ rustudio stores it in your login keyring (the Keychain on macOS). Details are in
 - [docs/ENGINE-GAPS.md](docs/ENGINE-GAPS.md): engine API that's still missing
 - [docs/TEAMCREATE.md](docs/TEAMCREATE.md): Team Create
 
+## Contributing: the clean room
+
+rustudio matches Studio by behaviour and never copies its code. If a change
+needs knowledge of Studio's internals (shaders, binaries, decompiled code),
+one person or AI session studies them and writes a code-free spec in
+`docs/specs/`, and a different one, who never saw them, implements it. See
+[docs/CLEANROOM.md](docs/CLEANROOM.md). AI assistants are told this in
+[AGENTS.md](AGENTS.md); in Claude Code it's enforced.
+
 ## Not affiliated with Roblox
 
 rustudio is an independent project. It is not made, endorsed or supported
