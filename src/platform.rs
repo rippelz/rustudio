@@ -44,6 +44,27 @@ pub fn load_average() -> String {
     "?".into()
 }
 
+/// Whether `a` and `b` name the same file or folder: on a case-insensitive
+/// disk (macOS and Windows by default) "Foo.luau" and "foo.luau" do.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows' canonical form is the name as stored on disk.
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    }
+}
+
 /// Moves `path` to the desktop's own trash where rustudio uses it (macOS:
 /// the Finder Trash, so Put Back works; Windows: the Recycle Bin, so Restore
 /// works). None where the caller keeps the XDG trash itself

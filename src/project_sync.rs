@@ -577,6 +577,37 @@ mod tests {
         doc.rename(a, "A2");
         st.write_back(&mut doc);
         assert!(dir.join("src/Server/A2.server.luau").is_file() && !dir.join("src/Server/A.server.luau").exists());
+        // A rename that only changes case → the file follows too, also on a
+        // case-insensitive disk (macOS, Windows), where the new name already
+        // "exists" because it is the old file.
+        let listed = |d: &str| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir.join(d))
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        doc.rename(a, "a2");
+        st.write_back(&mut doc);
+        let names = listed("src/Server");
+        assert!(names.contains(&"a2.server.luau".to_string()) && !names.contains(&"A2.server.luau".to_string()), "{names:?}");
+        doc.rename(a, "A2");
+        st.write_back(&mut doc);
+        // A new script whose file name is taken (a same-named sibling) gets
+        // C_2.client.luau, and keeps its own name on re-opening.
+        let c2 = doc.insert(server, InstanceBuilder::new("LocalScript").with_name("C").with_property("Source", "-- c2\n".to_string()));
+        st.write_back(&mut doc);
+        assert_eq!(std::fs::read_to_string(dir.join("src/Server/C_2.client.luau")).unwrap(), "-- c2\n");
+        {
+            let (doc2, _) = open(&dir.join("default.project.json")).unwrap();
+            let server2 = named(&doc2, named(&doc2, doc2.dom.root_ref(), "ServerScriptService").unwrap(), "Server").unwrap();
+            let names: Vec<String> = doc2.dom.get_by_ref(server2).unwrap().children().iter().map(|c| doc2.dom.get_by_ref(*c).unwrap().name.clone()).collect();
+            assert!(!names.iter().any(|n| n == "C_2"), "{names:?}");
+        }
+        doc.remove(&[c2]);
+        st.write_back(&mut doc);
         // A property → its .meta.json.
         doc.set_props("t", vec![(a, ustr("Disabled"), Variant::Bool(true))], None);
         st.write_back(&mut doc);

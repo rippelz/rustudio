@@ -539,6 +539,9 @@ impl ProjectState {
         let (safe, renamed) = file_safe(&inst.name);
         let has_kids = !inst.children().is_empty();
         let lua = self.uses_lua_extension(dir);
+        // A free file name, and whether it had to differ from the instance's
+        // (a same-named sibling, or one differing only in case on a
+        // case-insensitive disk): then originalName keeps the real name.
         let free = |base: String, ext: &str| {
             let mut name = format!("{base}{ext}");
             let mut i = 2;
@@ -546,7 +549,7 @@ impl ProjectState {
                 name = format!("{base}_{i}{ext}");
                 i += 1;
             }
-            dir.join(name)
+            (dir.join(name), renamed || i > 2)
         };
         // A Script with RunContext Client is a .client file (Rojo's
         // emitLegacyScripts = false reads it back that way).
@@ -561,7 +564,7 @@ impl ProjectState {
         };
         if let Some(kind) = kind {
             if has_kids {
-                let d = free(safe.clone(), "");
+                let (d, renamed) = free(safe.clone(), "");
                 let init = d.join(format!("init{}", suffix_of(kind, lua)));
                 let data = d.join("init.meta.json");
                 self.mapped.push(d.clone());
@@ -574,7 +577,7 @@ impl ProjectState {
                     self.create_files(doc, c, &d);
                 }
             } else {
-                let f = free(safe.clone(), suffix_of(kind, lua));
+                let (f, renamed) = free(safe.clone(), suffix_of(kind, lua));
                 let data = data_path_for_file(&f, &project::classify(project::name_of(&f)).map(|x| x.0).unwrap_or(safe));
                 self.mapped.push(f.clone());
                 self.mapped.push(data.clone());
@@ -585,7 +588,7 @@ impl ProjectState {
                 }
             }
         } else if class == "Folder" {
-            let d = free(safe, "");
+            let (d, renamed) = free(safe, "");
             let data = d.join("init.meta.json");
             self.mapped.push(d.clone());
             let _ = std::fs::create_dir_all(&d);
@@ -598,7 +601,7 @@ impl ProjectState {
                 self.create_files(doc, c, &d);
             }
         } else {
-            let f = free(safe.clone(), ".model.json");
+            let (f, renamed) = free(safe.clone(), ".model.json");
             let data = data_path_for_file(&f, &safe);
             self.mapped.push(f.clone());
             self.map.insert(r, Origin::Model { file: f.clone(), kind: FileKind::JsonModel, data });
@@ -653,7 +656,9 @@ impl ProjectState {
             Origin::Dir { dir, .. } => (dir.clone(), dir.with_file_name(&safe)),
             _ => return,
         };
-        if from == to || to.exists() || !self.writable(&from) || !self.writable(&to.parent().unwrap_or(Path::new("/")).join("")) {
+        // A case-only rename finds `to` already there on a case-insensitive
+        // disk: it is the same file, and renaming it changes the case.
+        if from == to || (to.exists() && !crate::platform::same_file(&from, &to)) || !self.writable(&from) || !self.writable(&to.parent().unwrap_or(Path::new("/")).join("")) {
             return;
         }
         if std::fs::rename(&from, &to).is_err() {
