@@ -106,6 +106,10 @@ pub struct Layout {
     pub snap_rotate: Option<bool>,
     pub rotate_inc: Option<f32>,
     pub local_space: Option<bool>,
+    pub clear_on_pie: Option<bool>,
+    pub show_context: Option<bool>,
+    pub show_timestamp: Option<bool>,
+    pub show_source: Option<bool>,
 }
 
 fn path() -> PathBuf {
@@ -220,6 +224,10 @@ impl Layout {
         if let Some(v) = self.snap_rotate { ed.snap_rotate = v; }
         if let Some(v) = self.rotate_inc.and_then(finite).filter(|v| *v > 0.0) { ed.rotate_inc = v; }
         if let Some(v) = self.local_space { ed.local_space = v; }
+        if let Some(v) = self.clear_on_pie { ed.output_view.clear_on_pie = v; }
+        if let Some(v) = self.show_timestamp { ed.output_view.show_timestamp = v; }
+        if let Some(v) = self.show_context { ed.output_view.show_context = v; }
+        if let Some(v) = self.show_source { ed.output_view.show_source = v; }
     }
 
     /// Size, position and maximized state for the window about to open.
@@ -364,6 +372,7 @@ impl Saver {
             popped: saved_popped(panels),
             homes: panels.homes.clone(),
             zoom: Some(ed.ui.zoom),
+            clear_on_pie: Some(ed.output_view.clear_on_pie),
             ribbon_tab: Some(format!("{:?}", ed.ui.tab)),
             run_type: Some(format!("{:?}", ed.ui.run_type)),
             show_grid: Some(ed.show_grid),
@@ -374,6 +383,9 @@ impl Saver {
             snap_rotate: Some(ed.snap_rotate),
             rotate_inc: Some(ed.rotate_inc),
             local_space: Some(ed.local_space),
+            show_context: Some(ed.output_view.show_context),
+            show_timestamp: Some(ed.output_view.show_timestamp),
+            show_source: Some(ed.output_view.show_source),
         };
         serde_json::to_string_pretty(&layout).unwrap_or_default()
     }

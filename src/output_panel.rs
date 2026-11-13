@@ -217,6 +217,7 @@ pub struct OutputState {
     pub show_timestamp: bool,
     pub show_context: bool,
     pub show_source: bool,
+    pub clear_on_pie: bool,
     pub sel: OutputSelection,
 }
 
@@ -246,6 +247,7 @@ impl Default for OutputState {
             show_timestamp: false,
             show_context: false,
             show_source: true,
+            clear_on_pie: false,
             sel: OutputSelection::default(),
         }
     }
@@ -333,15 +335,19 @@ impl Editor {
                     }
                 });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let more = ui.add(egui::Button::new("⋯").min_size(Vec2::new(24.0, 20.0)));
-                egui::Popup::menu(&more).show(|ui| {
+                let more = ui.add(egui::Button::new(String::default()).min_size(Vec2::new(24.0, 20.0))).on_hover_text("Output Settings");
+                crate::ti::paint(ui.painter(), more.rect.shrink(2.0), "settings", theme::TEXT);
+
+                egui::Popup::menu(&more).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                     ui.checkbox(&mut st.show_timestamp, "Show Timestamp");
                     ui.checkbox(&mut st.show_context, "Show Context");
                     ui.checkbox(&mut st.show_source, "Show Source");
+                    ui.checkbox(&mut st.clear_on_pie, "Clear On Play");
                 });
-                let (r, clear) = ui.allocate_exact_size(Vec2::new(24.0, 20.0), Sense::click());
-                crate::ti::paint(ui.painter(), r.shrink(2.0), "clear-all", theme::TEXT);
-                if clear.on_hover_text("Clear Output").clicked() {
+
+                let clear_output = ui.add(egui::Button::new(String::default()).min_size(Vec2::new(24.0, 20.0))).on_hover_text("Clear Output");
+                crate::ti::paint(ui.painter(), clear_output.rect.shrink(2.0), "trash", theme::TEXT);
+                if clear_output.clicked() {
                     self.log.clear();
                     st.log_cleared();
                 }

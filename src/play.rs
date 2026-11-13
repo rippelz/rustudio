@@ -443,6 +443,11 @@ impl Editor {
         if self.defer_play_until_loaded(mode) {
             return;
         }
+        // Output's "Clear On Play": start the session with an empty log.
+        if self.output_view.clear_on_pie {
+            self.log.clear();
+            self.output_view.log_cleared();
+        }
         // The local player is the signed-in account (identity and avatar),
         // as in Studio: a session check still running at Play is waited for.
         if mode == RunMode::Play {
