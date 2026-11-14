@@ -1898,22 +1898,24 @@ mod tests {
 
     #[test]
     fn marked_place_folder_is_play_content() {
-        let root = std::env::temp_dir().join(format!("rs-local-content-{}", std::process::id()));
+        // canonicalize: macOS temp dirs sit behind the /var → /private/var link.
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!("rs-local-content-{}", std::process::id()));
         let marked = root.join("marked");
         let plain = root.join("plain");
         std::fs::create_dir_all(marked.join("meshes")).unwrap();
         std::fs::create_dir_all(&plain).unwrap();
         std::fs::write(marked.join(LOCAL_CONTENT_MARKER), "").unwrap();
-        std::fs::write(marked.join("meshes/a.obj"), "v 0 0 0").unwrap();
+        // Not meshes/a.obj: place_content_policy runs in parallel and checks that name.
+        std::fs::write(marked.join("meshes/marked-a.obj"), "v 0 0 0").unwrap();
         std::fs::write(plain.join("b.obj"), "v 0 0 0").unwrap();
         std::fs::write(marked.join("level.rbxlx"), "").unwrap();
         std::fs::write(plain.join("other.rbxlx"), "").unwrap();
         note_opened_place(&marked.join("level.rbxlx"));
         note_opened_place(&plain.join("other.rbxlx"));
-        assert!(place_content_allowed("meshes/a.obj", true));
-        let abs = format!("file://{}", marked.join("meshes/a.obj").display());
+        assert!(place_content_allowed("meshes/marked-a.obj", true));
+        let abs = format!("file://{}", marked.join("meshes/marked-a.obj").display());
         assert!(place_content_allowed(&abs, true));
-        assert_eq!(resolve("meshes/a.obj", None), Some(marked.join("meshes/a.obj")));
+        assert_eq!(resolve("meshes/marked-a.obj", None), Some(marked.join("meshes/marked-a.obj")));
         // Unmarked folders, and escapes out of a marked one, stay blocked.
         assert!(!place_content_allowed(&format!("file://{}", plain.join("b.obj").display()), true)
             || local_content_opt_in());
