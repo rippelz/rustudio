@@ -40,6 +40,8 @@ pub mod anim_types;
 pub mod anim_tween;
 #[path = "anim_tracks.rs"]
 pub mod anim_tracks;
+#[path = "anim_retarget.rs"]
+pub mod anim_retarget;
 
 /// Native steps queued among the frame's RunService events
 /// (`Runtime::fire`), run at their place in the signal queue: Studio steps

@@ -437,6 +437,8 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Resu
                     scales.set("width", l.scales.width)?;
                     scales.set("depth", l.scales.depth)?;
                     scales.set("head", l.scales.head)?;
+                    scales.set("bodyType", l.scales.body_type)?;
+                    scales.set("proportion", l.scales.proportion)?;
                     t.set("playerAvatarType", if l.r15 { "R15" } else { "R6" })?;
                 }
                 None => {

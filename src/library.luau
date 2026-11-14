@@ -29,16 +29,32 @@ function printidentity(prefix) print((prefix or "Current identity is") .. " " ..
 function LoadLibrary(name)
     error("LoadLibrary is no longer available in Roblox ('" .. tostring(name) .. "' can't be loaded)", 2)
 end
-local function settings_table()
-    local mt = {}
-    mt.__index = function(t, k)
-        local v = setmetatable({}, mt)
-        rawset(t, k, v)
-        return v
+-- settings(): Studio's GlobalSettings ("Global Settings") and its items,
+-- Instances as in Studio (Vinegar 0.747: GetChildren in this order). The
+-- Studio Settings dialog's members (Studio, Physics, Rendering, Network,
+-- Diagnostics) read and write src/studio_settings.rs's store through
+-- src/domains/services.rs. Made on first use, as UserSettings.
+local SETTINGS_ITEMS = {
+    {"GameSettings", "Game Options"}, {"LuaSettings", "Lua"}, {"DebugSettings", "Diagnostics"},
+    {"PhysicsSettings", "Physics"}, {"Studio", "Studio"}, {"NetworkSettings", "Network"},
+    {"RenderSettings", "Rendering"}, {"TaskScheduler", "Task Scheduler"},
+}
+local global_settings
+local function make_settings()
+    if global_settings ~= nil and not pcall(function() return global_settings.Name end) then
+        global_settings = nil
     end
-    return setmetatable({}, mt)
+    if global_settings == nil then
+        global_settings = create("GlobalSettings")
+        global_settings.Name = "Global Settings"
+        for _, it in SETTINGS_ITEMS do
+            local o = create(it[1])
+            o.Name = it[2]
+            o.Parent = global_settings
+        end
+    end
+    return global_settings
 end
-local the_settings = settings_table()
 local function fake_signal()
     return { Connect = function() return { Disconnect = function() end, Connected = true } end, Wait = function() return task.wait() end }
 end
@@ -136,26 +152,43 @@ local user_features = {
     UserNavigationClickToMoveSkipPassedWaypoints = true, UserNewPoppercam4 = true, UserNoMoreKeyboardPan = true,
     UserNoUpdateOnLoop = true, UserPointerActionsInPlayerScripts = false, UserPoppercamLooseOpacityThreshold = true,
     UserTheMovementModeInquisition = true, UserThirdGamepadZoomStep = true, UserTouchSensitivityAdjust = true,
+    -- Studio 0.747 (Vinegar, 2026-11-12: checks/humanoid-physics/feel), the
+    -- flags its StarterPlayer.PlayerModule and Animate ask for.
+    UserAbilitiesUserInterfaceA = true, UserAbilitiesUserInterfaceB = true, UserAbilitiesUserInterfaceC = false,
+    UserCCLNoSwimAnimationsFix = true, UserControlModuleDisabledUpdate = false, UserDisableForceLocalHumanoidPrediction = true,
+    UserDoubleJumpButtonFix = true, UserNavigationClickToMoveNoDirectPath = true, UserPSIASClickToMoveRelaxTeleport = true,
+    UserPSUseBindToAnimation = true, UserPlayerScriptsBindActivateOnIAS = true, UserPlayerScriptsCCLIntegrationD = true,
+    UserPlayerScriptsCCLIntegrationDGA = false, UserPlayerScriptsClassicThumbstickRenameUI = true,
+    UserPlayerScriptsFixSAuthRenderStepMove = true, UserPlayerScriptsFixTouchJumpVisibility = true,
+    UserPlayerScriptsImportWaitForAbilitiesFolder = false, UserPlayerScriptsPlayerControlState2 = true,
+    UserPlayerScriptsPlayerControlState2GA = false, UserPlayerScriptsRefactor1 = true, UserPlayerScriptsRefactor2 = true,
+    UserPlayerScriptsResetDTTouchOnCreate = true, UserPlayerScriptsTaskDeferSimulation = true,
+    UserServerAuthorityDontSetAutoRotate = true, UserVRFixCameraCloseArticulation = true,
+    UserVRSkipOcclusionInFirstPerson = true,
 }
 function M.IsUserFeatureEnabled(self, name)
     local v = user_features[name]
     if v == nil then error("Flag " .. tostring(name) .. " does not exist", 0) end
     return v
 end
--- UserSettings():GetService / FindService (only UserSettings dispatches here).
+-- UserSettings():GetService / FindService and settings():GetService (only
+-- UserSettings and GlobalSettings dispatch here): an item by class name.
 function M.GetService(self, name)
+    if global_settings ~= nil and self == global_settings then
+        for _, c in global_settings:GetChildren() do
+            if c.ClassName == name then return c end
+        end
+        return nil
+    end
     if name == "UserGameSettings" then make_user_settings() return user_game_settings end
-    return the_settings[name]
+    return nil
 end
 M.FindService = M.GetService
-function the_settings:GetService(name) return the_settings[name] end
-function the_settings:GetFFlag() return false end
-function the_settings:GetFVariable() return "" end
--- settings() wants the Plugin capability, which game scripts lack (an admin script
+-- settings() wants the Plugin capability, which game scripts lack (Adonis
 -- kicks a client whose pcall(settings) succeeds, "Tampering with Client
 -- [read rt0001]"). src/security.rs replaces this with a C function that
 -- checks the calling thread's identity; this one only hands it the value.
-function settings() return the_settings end
+function settings() return make_settings() end
 function UserSettings() return make_user_settings() end
 -- The Stats service (created on first use, as GetService does).
 function stats() return game:GetService("Stats") end
@@ -360,14 +393,18 @@ M.RegisterActiveKeyframeSequence = M.RegisterKeyframeSequence
 function __rs_anim_register(id, clip) registered[id] = clip; sequences[id] = nil; __rs_anim_forget(id) end
 function __rs_anim_registered(id) return registered[id] end
 
--- FloatCurve's version-2 wire records: u16 mode, f32 value/left/right;
--- a version-1 time array follows, in 1/2400 second ticks (Studio 0.746).
+-- FloatCurve's wire records: u16 mode, f32 value/left/right; a version-1
+-- time array follows, in 1/2400 second ticks (Studio 0.746). The record
+-- block is version 2 as Studio saves it today and version 1 in older clips
+-- (the 2024 Laser Tag blaster animations), laid out the same; Studio plays
+-- both, with the stored tangents whatever the flags say.
 local function curve_keys(curve)
     local ok, data = pcall(function() return curve.ValuesAndTimes end)
     if not ok or type(data) ~= "string" or #data < 16 then return {} end
     local b = buffer.fromstring(data)
     local n = buffer.readu32(b, 4)
-    if buffer.readu32(b, 0) ~= 2 or n > (#data - 16) / 18 then return {} end
+    local version = buffer.readu32(b, 0)
+    if (version ~= 1 and version ~= 2) or n > (#data - 16) / 18 then return {} end
     local times = 8 + n * 14
     if buffer.readu32(b, times) ~= 1 or buffer.readu32(b, times + 4) ~= n then return {} end
     local keys = {}
@@ -400,7 +437,8 @@ local function marker_frames(curve)
     local ok, data = pcall(function() return curve.ValuesAndTimes end)
     if not ok or type(data) ~= "string" or #data < 16 then return {} end
     local b, values, offset = buffer.fromstring(data), {}, 9
-    if buffer.readu32(b, 0) ~= 2 then return {} end
+    local version = buffer.readu32(b, 0)
+    if version ~= 1 and version ~= 2 then return {} end
     local n = buffer.readu32(b, 4)
     if n > #data - 16 then return {} end
     for _ = 1, n do
@@ -412,10 +450,18 @@ local function marker_frames(curve)
     local timeoff = offset - 1
     if timeoff + 8 + n * 4 > #data or buffer.readu32(b, timeoff) ~= 1
         or buffer.readu32(b, timeoff + 4) ~= n then return {} end
+    -- A clip converted from a KeyframeSequence keeps its named keyframes as
+    -- a NamedKeyframeEvent curve: Studio fires them as KeyframeReached
+    -- (Laser Tag's Equip "End"), not as markers.
+    local named = curve.Name == "NamedKeyframeEvent"
     local frames = {}
     for i, value in values do
-        table.insert(frames, {t = buffer.readi32(b, timeoff + 8 + (i-1)*4) / 2400,
-            name = "Keyframe", markers = {{curve.Name, value}}})
+        local t = buffer.readi32(b, timeoff + 8 + (i-1)*4) / 2400
+        if named then
+            table.insert(frames, {t = t, name = value, markers = {}})
+        else
+            table.insert(frames, {t = t, name = "Keyframe", markers = {{curve.Name, value}}})
+        end
     end
     return frames
 end
@@ -453,8 +499,12 @@ local function parse_curve(clip)
             if next(channels) then joints[folder.Name] = {curves = channels} end
         end
     end
+    -- Studio 0.744 names a curve clip's end "End": Laser Tag's Equip and
+    -- Reload (empty NamedKeyframeEvent curves) fire KeyframeReached("End")
+    -- as they finish, before Stopped; KeyframeSequences don't.
+    if length > 0 then table.insert(frames, {t = length, name = "End", markers = {}}) end
     table.sort(frames, function(a,b) return a.t < b.t end)
-    return {joints = joints, frames = frames, length = length, loop = clip.Loop, priority = clip.Priority}
+    return {joints = joints, frames = frames, length = length, loop = clip.Loop, priority = clip.Priority, curve = true}
 end
 
 local function parse_sequence(kfs)
@@ -490,6 +540,8 @@ local function load_sequence(id)
         end
     end
     local seq = kfs and parse_sequence(kfs) or false
+    -- The clip's authoring rig, for retargeting (anim_retarget.rs).
+    if seq then seq.rig = kfs:FindFirstChildOfClass("AnimationRigData") end
     sequences[id] = seq
     return seq or nil
 end
@@ -498,7 +550,7 @@ end
 -- (src/domains/anim_tracks.rs); it loads sequences through `__rs_anim_load`
 -- and samples CurveAnimation joints through `__rs_anim_sample`.
 __rs_anim_load = load_sequence
-function __rs_anim_sample(list, t)
+local function curve_pose(list, t)
     local position, rotation = Vector3.zero, CFrame.new()
     for name, c in list.curves do
         if c.quat then
@@ -511,6 +563,19 @@ function __rs_anim_sample(list, t)
         elseif name == "Rotation" and c.rotation then rotation = CFrame.fromEulerAngles(x, y, z, c.order) end
     end
     return CFrame.new(position) * rotation
+end
+-- Studio 0.744's Animator doesn't evaluate a CurveAnimation's curves at the
+-- track's time: it samples them every 1/30 s and lerps the poses between
+-- those samples (Animator:StepAnimations probe on Laser Tag's Reload:
+-- LeftArm at 0.05 s is CFrame:Lerp of the 1/30 and 2/30 s poses to 1e-5,
+-- not the curve value there).
+local CURVE_RATE = 30
+function __rs_anim_sample(list, t)
+    local k = math.floor(t * CURVE_RATE + 1e-6)
+    local t0 = k / CURVE_RATE
+    local u = (t - t0) * CURVE_RATE
+    if u <= 1e-6 then return curve_pose(list, t0) end
+    return curve_pose(list, t0):Lerp(curve_pose(list, (k + 1) / CURVE_RATE), u)
 end
 
 -- The model a Humanoid / Animator / AnimationController animates.
@@ -574,7 +639,9 @@ end
 function M.GetTimeOfKeyframe(self, name)
     local t = __rs_track_keyframe_time(self, tostring(name))
     if t then return t end
-    error("GetTimeOfKeyframe: no keyframe named " .. tostring(name), 2)
+    -- Studio 0.744's messages (a curve clip has no keyframes to look up).
+    if t == false then error("Invalid operation for this animation format.", 2) end
+    error("Could not find a keyframe by that name!", 2)
 end
 
 ------------------------------------------------------------- ParticleEmitter
@@ -812,8 +879,17 @@ function __rs_input_event(state, uit, key, x, y, z, dx, dy, gpe)
     end
     io.UserInputState = Enum.UserInputState[state]
     io.Position = Vector3.new(x, y, z)
+    -- Mouse motion reaches scripts scaled by UserGameSettings.MouseSensitivity
+    -- (Studio 0.747: 10 px of motion with sensitivity 0.52 is Delta 5.2, and
+    -- UserInputService:GetMouseDelta() the same:
+    -- checks/humanoid-physics/feel/traces/studio-ias.log); the input action
+    -- system's MouseDelta takes the raw pixels (domains/gui_input.luau).
+    if uit == "MouseMovement" then
+        local sens = tonumber(ugs_values.MouseSensitivity) or 1
+        dx, dy = dx * sens, dy * sens
+        mouse_delta = Vector2.new(dx, dy)
+    end
     io.Delta = Vector3.new(dx, dy, 0)
-    if uit == "MouseMovement" then mouse_delta = Vector2.new(dx, dy) end
     local uis = game:GetService("UserInputService")
     local sunk = false
     if not gpe then sunk = run_actions(io, io.UserInputState) end

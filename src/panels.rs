@@ -160,6 +160,9 @@ impl Tab {
 /// Where a panel sat last in the main window (so it goes back there).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Home {
+    /// Complete last topology, including temporarily hidden groups (reserved map entry).
+    Topology(String),
+    Window(String),
     /// In a tab group with these panels.
     With(Vec<String>),
     /// Alone in a group split off next to these panels' group: `first`
@@ -179,6 +182,26 @@ fn fraction_ok(f: f32) -> f32 {
 /// else where it was last (`homes`) or where its `PLACEMENTS` row says;
 /// never in the 3D view's group.
 pub fn place(dock: &mut DockState<Tab>, tab: Tab, homes: &HashMap<String, Home>) {
+    if let Some(Home::Topology(json)) = homes.get("__topology") {
+        if let Ok(saved) = serde_json::from_str::<DockState<crate::layout_store::SavedTab>>(json) {
+            let mut full = saved.map_tabs(|t| t.tab());
+            let visible: Vec<Tab> = dock.iter_all_tabs().map(|(_, t)| *t).collect();
+            let mut projected = full.clone();
+            retain_visible(&mut projected, |t| visible.contains(t));
+            // Only replace the tree when it still represents the live layout.
+            // A user move while another panel is hidden must never be undone.
+            if full.find_tab(&tab).is_some() && topology(&projected) == topology(dock) {
+                sync_fractions(&mut full, dock);
+                let mut restored = full;
+                retain_visible(&mut restored, |t| *t == tab || visible.contains(t));
+                *dock = restored;
+                if let Some(at) = dock.find_tab(&tab) {
+                    let _ = dock.set_active_tab(at);
+                }
+                return;
+            }
+        }
+    }
     let key = tab.key();
     let p = placement(key);
     let tree = dock.main_surface_mut();
@@ -221,7 +244,7 @@ pub fn place(dock: &mut DockState<Tab>, tab: Tab, homes: &HashMap<String, Home>)
                 return;
             }
         }
-        None => {}
+        _ => {}
     }
     // Next to the panels its row names.
     for near in p.near {
@@ -284,8 +307,68 @@ pub fn place(dock: &mut DockState<Tab>, tab: Tab, homes: &HashMap<String, Home>)
     }
 }
 
+// Remove through the same collapse path as interactive closes. Batch retain
+// can rebalance an empty sibling subtree differently from sequential closes.
+fn retain_visible(dock: &mut DockState<Tab>, keep: impl Fn(&Tab) -> bool) {
+    let removed: Vec<_> = dock.iter_all_tabs().filter(|(_, t)| !keep(t)).map(|(_, t)| *t).collect();
+    for tab in removed {
+        if let Some(at) = dock.find_tab(&tab) { dock.remove_tab(at); }
+    }
+}
+
+/// Carry resized surviving splits into the remembered tree.
+fn sync_fractions(full: &mut DockState<Tab>, live: &DockState<Tab>) {
+    let visible = subtree_keys(live.main_surface(), NodeIndex::root());
+    let t = full.main_surface_mut();
+    for i in 0..t.len() {
+        let n = NodeIndex(i);
+        if !matches!(t[n], Node::Vertical(_) | Node::Horizontal(_)) { continue; }
+        let keys = |tree: &egui_dock::Tree<Tab>, at| {
+            let mut k = subtree_keys(tree, at);
+            k.retain(|k| visible.contains(k));
+            k.sort(); k
+        };
+        let left = keys(t, n.left());
+        let right = keys(t, n.right());
+        if left.is_empty() || right.is_empty() { continue; }
+        for (j, node) in live.main_surface().iter().enumerate() {
+            let fraction = match node { Node::Vertical(s) | Node::Horizontal(s) => s.fraction, _ => continue };
+            let at = NodeIndex(j);
+            if keys(live.main_surface(), at.left()) == left && keys(live.main_surface(), at.right()) == right {
+                match &mut t[n] { Node::Vertical(s) | Node::Horizontal(s) => s.fraction = fraction, _ => {} }
+                break;
+            }
+        }
+    }
+}
+
+/// Stable topology for checking a projected tree against the live dock.
+fn topology(dock: &DockState<Tab>) -> String {
+    fn node(tree: &egui_dock::Tree<Tab>, n: NodeIndex) -> String {
+        if n.0 >= tree.len() { return String::new(); }
+        match &tree[n] {
+            Node::Leaf(l) => format!("{:?}", l.tabs()),
+            Node::Vertical(_) => format!("v({},{})", node(tree, n.left()), node(tree, n.right())),
+            Node::Horizontal(_) => format!("h({},{})", node(tree, n.left()), node(tree, n.right())),
+            Node::Empty => String::new(),
+        }
+    }
+    node(dock.main_surface(), NodeIndex::root())
+}
+
 /// Notes where each panel in the main window sits (call every frame).
 pub fn record_homes(dock: &DockState<Tab>, homes: &mut HashMap<String, Home>) {
+    let keep = match homes.get("__topology") {
+        Some(Home::Topology(json)) => serde_json::from_str::<DockState<crate::layout_store::SavedTab>>(json)
+            .ok().is_some_and(|d| d.iter_all_tabs().any(|(_, t)| dock.find_tab(&t.tab()).is_none())),
+        _ => false,
+    };
+    if !keep {
+        if let Ok(json) = serde_json::to_string(&crate::layout_store::saved_dock(dock)) {
+            homes.insert("__topology".into(), Home::Topology(json));
+        }
+    }
+
     let tree = dock.main_surface();
     for (n, node) in tree.iter().enumerate().map(|(i, n)| (NodeIndex(i), n)) {
         let Some(leaf) = node.get_leaf() else { continue };
@@ -473,6 +556,46 @@ pub enum Location {
 }
 
 impl Panels {
+    pub fn remember_windows(&mut self) {
+        for saved in crate::layout_store::saved_popped(self) {
+            let key = format!("__window:{}", saved.key);
+            let keep = match self.homes.get(&key) {
+                Some(Home::Window(json)) => serde_json::from_str::<crate::layout_store::SavedPopped>(json).ok()
+                    .is_some_and(|old| old.dock.iter_all_tabs().any(|(_, t)| saved.dock.find_tab(t).is_none())),
+                _ => false,
+            };
+            if !keep {
+                if let Ok(json) = serde_json::to_string(&saved) { self.homes.insert(key, Home::Window(json)); }
+            }
+        }
+    }
+
+    pub fn restore_window(&mut self, main: &DockState<Tab>, tab: Tab) -> bool {
+        let saved = self.homes.values().find_map(|h| {
+            let Home::Window(json) = h else { return None };
+            let w = serde_json::from_str::<crate::layout_store::SavedPopped>(json).ok()?;
+            w.dock.find_tab(&crate::layout_store::SavedTab::from_tab(&tab)?).map(|_| w)
+        });
+        let Some(saved) = saved else { return false };
+        let mut full = saved.dock.map_tabs(|t| t.tab());
+        if let Some(w) = self.popped.iter_mut().find(|w| w.key == saved.key) {
+            let visible = w.tabs();
+            let mut projection = full.clone();
+            retain_visible(&mut projection, |t| visible.contains(t));
+            if topology(&projection) != topology(&w.dock) { return false; }
+            sync_fractions(&mut full, &w.dock);
+            retain_visible(&mut full, |t| *t == tab || visible.contains(t));
+            w.dock = full;
+            w.focus = true;
+        } else {
+            retain_visible(&mut full, |t| *t == tab && main.find_tab(t).is_none());
+            let mut w = Popped::new(saved.key, full, saved.size, saved.pos);
+            w.wm_restore = saved.wm;
+            self.popped.push(w);
+        }
+        true
+    }
+
     pub fn locate(&self, main: &DockState<Tab>, tab: &Tab) -> Option<Location> {
         if let Some(p) = main.find_tab(tab) {
             return Some(Location::Main(p));
@@ -494,6 +617,7 @@ impl Panels {
 
     /// Takes a tab out of wherever it is (dropping a window left empty).
     pub fn take(&mut self, main: &mut DockState<Tab>, tab: &Tab) -> Option<Tab> {
+        self.remember_windows();
         match self.locate(main, tab)? {
             Location::Main(p) => main.remove_tab(p),
             Location::Popped(i, p) => {
@@ -519,6 +643,7 @@ impl Panels {
             return;
         }
         let w = self.popped.remove(i);
+        self.homes.remove(&format!("__window:{}", w.key));
         for t in w.tabs() {
             if main.find_tab(&t).is_none() {
                 place(main, t, &self.homes);
@@ -528,6 +653,8 @@ impl Panels {
 
     /// Does one move. `size` / `pos`: a new window's (logical pixels).
     pub fn apply(&mut self, main: &mut DockState<Tab>, mv: DockMove, size: [f32; 2], pos: Option<[f32; 2]>) {
+        // Explicit docking/moving supersedes remembered hidden-window placement.
+        self.homes.retain(|_, h| !matches!(h, Home::Window(_)));
         match mv {
             DockMove::DockAll => {
                 while !self.popped.is_empty() {
@@ -576,6 +703,7 @@ impl Panels {
                 }
             }
         }
+        self.homes.retain(|_, h| !matches!(h, Home::Window(_)));
     }
 
     /// Turns egui_dock's floating windows (a tab dragged out of a dock) in
@@ -633,6 +761,65 @@ mod tests {
     fn remove(dock: &mut DockState<Tab>, t: Tab) {
         let p = dock.find_tab(&t).unwrap();
         dock.remove_tab(p);
+    }
+
+    #[test]
+    fn hidden_floating_tabs_restore_window_and_order() {
+        let mut p = Panels::default();
+        let mut main = default_dock();
+        p.apply(&mut main, DockMove::PopOut(Tab::Explorer), [510.0, 420.0], Some([60.0, 80.0]));
+        p.apply(&mut main, DockMove::MoveTo(Tab::Properties, "explorer".into()), [1.0, 1.0], None);
+        p.remember_windows();
+        p.take(&mut main, &Tab::Explorer);
+        p.take(&mut main, &Tab::Properties);
+        assert!(p.popped.is_empty());
+        assert!(p.restore_window(&main, Tab::Properties));
+        assert!(p.restore_window(&main, Tab::Explorer));
+        assert_eq!(p.popped[0].tabs(), vec![Tab::Explorer, Tab::Properties]);
+        assert_eq!(p.popped[0].size, [510.0, 420.0]);
+        assert_eq!(p.popped[0].pos, Some([60.0, 80.0]));
+    }
+
+    #[test]
+    fn hidden_topology_survives_both_orders_and_persistence() {
+        for custom in 0..3 {
+            for reverse in [false, true] {
+                let mut dock = default_dock();
+                if custom == 1 {
+                    remove(&mut dock, Tab::Explorer);
+                    remove(&mut dock, Tab::Properties);
+                    let children = dock.main_surface_mut().split_left(NodeIndex::root(), 0.31, vec![Tab::Properties]);
+                    dock.main_surface_mut().split_below(children[1], 0.72, vec![Tab::Explorer]);
+                } else if custom == 2 {
+                    remove(&mut dock, Tab::Properties);
+                    let (n, _) = dock.main_surface().find_tab(&Tab::Explorer).unwrap();
+                    dock.main_surface_mut()[n].append_tab(Tab::Properties);
+                }
+                let fractions = |d: &DockState<Tab>| d.main_surface().iter().filter_map(|n| match n {
+                    Node::Vertical(s) | Node::Horizontal(s) => Some(s.fraction), _ => None
+                }).collect::<Vec<_>>();
+                let expected_fractions = fractions(&dock);
+                let expected = topology(&dock);
+                let mut homes = HashMap::new();
+                record_homes(&dock, &mut homes);
+                remove(&mut dock, Tab::Explorer);
+                record_homes(&dock, &mut homes);
+                remove(&mut dock, Tab::Properties);
+                record_homes(&dock, &mut homes);
+                homes = serde_json::from_str(&serde_json::to_string(&homes).unwrap()).unwrap();
+                let order = if reverse { [Tab::Properties, Tab::Explorer] } else { [Tab::Explorer, Tab::Properties] };
+                for tab in order {
+                    place(&mut dock, tab, &homes);
+                    record_homes(&dock, &mut homes);
+                }
+                assert_eq!(topology(&dock), expected, "custom={custom}, reverse={reverse}");
+                assert_eq!(fractions(&dock), expected_fractions);
+                remove(&mut dock, Tab::Explorer);
+                record_homes(&dock, &mut homes);
+                place(&mut dock, Tab::Explorer, &homes);
+                assert_eq!(topology(&dock), expected);
+            }
+        }
     }
 
     /// The default layout: Explorer right, Properties under it, Output under the 3D view.
@@ -780,4 +967,28 @@ mod tests {
         assert_eq!(p.popped[1].key, "script-2");
         assert_eq!(p.popped[1].title(), "Script — rustudio");
     }
+}
+
+/// Script tabs belong to the replaced document; preserve all tool topology.
+pub fn close_document_tabs(dock: &mut DockState<Tab>, panels: &mut Panels) {
+    retain_visible(dock, |t| !matches!(t, Tab::Script(_)));
+    for window in &mut panels.popped {
+        retain_visible(&mut window.dock, |t| !matches!(t, Tab::Script(_)));
+    }
+    panels.popped.retain(|w| w.dock.iter_all_tabs().next().is_some());
+}
+
+#[test]
+fn document_close_removes_scripts_preserving_tools() {
+    let script = Tab::Script(rbx_dom_weak::types::Ref::new());
+    let mut dock = DockState::new(vec![Tab::Viewport, script, Tab::Output]);
+    let mut panels = Panels::default();
+    panels.pop_out(script, [420.0, 520.0], None);
+    close_document_tabs(&mut dock, &mut panels);
+    assert!(dock.find_tab(&script).is_none());
+    assert!(panels.popped.is_empty());
+    assert!(dock.find_tab(&Tab::Viewport).is_some());
+    assert!(dock.find_tab(&Tab::Output).is_some());
+    place(&mut dock, script, &panels.homes);
+    assert!(dock.find_tab(&script).is_some());
 }

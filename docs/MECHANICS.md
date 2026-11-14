@@ -77,6 +77,60 @@
 | Output | every script line is tagged [Server] or [Client] while Play runs | person's request |
 | Explorer | Server / Client toggle at the top while Play runs; the viewport shows the side you pick | person's request |
 
+## Character (Play)
+
+| Value | Number | Source |
+|---|---|---|
+| Rig | R15 by default (toolbar R15 / R6 picker, or the avatar's own type); a Humanoid Model with HumanoidRootPart and Motor6D joints | StarterPlayer default R15; joint names from the Roblox docs |
+| R15 parts | HumanoidRootPart 2×2×1, LowerTorso 2×0.4×1, UpperTorso 2×1.6×1, Head 1.2³, arms 1 wide (upper 1, lower 0.95, hand 0.3 tall), legs 1 wide (upper 1.15, lower 1.15, foot 0.3 tall) | joint layout from the Roblox docs; sizes estimated |
+| R15 joints | Root, Waist, Neck, Left/Right Shoulder, Elbow, Wrist, Hip, Knee, Ankle; each part has its …RigAttachment | Roblox docs |
+| R6 parts / joints | Torso 2×2×1, Head 1.2³, arms and legs 1×2×1; RootJoint, Neck, Left/Right Shoulder, Left/Right Hip | Roblox docs; sizes estimated |
+| Hip height | R15 2 studs × height scale, R6 0 (R6 uses its legs) | estimated |
+| Body | Humanoid properties from StarterPlayer (CharacterWalkSpeed, CharacterJumpPower/Height, CharacterUseJumpPower, CharacterMaxSlopeAngle) | Roblox docs (StarterPlayer) |
+| Physics shape | one dynamic assembly: the HumanoidRootPart with every part the joints hold; Head, torso parts and the root collide as their own boxes at the animated pose, limbs don't (R15 CanCollide false); mass, centre and inertia from the joints' own pose. See "Round 27" | Studio code and measurements, checks/humanoid-physics |
+| Upright | the character never tips over; with Humanoid.AutoRotate it turns toward its MoveDirection, the angle left shrinking as exp(−7 t); with UserGameSettings.RotationType CameraRelative (shift-lock, first person) it faces the camera at once | Studio: turning to a new direction left 1.48 → 0.93 / 0.38 / 0.12 rad after 0.10 / 0.22 / 0.35 s |
+| Walk speed | Humanoid.MoveDirection × WalkSpeed (16), full speed from the first frame; the client's Humanoid counts (a LocalScript changing WalkSpeed moves the player at once) | Studio: 15.8 studs/s from the first frame |
+| Jump | while Humanoid.Jump is set (the ControlModule holds it while Space is down): commanded speed JumpPower with UseJumpPower, else √(2·g·JumpHeight) / 1.06 clamped to [0, 1000]; it leaves the ground at 1.06 × that | Studio code Studio (table at the top); Studio: JumpPower 50 → 7.27 studs, 100 → 28.86; JumpHeight 7.2 → 7.31, 3 → 3.07; 0.51 s in the air at 50 |
+| States | Running ↔ Jumping → Freefall → Landed (0.1 s) → Running; Dead on death. GetState, StateChanged, Jumping, FreeFalling, Running events | Roblox docs (HumanoidStateType); Landed duration estimated; Climbing: see Climbing below |
+| Animation | each joint is posed by its Motor6D.Transform (Part1 = Part0 · C0 · Transform · C1⁻¹) as the client has it; AnimationTracks write it ("Animation" below), and so can a game's own scripts. No procedural swing: Studio offline can't load the default animations (their tracks report Length 0) and its character stands still, as rustudio's does | Studio: Animate's idle tracks playing with Length 0 |
+| Network owner | the client moves its own character and sends the pose to the server | Roblox docs (network ownership) |
+| Default look (no avatar) | blocky parts in Studio's offline colours: head and arms (245, 205, 48), torso (13, 105, 172), legs (164, 189, 71) | Roblox Studio: the Play character's Head / UpperTorso / RightUpperArm / RightUpperLeg Color |
+| Avatar | signed in (or Account → avatar username): body type, BodyColors, scales, Shirt / Pants / T-shirt, face decal, rigid accessories by attachment name | Roblox docs (avatar API, HumanoidDescription) |
+| Avatar not supported | layered clothing, body-part / head meshes, dynamic heads, emotes, animations | not implemented |
+| Acceleration | Running's force: 150 × (target − velocity) per mass, at most mass × g × the floor's friction, on the 240 Hz steps (level 2: every 2nd tick over 2h) | Studio code Studio; "Round 27" |
+| Step-up height | what the hip-height spring and the floor rays give (no number of its own) | Studio code; probes T5 |
+| Max slope | 89° | Humanoid.MaxSlopeAngle default (Roblox docs) |
+| Movement keys | Roblox's own ControlModule (Keyboard): ContextActionService PlayerActions CharacterForward W / Up, Backward S / Down, Left A, Right D, Jump Space; Player:Move relative to the camera's heading. The Left / Right arrows turn the camera (CameraInput) | PlayerModule source (Studio install); Studio's key tool can't send arrow keys, so that part is from the scripts |
+| Health / death | Humanoid.Health 100; at 0 (or below FallenPartsDestroyHeight −500) limbs fall apart, respawn after 5 s | Players.RespawnTime default 5; Workspace.FallenPartsDestroyHeight default −500 |
+| Look | Studio's offline colours: head and arms (245, 205, 48), torso (13, 105, 172), legs (164, 189, 71); Place A's viewmodel arms take their colour from these | Roblox Studio |
+| Camera | the client's Workspace.CurrentCamera, moved by Roblox's CameraModule (Classic camera, Poppercam, ZoomController, MouseLockController, TransparencyController); see "Player controller" | Studio: starts 12.5 studs from the head, pitch −15°, both matched |
+
+## Player controller (Roblox's default scripts, Play)
+
+Studio's own scripts run unchanged, read from the Studio install at Play
+start (nothing copied into rustudio). Checked in Studio by listing the
+client's PlayerScripts and the character during Play and matching each
+script's source length with the files.
+
+| Value | Setting | Source |
+|---|---|---|
+| Which scripts | StarterPlayerScripts gets PlayerScriptsLoader, PlayerModule (CameraModule, ControlModule, CommonUtils; `*.spec.lua` left out) from ExtraContent/scripts/PlayerScripts/StarterPlayerScripts, and RbxCharacterSounds (+ AtomicBinding) from StarterPlayerScriptsCommon. Each character gets Health (content/avatar/scripts/humanoidHealthRegenScript.rbxmx) and Animate (R15: content/avatar/scripts/humanoidAnimateR15_DEPRECATED_20260813.rbxm; R6: humanoidAnimatePlayEmote.rbxm) | Studio: PlayerModule 793, CameraModule 25 338, ControlModule 24 195, Animate 28 802, Health 703 characters, equal to those files; the R6 / R15 choice and the name rule from Studio code Studio (table at the top) |
+| Overrides | a place's own script of the same name in StarterPlayerScripts / StarterCharacterScripts wins; Place A keeps the defaults and turns the controls off itself (GetControls():Disable()) | Roblox behaviour |
+| Not inserted | Studio's legacy ChatScript / BubbleChat; rustudio keeps its own chat box | rustudio |
+| Player settings | each Player copies StarterPlayer's CameraMaxZoomDistance, CameraMinZoomDistance, CameraMode, DevCameraOcclusionMode, DevComputerCameraMovementMode → DevComputerCameraMode, DevComputerMovementMode, DevTouchCameraMovementMode → DevTouchCameraMode, DevTouchMovementMode, EnableMouseLockOption → DevEnableMouseLock, AutoJumpEnabled, Health / NameDisplayDistance | Roblox docs (StarterPlayer) |
+| Core services | Play makes Players, ReplicatedStorage, ReplicatedFirst, StarterGui, StarterPack, StarterPlayer (with its two script folders) when the file has none | Roblox: every DataModel has them |
+| Device | keyboard and mouse: TouchEnabled, GamepadEnabled, VREnabled false; PreferredInput KeyboardAndMouse; touch and gamepad modules load but stay idle | Studio's Play on a desktop |
+| User feature flags | UserSettings():IsUserFeatureEnabled answers as Studio does for the 22 flags the scripts read (UserFixStuckShiftLock, UserRaycastUpdateAPI2, UserCurrentCameraUpdate2… true; UserPSSinkUnknownTouchEvents, UserFixVRImmersionAutoRotate, UserAnimateRemoveEmoteChatHook, UserAnimationAbilityManagerFixed false); unknown names error, like Studio's | Studio, 2026-11-01 |
+| Input order | every key, mouse button, mouse move and wheel becomes one InputObject per device (a userdata: typeof gives "InputObject"); ContextActionService's bound actions see it first, highest priority first (newest first among equal), nil / Sink stops it, Pass hands it on, End goes to the actions that took the Begin; then UserInputService InputBegan / InputChanged / InputEnded, and PointerAction for the wheel | Roblox docs |
+| Mouse motion | InputObject.Delta and GetMouseDelta are non-zero only while the cursor is locked (MouseBehavior LockCenter or LockCurrentPosition); the view grabs the cursor then (Locked, Confined where locking isn't possible) and lets go when the game sets Default | Roblox docs; CameraInput relies on it |
+| Wheel | 0.5 of wheel input (InputObject.Position.Z, PointerAction) per notch | Studio: one wheel event of −3 / +2 / −1 notches zoomed 12.5 → 23.375 → 14.917 → 19.146 studs, ZoomController's step for 0.5 per notch; rustudio gives the same numbers |
+| Client frame order | input → RenderStepped / PreRender (BindToRenderStep: ControlModule at Input 100, CameraModule at Camera 200) → PreAnimation (AnimationTracks) → Stepped / PreSimulation → PostSimulation / Heartbeat; the character moves next frame from what the client's Humanoid holds | Roblox docs (RunService); Place A moves its player on PreSimulation |
+| Humanoid:Move / Player:Move | sets MoveDirection (length at most 1), turned by the camera's heading when relative | Roblox docs |
+| Root constraints | a LinearVelocity (Plane, World) on the player's HumanoidRootPart sets its horizontal velocity, a rigid one-attachment AlignOrientation its facing, a script setting AssemblyLinearVelocity its vertical speed; AssemblyLinearVelocity / AssemblyMass read back the character's | Roblox physics (rustudio's character is kinematic); Place A' "pmove" |
+| Shift-lock / first person | MouseLockController (LeftShift) and zooming in to 0.5 studs set MouseBehavior LockCenter and RotationType CameraRelative; the head and accessories fade (LocalTransparencyModifier) | the scripts; self-test "player-module" |
+| Right-drag | CameraInput turns 0.5° per pixel (vertical × 0.77) while MouseBehavior is LockCurrentPosition | CameraInput source |
+| Place A match | its own movement now gets its keys and frame events, but the player stays put: Nacht's collision MeshParts collide as boxes in rustudio's physics (and some hull brushes fall back to boxes offline), so the capsule starts inside them | open; physics shapes, not the controller |
+
 ## Animation
 
 | Value | Setting | Source |
@@ -117,7 +171,19 @@ by id.
 | While computing | decompositions run on background threads; an anchored part collides with the mesh's exact triangles meanwhile, an unanchored one with its hull; the finished pieces replace them within 0.25 s | rustudio |
 | Cache | ~/.cache/rustudio/collision/{hash}.bin, keyed by mesh id, fidelity and settings version | rustudio |
 | Rules kept | CanCollide / Anchored / welds / assemblies as for other parts; a character's own parts never block it | as in "Physics" |
-| Place A | Map 1's map pieces use PreciseConvexDecomposition, brushes Hull (its Bo3Map CreateMeshPartAsync options); in a match the character walks (4000, 3.1, −34) → (4006.7, 3.1, −45.2) → (4025.7, 4, −34.1) → (4014.7, 3, −11) → (3993.6, 3.1, −22.1) | rustudio, Place A match walk |
+| Place A | Nacht's map pieces use PreciseConvexDecomposition, brushes Hull (its Bo3Map CreateMeshPartAsync options); in a match the character walks (4000, 3.1, −34) → (4006.7, 3.1, −45.2) → (4025.7, 4, −34.1) → (4014.7, 3, −11) → (3993.6, 3.1, −22.1) | rustudio, Place A match walk |
+
+## Avatar (bodies and layered clothing)
+
+| Value | Setting | Source |
+|---|---|---|
+| R15 body | Studio's content/avatar/characterR15DynamicHeadV2.rbxm: Roblox's body-part MeshParts (LeftHand 7430070991 … LowerTorso 7430071109), each with a WrapTarget cage (7430071100 …), RigAttachments, Motor6Ds and a Humanoid (HipHeight 2). Its head — Roblox's current dynamic head, mesh 123480233606534 (Draco), cage 76523574292282, face 111092388570647 (transparent around the face, so the head colour shows) — is served only to signed-in accounts: kept when signed in or cached, else Studio's defaultDynamicHead.rbxm head (mesh 11445807850, face 11445807951) takes the Neck | Studio install; asset delivery (session for the head); self-test "catalog-assets" |
+| Layered clothing, real item | Roblox's "Hooded Jacket - Gray" (8516620262, an Accessory whose Handle has a WrapLayer: mesh 8917454991, inner cage 8917455036, outer cage 8917455040, Order 1, Puffiness 1): 1 706 of its 1 709 inner-cage points pair with the body cages by UV; it lands on 11 body parts, 90% of its vertices outside the body parts' boxes | self-test "catalog-assets" |
+| R6 body | Studio's content/avatar/character.rbxm (Head with a Head SpecialMesh × 1.25 and face decal, Torso, limbs, accessory attachments) with Roblox's six classic joints: RootJoint and Neck C0/C1 rotated (−1,0,0 / 0,0,1 / 0,1,0), shoulders and hips at (±1, 0.5 / −1, 0) with C1 (∓0.5, 0.5 / ±0.5, 1), MaxVelocity 0.1 | Studio install; the classic R6 joint frames R6 animations are authored in |
+| Head mesh type | SpecialMesh MeshType Head draws Studio's content/avatar/heads/head.mesh (1.2 studs native), round across the part's smaller horizontal side × Scale | Studio install; diameter rule estimated |
+| R15 scales | each part's OriginalSize and each attachment's OriginalPosition × (width, height, depth) (the head × head scale); Motor6Ds re-seated on their RigAttachments; HipHeight × height | values stored in the body file |
+| Collisions | Head, UpperTorso, LowerTorso (R6: Torso) and the HumanoidRootPart collide; limbs don't | Studio (CanCollide of the default rigs) |
+| Layered clothing | an Accessory whose Handle has an enabled WrapLayer fits onto the character's WrapTarget cages: inner cage (ReferenceMeshContent at ReferenceOrigin) and body cage points paired by template UV; garments go on in Order, each next one onto the previous one's fitted outer cage (CageMeshContent at CageOrigin); each garment vertex follows its 4 nearest inner-cage points (inverse-square weights) and its height above them × Puffiness (clamped to [−1, 1], default 1, as Studio's setter does); accessories put on during Play attach by matching attachment names like spawn-time ones; drawn cut by body part so it follows the joints | Roblox docs (WrapLayer, WrapTarget, cages share one template); Puffiness range and default from Studio (Studio, WrapPuffinessDefaultPercent); binding rule rustudio's |
 
 ## Physics (rapier3d)
 
@@ -133,7 +199,7 @@ by id.
 | Material | density 0.7, friction 0.3, elasticity 0.5 for every part | Plastic PhysicalProperties (Roblox docs); per-material values not used yet |
 | Shapes | Block, Ball (radius = smallest size / 2), Cylinder (along X), Wedge, CornerWedge; MeshParts by CollisionFidelity (see "Collision"); Unions use their box | Roblox docs |
 | Movers | BodyForce, BodyThrust, VectorForce, Torque; BodyVelocity, LinearVelocity; BodyPosition, AlignPosition; BodyGyro, AlignOrientation; BodyAngularVelocity, AngularVelocity — recomputed every step, defaults (P, D, MaxForce, Responsiveness…) from the reflection database | Roblox docs for what each property does; control laws estimated: body movers are springs P·error − D·velocity solved implicitly, Align* are critically damped springs with natural frequency = Responsiveness, velocity constraints close the error in one step, BodyVelocity / LinearVelocity / AlignPosition also hold the part's weight; an unlimited LinearVelocity (ForceLimitsEnabled off or MaxForce inf, any mode) is rigid against friction: the velocity the floor's friction took off its axes last step (not what a contact normal held back) is added to the next push, so a box driven at 10 on a Plastic floor holds 10.00 and covers 10 studs a second (it held 9.02) |
-| Touched / TouchEnded | contact start/stop between parts (CanTouch respected), and the character's capsule entering a part | Roblox docs |
+| Touched / TouchEnded | contact start/stop between parts (CanTouch respected), and the character's parts touching a part | Roblox docs |
 | Terrain | Workspace.Terrain voxels (SmoothGrid) → fixed triangle meshes in 64-stud cells, friction 0.4, elasticity 0.1; water has no collider (no swimming yet); Touched reports the Terrain | SmoothGrid format from community docs (rbx-dom); cell size, friction and elasticity estimated |
 | Explosion | an Explosion put in Workspace: Hit(part, distance) for every part within BlastRadius (default 4); unanchored parts pushed outward by BlastPressure × 0.0004 / mass studs/s (at most 150); joints of parts within BlastRadius × DestroyJointRadiusPercent break and Humanoids there die; a 0.6 s flash | Roblox docs (Explosion); push strength, cap and flash estimated |
 
@@ -200,6 +266,58 @@ by id.
 | Ambient | RGB 70, 70, 70 | estimated |
 | OutdoorAmbient | RGB 128, 128, 128 | estimated |
 | Neon / SmoothPlastic / Glass / ForceField | see the model below | enum numbers from rbx_reflection_database |
+
+## Lighting model (measured against Studio)
+
+Every number here was measured in Roblox Studio
+(Technology Future, an 863×675 view from (4, 9, 22) toward (4, 2, 0), FOV 70,
+test places in /tmp/rs-light/places), reading screenshot pixels with
+/tmp/rs-light/sample.py, or read from Studio's own shader pack (glsl3 / Vulkan
+"RBXS" packs in the Studio folder; Globals constant buffer CB0[13..31]:
+AmbientColor, SkyAmbient, Lamp0Color/Dir, FogParams, FogColor, Exposure,
+LightConfig, SkyGradient/Env scales). "Display" values are 0–255 screen
+levels; "linear" is light before the tone curve.
+
+| Value | Number | Source |
+|---|---|---|
+| Colour to linear | channel² (gamma 2.0) for part colours, light colours, Ambient, skybox texels | Studio shaders (sqrt on output, squaring on input); fits all scenes below |
+| Display gamma | output = sqrt(tone-mapped) | Studio shaders ("sqrt(c × Exposure)" in the Future pack) |
+| Default tone curve | y = x(ax+b) / (x(ax+c)+d) × e, a 6.0402, b 0.0064675, c 2.41386, d 0.656391, e 1.157207 | fitted to 16 Ambient/Brightness/Exposure screenshots, RMS 0.38 levels (/tmp/rs-light/fit_tone.py) |
+| Retro tone curve (ColorGradingEffect.TonemapperPreset Retro) | none: sqrt(clamp(x)) | fitted, RMS 2.6 levels (fit_retro.py) |
+| ExposureCompensation | light × 2^E | Exposure 1/2/3 screenshots |
+| Sun | 0.5 × Brightness × N·L, white at every ClockTime | 5 clock times, Brightness 0.5–4 (calib.json, calib2.json): front face 149 at 6:30, 7:45, 10:00 and 17:00 |
+| ColorShift_Top | tints the sun by its hue only (averaged to 1); black/grey/white change nothing | calib2 clock14shift; ColorShift_Bottom has no effect (clock14shiftbot) |
+| Sun direction | (cos θ cos φ, sin θ cos φ, sin φ), θ = (ClockTime − 6)·15°, φ = latitude − 23.5°; ClockTime first clamped to [0, 24] and cut to whole seconds | Lighting:GetSunDirection at 5 clock times, error < 0.001; cached at Lighting |
+| Ambient / OutdoorAmbient | Ambient² + max(Outdoor² − Ambient², 0) × sky visibility (outdoors: the larger of the two), at night too | calib.json; future_night side face 130 vs 132 |
+| Sky visibility (rustudio) | 0 under a roof: highest underside of mostly-opaque parts over each 4-stud cell, 128² cells around the camera | rustudio approximation of Studio's 4-stud lighting voxels |
+| Sun shadows | 2048² shadow map, ±128 studs around the view, 3×3 filter | rustudio; Studio's edge is slightly softer (future_day base_shadow 29 vs 30) |
+| Local lights (LightingStyle Realistic) | Color² × Brightness × 1.06 × window × 110/(110 + x²) × N·L, x = clamp(d, 0.7R, R) − 0.7R, window = 2t³ − 3t² + 1, t = x / 0.3R | 5 PointLight profiles (B 0.5–2, R 20–40, height 4–8), RMS ~3 levels (lightcal.json, fit_light3.py) |
+| SpotLight cone | Angle is the full cone: cos cut = cos(Angle/2), strength × sat((cos − cos cut)/(1 − cos cut))² | Future spot 60° at height 10: 97 under it vs 99 predicted, edge at 5.5 studs vs 5.77 (studio_spot60.png); a Light1-like spot (studio_spot2.png) |
+| Lights in Attachments | at the attachment's world CFrame, Face relative to it (Front = LookVector) | studio_spot2 (Attachment spot) matches |
+| LightingStyle Soft: point lights | no N·L (a ball reads 224 all round), 0.98 × Brightness on a plateau, fade from 0.6 Range to max(Range, 8) + 1, short lights weaker (0.13 at Range 4, 0.49 at 8, 0.87 at 12, 1 from 20) | softcal2/3.json, ball_soft.json; Place A lobby uses Soft (from round 11: see LightingStyle default) |
+| LightingStyle Soft: spot lights | no N·L, edge blurred −2/+4 studs, strength × min(1, cone cross-section / 800 studs²) | softcal2/3.json (spot 30–120°, height 5–20); approximate (lobby red spots read about half as bright as Studio's) |
+| LightingStyle default | When the place doesn't save LightingStyle it follows Technology: Legacy / Voxel / Compatibility, or no Technology at all, → Soft; ShadowMap / Future → Realistic. PrioritizeLightingQuality follows (on only for Future). Stored into the place on open (`doc::ensure_services`), so scripts read what is drawn; new places save Technology Future (Studio's Baseplate) | tools/fidelity: Place A saves neither and Studio reads Soft, PrioritizeLightingQuality false; the control place (Future) reads Realistic, true; future_day/night (Future) N·L shading. (Round 10 drew Place A Realistic: its chapel read at 25–35 % of Studio's brightness.) |
+| EnvironmentDiffuseScale | skybox irradiance (cosine-weighted, texels²) × scale | envd1: within 7 levels with no tuning; Future = ShadowMap (studio_envd1 / studioF_envd1) |
+| Sky by time of day | full by day; dusk (sun 0.54 below) = day × (0.051, 0.032, 0.049); black at 00:00 | studio_envd_night (sky (10,14,27)), future_night (sky 0) |
+| Default skybox | PlatformContent/pc/textures/sky/sky512_{bk,dn,ft,lf,rt,up}.tex (DDS), placed as any Sky's faces (next row) | Studio folder; sky top 137 vs 134, horizon 163 vs 161 |
+| Skybox faces | looking +X Lf, −X Rt, +Y Up, −Y Dn, +Z Bk, −Z Ft; side faces read unmirrored from inside, image top up; Up / Dn as `viewport.rs prepare_sky` turns them; texels² with no scale by day | `skydiag` (below): 14 views within 1.4–2.2 levels |
+| SkyboxOrientation | turns the whole sky: drawn(d) = sky(R⁻¹·d), R = Rz·Rx·Ry, each Roblox's rotation by that axis's degrees (not CFrame.fromOrientation's Y·X·Z) | `skydiag` orientations: 49–69 → 3.3–3.7 levels |
+| Glass | lit colour × (1 − F) + sky(reflected) × F × mix(0.5, 1, colour), F = (1 − cos)^3.5; reflects even with EnvironmentSpecularScale 0 | glass_dark/glass_day cubes (Future and ShadowMap identical), largest error 23 at grazing |
+| Neon | colour × 4, unlit (full channel → 255) | future_day neon (0, 255, 0) |
+| Material darkening (Future) | per Material, linear: Wood 0.785, WoodPlanks 0.68, Marble 0.6, Basalt 0.36, Slate 0.56, CrackedLava 0.09, Concrete 0.66, Limestone 0.83, Granite 0.2, Pavement 0.31, Brick 0.62, Pebble 0.66, Cobblestone 0.61, Rock 0.36, Sandstone 0.44, CorrodedMetal (0.38, 0.22, 0.14), DiamondPlate 0.43, Foil 0.99, Metal 0.6, Grass 0.4, LeafyGrass 0.21, Sand 0.74, Fabric 0.17, Snow 0.73, Mud 0.26, Ground 0.2, Asphalt 0.23, Salt 0.74, Ice 0.99, Glacier 0.79, Cardboard 0.43, Carpet 0.64, CeramicTiles 0.87, ClayRoofTiles 0.36, RoofShingles 0.48, Leather 0.77, Plaster 0.74, Rubber 0.66 (full table in mech::material_albedo) | white cubes per Material vs SmoothPlastic, top and front agree within 0.01 (matcal.json) |
+| MeshPart TextureID / SpecialMesh TextureId | covers the part; Color never shows through (except character body parts). Transparency 0: texel alpha ignored, transparent texels draw their own RGB opaque (a glasses texture's lenses come out black). Transparency > 0: alpha = texel alpha × (1 − Transparency), blended to the scene behind (smooth, not a cutout); MeshPart and SpecialMesh FileMesh behave the same | Place A lobby floor turned red in Studio: no change; 2026-11-13 Studio quads (alpha ramp, glasses PNG, a cloud beam texture) at Transparency 0 / 0.02 / 0.5 in front of a red wall |
+| SurfaceAppearance AlphaMode | Overlay: transparent texels show Color, at any Transparency; Transparency: cut out below about half alpha at Transparency 0, blended (texel alpha × (1 − Transparency)) to the scene above it | Roblox docs; lobby railings; same 2026-11-13 Studio quads |
+| Mesh vertex colours | `.mesh` RGBA (40-byte vertices, +36) and OBJ `v x y z r g b [a]` multiply Color, or the texture when there is one (checker × colours), lit as usual; vertex alpha counts only when Transparency > 0 (alpha × vertex alpha), like texel alpha | Studio part VS `VARYING2 = COLOR0 × instance colour` (glsl3 pack); 2026-11-13 Studio: vertex-coloured cube white / textured / Color (255,128,128), quads with two alpha-0 corners at Transparency 0 / 0.02 / 0.5 |
+| SurfaceAppearance emission | ColorMap × EmissiveMask × EmissiveTint² × EmissiveStrength, unlit | lobby stained glass (strength 2.2) stays lit with every light off |
+| Part textures | mipmapped (averaged in linear), trilinear, 8× anisotropic | lobby floor tiles: aliasing sparkle gone, floor 47 vs 43 |
+| Post: ColorCorrection, Bloom | colour correction after the tone curve; bloom over Threshold, Intensity × spread over Size | Future pack post shader order (HDR → tone curve → 3×4 colour matrix; bloom thresholds on max RGB) |
+| Fog | linear FogStart → FogEnd to FogColor² | estimated (Studio uses exp2 of FogParams; not yet fitted) |
+| Not modelled yet | local-light shadows of MeshParts and unions (round 26: built-in parts block Shadows lights), Atmosphere, SunRays, DepthOfField, specular highlights, MaterialVariants, PBR maps | — |
+
+Place A lobby (chapel) side by side: ambient-only matches (walls 8–9 vs 8–21);
+with lights the floor matches (47 vs 43) and walls are lit, but Soft spot
+lights stay weaker than Studio's (wall 32 vs 77). Nacht match room: lights
+now sit where Place A puts them (Attachment.WorldCFrame was missing).
 
 ## Undo
 
@@ -317,7 +435,9 @@ by id.
 | Raycast, GetPartBoundsInBox / InRadius, GetPartsInPart, FindPartsInRegion3 | a 16-stud grid over the Workspace's parts, kept up to date from the document's change journal; rays walk it 64 studs at a time; parts covering more than 512 cells, and boxes over 4 096 cells, fall back to testing every part | estimated; Place A's nav grid (tens of thousands of include-list rays) now builds in 40 s, Studio's own time, instead of minutes |
 
 | Ray starting inside a part | a ray that starts inside a part's box doesn't hit that part | Roblox docs (raycasting); Place A's gun-near-a-wall check had pulled the gun back because its ray started inside a big collision part |
-| MeshParts | rays test the mesh's own triangles (CollisionFidelity other than Box), not its bounding box; the mesh comes from the same local files as drawing | Roblox behaviour; Place A's "Terrain" collision meshes around the player |
+| MeshParts / unions | queried by Studio's stored collision pieces (PhysicalConfigData, `CSGPHS` v8: convex hulls split by an Edgebreaker CLERS stream, plus explicit triangle pieces; src/physics_mesh.rs), stretched by Size / InitialSize; the blob also gives CollisionFidelity (type byte 1 Hull, 2 Default, 3 Precise, `BLOCK` Box: the file has no such property). Rays meet the pieces as stored; a ray starting inside any piece (or on a solid piece's face) skips the whole part; flat pieces are hit but never contain the origin. Spherecast / Blockcast / Shapecast meet the pieces scaled towards the part's centre by (half − 0.05) / half per axis, and skip only the pieces they start in. Box fidelity is the box. Without a blob: the mesh's own triangles (CollisionFidelity other than Box) | Studio encoder Studio / decoder Studio / CLERS writer Studio; Studio probes (checks/laser-tag-parity/raycast); Place A's "Terrain" collision meshes for the blob-less case |
+| CanQuery | only counts once CanCollide is off: a CanCollide part is queried whatever its CanQuery | Studio: Laser Tag's spawn forcefields and containment walls (CanCollide, CanQuery false) are hit |
+| Box contacts | rays: a ray that only touches an edge or corner (no length inside) misses; the normal is the face entered, or the faces entered together summed at an edge / corner ((-1, -1, 1) / √3 into a corner); a ray along a face's plane enters through the face ahead. Sweeps against boxes are exact (sphere: root of the centre-to-box distance; box: moving separating axes) | Studio probes; parry's GJK cast was up to 0.29 studs short on Laser Tag's 381-stud FLOOR |
 | CollisionGroup | RaycastParams / OverlapParams.CollisionGroup skips parts whose CollisionGroup was set not to collide with it (PhysicsService:CollisionGroupSetCollidable on that side) | Roblox docs; Place A's "WeaponRay" group |
 
 ## Content folder
@@ -512,14 +632,14 @@ The controller's character never tips,   so rustudio leaves GettingUp on the nex
 
 **Climbing**:
 
-- Target velocity (). With a ladder (FUN_14529d010) and a move
+- Target velocity (). With a ladder (FUN_Studio) and a move
   vector d: if d̂ · flat look ≥ −0.2 (Studio), or there is no floor
-  (FUN_14529d540 = the floor sensor's part, flag CacheAndReduceCallsToFloor
+  (FUN_Studio = the floor sensor's part, flag CacheAndReduceCallsToFloor
   Studio only caches it), the target is (0, ±|d| × 0.7, 0)
-  (Studio; 0.01 under |d| 0.1, Studio / Studio; −1 when
+  (Studio; 0.01 under |d| 0.1, Studio; −1 when
   moving away, Studio). Moving away *with* a floor keeps the move
   vector itself: the climber walks off the foot of the ladder. With a floor,
-  the target is then bent along the floor normal (FUN_14529d660 = sensor
+  the target is then bent along the floor normal (FUN_Studio = sensor
   ): Studio if normal.y ≥ cos(MaxSlopeAngle) (Studio), else
   Studio removes the into-floor part. Both leave a vertical target
   vertical. The physics is the Running/Climbing controller Studio
@@ -530,14 +650,13 @@ The controller's character never tips,   so rustudio leaves GettingUp on the nex
   same but at most 3.0902 per step (walk-off 0 → 3.0902 → 9.2705 →
   14.6352). rustudio: `physics::climb_step`, `mech::climb_controller`,
   `CLIMB_GAIN_PER_STEP`, `CLIMB_HORIZONTAL_STEP_MAX`, `humanoid_steps`.
-- FindLadder (classic, Studio → Studio; Studio is the
+- FindLadder (classic, Studio; Studio is the
   ControllerManager sensor). Look = the root CFrame's look vector. Broad
   query: a world box centred reach × 0.75 (Studio) ahead, ± that in
   X and Z, from root.y − (height − 0.3) up to root.y + 1 (Studio).
-  Its parts are the *include list* of every later ray (FUN_140adf070).
+  Its parts are the *include list* of every later ray (FUN_Studio).
   A down ray of height − 0.3 (only candidates) sets the drop; samples start
-  at root.y − drop + step (index 1) every height/3 × 1/7 (Studio,
-  Studio), up to index floor((height − 0.3)/step) + 10 (Studio),
+  at root.y − drop + step (index 1) every height/3 × 1/7 (Studio), up to index floor((height − 0.3)/step) + 10 (Studio),
   each a ray of reach × 1.5 (Studio) along the look. A TrussPart hit
   (virtual 0x2a8 == 3) succeeds at once; otherwise the rung pattern below
   2.45 × height/3 (Studio, /5 Studio). Reach R6 0.7 / R15 1.2
@@ -552,8 +671,7 @@ The controller's character never tips,   so rustudio leaves GettingUp on the nex
   truss climbs (root 10.378). Earlier: rung gaps 0.2–2 climb, 3–4 do not;
   truss face 1.0 from the root climbs, 1.1 does not.
 - ClimbSensorUseLookAsNormal (registered Studio, value Studio;
-  `game:GetFastFlag` → true) is read only in Studio (Studio,
-  Studio → Studio): the ControllerManager sensor replaces its
+  `game:GetFastFlag` → true) is read only in Studio (Studio): the ControllerManager sensor replaces its
   normal with the look. The classic Humanoid keeps the ray's hit normal.
 - When FindLadder runs (Studio): only if the state's row of the
   transition table Studio (0x4c per state, 18 = none) has a ladder
@@ -643,7 +761,7 @@ The controller's character never tips,   so rustudio leaves GettingUp on the nex
   `climbing_held_jump_regrabs_like_studio`, `climbing_hugs_ladder_like_studio`,
   `climbing_tall_part_ladder_stays_close`.
 - Ledges (2026-11-11). Studio has no ledge climb for a wall that reaches
-  the floor. Studio Studio, rung pattern: a sample counts as a
+  the floor. Studio, rung pattern: a sample counts as a
   hit only if the hit point is within reach (R6 0.7, R15 1.2) of the
   ray's start; the ray itself is reach × 1.5 long, and that length only
   matters for a TrussPart, which succeeds on any hit. `first` is the
@@ -724,7 +842,7 @@ So   the velocity closes on the move vector at 35 /s and Jump settles at   500 /
 Seated was located; the re-sit cooldown wasn't found
 in it, so `SEAT_COOLDOWN_S` stays an estimate.
 
-## Round 14: API surface (from Studio, Studio)
+## Round 14: API surface (from Studio)
 
 **Member access messages** (Luau instance bridge, Studio; strings at
 …). The stubs (src/stubs.rs) and the runtime
@@ -879,7 +997,7 @@ offline Studio now draws textured terrain.** Earlier: Studio asks for terrain
 TexturePacks as KTX2 representations (`7rdo`, `doNotFallbackToBaseline`);
 with FStringTextureTranscodeRollout off it asks for the baseline pack but
 never fetches the maps inside it (SSL "certificate unknown" in
-mockblox.err). So an offline Studio shows each material's `avgAlbedo`
+the local backend.err). So an offline Studio shows each material's `avgAlbedo`
 (FStringTerrainColorTable) recoloured by MaterialColors. The terrain corpus
 runs rustudio with `RUSTUDIO_MATPACKS=0` so both draw the same fallback;
 with packs rustudio draws the real textures (same shader, layer ≥ 0).
@@ -2666,4 +2784,207 @@ NormalMap, RoughnessMap and MetalnessMap use the asynchronous material-pack
 loader; StudsPerTile controls projection density and variant faces have no
 random rotation or offset. These paths still require Studio image parity
 verification; the 25 original flat-reference MAEs are invalid as texture scores.
+
+## Freeform drag parity (2026-11-10)
+
+Reference: own hidden Studio, Select tool, 862x675 view,
+`Camera.CFrame = CFrame.lookAt((0,20,20), (0,2,0))`, FieldOfView 70, a
+512x4x512 locked baseplate at (0,−2,0); snapping through
+`DraggerService.LinearSnapEnabled / LinearSnapIncrement` (scriptable). Mouse
+drags were sent with a scripted mouse `drag`; R / T were pressed by a second, concurrent
+`key` call while the drag (6 s, 60 steps) was held. Studio's own SelectDragger plugin scripts
+(DraggerFramework.Utility.DragHelper, getGeometry, JointPairs, PartMover, Math;
+DraggerSchemaCore.FreeformDragger, SelectionInfo, dispatchWorldClick,
+TransformHandlesImplementation, ExtrudeHandlesImplementation;
+DraggerContext_PluginImpl). `Camera:ViewportPointToRay(431, 337.5)` returned the
+LookVector exactly: the mouse ray uses no half-pixel offset (as `camera.rs`).
+
+| Plugin function | What it does | rustudio |
+|---|---|---|
+| DraggerContext_PluginImpl.getGridSize / shouldGridSnap | `DraggerService.LinearSnapIncrement`; snapping is off while Shift is held (getGridSnapEnabled, used for the grab point, ignores Shift) | `drag_grid`, `PartDrag::shift` |
+| areCollisionsEnabled / shouldJoinSurfaces | `plugin.CollisionEnabled`; `plugin:GetJoinMode() ~= None` (both off in a fresh Studio; the ribbon actions toggleCollisionCheckAction / toggleJointCreationAction flip them) | `Editor::collisions` / `join_surfaces`, menu on the Geometric button; `mech::*_ON_BY_DEFAULT` = false |
+| SelectionInfo.computeInfo | box basis = `BasisObject:GetPivot()`; BasisObject is the last object collected, measured to be the grabbed one when several are selected (UseLocalSpace made no difference); parts' boxes in that frame; with more than one object the basis moves to the box centre | `DragBox::new`, `start_part_drag` |
+| dispatchWorldClick.buildFreeformDragInfo | grab point rounded on X / Z of the clicked surface's TargetMatrix, `floor(x/grid + 0.5)*grid` | `FreeDrag::begin` |
+| getGeometry | vertex / edge / face tables (Brick for blocks, balls, cylinders; Wedge; faces carry point, normal, `direction`, CCW vertices) | `Solid::geometry` (same order, 0-based) |
+| getSurfaceMatrixForPrimitiveMesh (+ getClosestFace, buildSurfaceMatrix) | closest face = min \|(hit−point)·n\|; of the edges not above that face's plane (`(v−point)·n < 0.001`), the one whose line passes nearest the hit; origin = its nearer end; `CFrame.fromMatrix(origin, n × edge, n)` | `surface_matrix` |
+| getSurfaceMatrixForSurfaceExtension | nothing under the mouse: the last target's plane, extended; no last target: no move | `FreeDrag::surface` |
+| getDragTargetNew + computeDragSnapping | R7 = (M⁻¹·basis).Rotation; size in surface = AABB of the box rotated by R7·tilt; hit rounded on M's X / Z; lift `0.5·size.Y − (R7·tilt·(offset − draggedPoint)).Y`; `mainCFrame = M·(x,0,z)·(0,lift,0)·R7·tilt·(−draggedPoint)`; soft snaps only with Snap to Parts (off) | `FreeDrag::target` |
+| updateTiltRotateNew (DraggingParts.processKeyDown) | R: axis = target UpVector under the mouse; T: `cameraCFrame:VectorToWorldSpace(1,0,0)`; the basis axis (±X, ±Y, ±Z of the original box) most aligned with it; `tilt = roundRotation(fromAxisAngle(a, π/2)) · tilt` | `FreeDrag::turn`, `rotate_part_drag` (re-runs the drag) |
+| JointPairs.new / tryToCreateJointPair / createJoints | candidates within `|Δpos| ≤ |size₀|/2 + |size₁|/2 + 0.05`; faces with normals dot < −0.999 and planes within 0.05 that overlap (isVertexInFace with 0.01 margin, either way, or edgeIntersectsEdge); cylinders only on end faces; no joints in a Humanoid model; one `Weld` per pair parented to the moved part, C0/C1 = part⁻¹ · fromMatrix(face centre, direction, normal × direction) | `joint_between`, `surface_joints`, one undo step (`Document::record_drag`) |
+| TransformHandlesImplementation._safelyTransformParts | Collisions: wanted transform overlaps (`ArePartsTouchingOthers`, 0.001 ignored) → bisect from the last good one, 32 steps, stop within 0.0005; within 0.001 of the last good → keep it; a target past the obstacle that doesn't overlap is accepted | `safe_amount`, `solids_overlap` (SAT), `Editor::overlaps_others`; Move / Rotate / Scale handles |
+| ExtrudeHandles._binarySearchForGoodPartSize | the same search on the size fraction (32 halvings) | Scale handles use `safe_amount` on the amount |
+
+Measured final CFrames (position; rotation shown when not identity). All are
+unit-tested in `part_drag::studio_parity_tests::studio_freeform_drags` (Studio
+values as expected, ≤ 0.001 studs, rotation to Studio's 5 printed decimals) and
+replayed through the editor in `selftest/drag_parity.rs` (tests/drag_parity.rs).
+
+| Case (press → release px, snap) | Studio | rustudio |
+|---|---|---|
+| 2x4x6 on baseplate, (441,319)→(538,298), snap 1 | (6, 2, −7) | (6, 2, −7) |
+| same, snap 0.5 | (7, 2, −7.5) | (7, 2, −7.5) |
+| same, snap off | (6.78342, 2, −7.04042) | (6.78342, 2, −7.04041) |
+| snap 1, R | (6, 2, −5), rot Y +90° | same |
+| snap 1, T | (6, 3, −8), rot X +90° | same |
+| snap off, R then T | (6.51291, 1, −8.25159), rows (0,0,1)(1,0,0)(0,1,0) | same |
+| onto 30° wedge slope, →(552,300), snap 1 | (6, 4.73205, −2.26795) | same |
+| same, snap off | (6.95338, 4.45120, −1.78150) | same |
+| same, snap off, R | (6.68287, 3.01916, −1.30114), rot Y +90° | same |
+| onto a 12x4x12 part's top, →(583,221), snap 1 / off | (9, 6, −11) / (9.79344, 6, −10.38101) | same |
+| onto a wall's +Z side, →(584,232), snap 1 / off | (8, 3, −3) / (8.75779, 3.20530, −3) | same |
+| part turned 30° about Y, R / T, snap off | (7.00563, 2, −5.93604) / (6.19330, 3, −7.92103) | same |
+| group (cube + 30° cube), snap 1 / off | Probe (6,2,−7), Probe2 (2,1,−4) / +(0.78342, 0, −0.04042) | same |
+| group with a 30°/20° tilted cube, grabbing the cube / the tilted one | Probe y 2.11 / 5.87141 (box in the grabbed part's frame) | same |
+| same, R then T | Probe (6.51291, 5.28171, −8.25159) | same |
+| Model, no PrimaryPart, no WorldPivot | pivot (1,2,0) → (7,2,−7) | same |
+| Model, WorldPivot (5,7,1) turned 30° Y; snap off | pivot (11,7,−6) / (11.78342, 7, −6.04042) | same |
+| Model, WorldPivot turned (30°, 0, 15°), snap off | parts lifted to y 4.62708 (box in the pivot's frame) | same |
+| Model, PrimaryPart turned 30° Y / 25° X | pivot (9,1,−7) / (9.78342, 2.53209, −7.04042) | same |
+| Model with tilted WorldPivot, T | pivot (11.81823, 5.49907, −3.70759) | same |
+| Join Surfaces, probe dropped at (6,2,−7) | `Weld` in Probe, Part1 Baseplate, C0 (0,−2,0) rows (1,0,0)(0,0,−1)(0,1,0), C1 (6,2,−7) | same (`studio_join_surfaces`) |
+| Join, against the wall's +Z face | C0 (0,0,−3) rows (1,0,0)(0,−1,0)(0,0,−1), C1 (0,−1,2) | same |
+| Collisions, Move arrow +X into a 2x8x8 wall at (8,4,0) | x = 5.00074 (off: 7.98286) | 5.0007 ± 0.001 over the same 16 mouse steps (`studio_move_handle_collision`) |
+
+Visual parity (screenshot pairs, Studio left, rustudio right, both 862x675
+with the same camera; rustudio headless under gamescope): selection is drawn
+as Studio's Outlines mode, a ~2.5 px band of Select Color (0.1, 0.6, 1) around
+the silhouette (convex hull of the projected shape) instead of a box
+wireframe; hover is a 4 px band of Hover Over Color (0.7, 0.9, 1)
+(DraggerService.HoverThickness = 4) and is not drawn while dragging; Move /
+Scale / Rotate / Transform show a white pivot dot ringed in Select Color; a
+free drag hides the handles and shows the hotkey list (T, R, Alt, Shift,
+Shift+X/C, H; H hides it); a Move arrow drag draws only that arrow, a white
+guide along its axis and the distance in a label, and the 4-row hotkey list.
+Not built: the dragged-point marker and snap relation lines
+(_renderSnapRelation / TargetGridView), Studio's arrow size and thickness
+(its arrows are about 1.7x longer here), Align Dragged Objects, Snap to Parts
+soft snaps, Physical (constraint-solving) mode, terrain targets, corner wedge
+and mesh surface frames (treated as their boxes), and the tilt animation.
+
+## Ctrl+R / Ctrl+T: RotateSelectionAction / TiltSelectionAction (2026-11-11)
+
+Both are native C++ actions (RTTI `.?AVRotateSelectionAction@Studio@RBX@@`
+TD Studio, vtable Studio, ctor Studio;
+`.?AVTiltSelectionAction@Studio@RBX@@` TD Studio, vtable Studio,
+ctor Studio). Their trigger (vtable) builds a 3x3 matrix and calls
+the shared Studio, which runs the legacy part mover (Studio …
+Studio) and sets the waypoint named by vtable +8 of the
+sub-object at.
+
+| Piece | Studio | rustudio |
+|---|---|---|
+| Rotate matrix | constant at Studio, rows (0,0,1)(0,1,0)(−1,0,0): 90° about **world +Y** (`CFrame.Angles(0, π/2, 0)`), regardless of camera or part orientation | `ROTATE_MATRIX` |
+| Tilt matrix | camera CFrame (): θ = atan2(R02, R22) = heading of the camera's back vector; `q = floor((θ + 2.25π)·4/2π) & 3`; q 0 → Rx(+90°), 1 → Rz(−90°), 2 → Rx(−90°), 3 → Rz(+90°) (q 1 and 3 are the constants at Studio, q 0 and 2 are written inline). That is a forward quarter turn about the world horizontal axis nearest the camera's right; pitch is ignored; quarter 0 is θ ∈ [−45°, 45°), so exactly 45° already counts as quarter 1 | `tilt_matrix` |
+| Parts | every selected PVInstance (Models, parts; Folders etc. are searched for PVInstances), expanded to their parts; **Locked parts turn too**; deduplicated through a `std::set` keyed by the parts' shared_ptr control block, so the list ends up in **heap-address order** | `selected_parts()` (selection order) |
+| Centre | the frame of the *last* part of that list (a "largest part" loop whose running maximum is never updated: `comiss xmm1, xmm6` with xmm6 = 0, so any part with area wins); the box around every part's corners in that frame; its centre back in world space | `quarter_turn_centre` with the last selected part |
+| Transform | each part: `T · M · T⁻¹ · cf`, T = translation to the centre; Model WorldPivots (no PrimaryPart) get the same rigid transform | `quarter_turn_selection` (+ `apply_model_pivots`) |
+| Rounding | every CFrame component to the nearest 1e-6 (`ceil(v·1e6 − 0.5)/1e6`, mirrored for negatives; \|v\| < 1e-5 → 0), then Gram-Schmidt orthonormalisation of the columns. **No grid snap**, no push out of overlaps (Studio afterwards only updates contacts) | `round_turned` |
+| Undo | waypoint `"SelectionRotate"` / `"SelectionTilt"`; `ChangeHistoryService:GetCanUndo()` returned `true, "SelectionTilt"`. Nothing to turn → no waypoint | `record_props("SelectionRotate" / "SelectionTilt")` |
+| Enabled | whenever something is selected (disabled with an empty selection; enabled for an empty Folder, which then does nothing); the trigger has no tool or drag check, and it worked with the Move tool active | always bound; no tool check |
+| Bare R / T | only bound to disabled plugin actions (LayeredClothingEditor LockControl, PathEditor AddTangentMode); outside a part drag they do nothing in the 3D view. During a drag they are DraggingParts.processKeyDown (updateTiltRotateNew, see "Freeform drag parity"), unchanged and still covered by the flat_rot_r / flat_tilt_t / rotated_r / rotated_t cases | `rotate_part_drag` only while `part_drag` is set |
+
+Live check: own hidden Studio, anchored parts
+A (1.3,2.7,−0.4)·Angles(0.3,0.5,0.1) 2x4x6, B (6,1,3)·Angles(0,0.4,0) 1x2x3,
+C (−3,5,2)·Angles(0.2,0,0.7) 3x1x1, a Model holding A and B with WorldPivot
+(5,7,1)·Angles(0,0.5,0.2), the actions run through `invoke_action`. Each
+measured centre matched the corner box in exactly one part's frame (to 1e-5),
+always the last of Studio's list: {A,B,C} → C, {C,B,A} → A, Model{A,B} → B,
+{A,B} → B, {B,A} → B, but {A,B} with B locked and Folder{A,B} → A, i.e. the
+order is not the selection order (heap order, effectively arbitrary). With
+parts that share an orientation the frame makes no difference. A single
+rotated part turned in place; a Model's pivot moved with its parts
+((5,7,1) → (3.06465,7,−1.68193)); a PrimaryPart model's pivot followed its
+PrimaryPart; a 1x3x8 part at (0.5,1.5,0.25) on a baseplate tilted into the
+baseplate and stayed at (0.5,1.5,0.25). Tilt from cameras at (0,20,20),
+(20,10,5), (−6,10,−20), (−20,5,3) looking at (0,2,0) gave Rx(+90), Rz(−90),
+Rx(−90), Rz(+90). Ctrl+R pressed in the middle of a mouse drag was not
+measured (the hidden window can't hold a drag and a chord at once); from the
+code it turns the parts and the drag's next mouse move puts them back on its
+own transform, which is what rustudio does too.
+
+All of these cases are `part_drag::quarter_turn_cases::CASES`, run through
+`quarter_turn_selection` (CFrames, Model pivot, then undo) in
+`part_drag::quarter_turn_tests::studio_quarter_turns`, with Studio's order
+given as the part order; `tilt_quarters_follow_the_camera_heading` covers the
+quarter seams and `turned_cframes_are_rounded_like_studio` the rounding.
+
+## Terrain against textured Studio (2026-11-10)
+
+**Reference.** Studio fetches terrain TexturePacks as alternate content
+representations (`assetType` TexturePack, priority list `ktx2` / `7rdo`,
+fidelities `AkA=` / `IkA=` / `QkA=`, `doNotFallbackToBaselineRepresentation`)
+and draws flat avgAlbedo from the baseline XML. Studio now serves Roblox's own
+KTX2 files, mirrored anonymously into `~/.local/share/Studio/assets/acr/<id>/
+ktx2-7rdo-<fidelity hex>.bin` (+ `.json`, the batch reply's metadata) by
+`assets.py`; `routes.py` reloads `assets.py`. Wine does socket and file I/O
+in the shared wineserver, so every Studio's HTTP reaches the first launch's
+the local backend: per-launch env or bind mounts don't apply. Studio's log then shows
+`Terrain TextureArray 512x512, arraySize: 37, mip: 10`.
+
+**Rig.** `tools/fidelity/terrain_closeup.py` (`--reuse-studio DIR`, `--only`):
+Studio's 3D view runs under its 38 px device bar (the vertical FOV spans all
+675 px), so rustudio renders the full viewport and both lose the bar's rows;
+the old 637 px rustudio view was 5.7 % zoomed and shifted 19 px (per-patch
+shift fields, `shiftmap`). The overlay chip and gizmo are masked.
+25 close-ups: mean MAE 20.6 → 5.5, 20 under 8
+(`~/.cache/rustudio/terrain-cmp/report.md`).
+
+| What | Studio (Studio 0.744) | rustudio |
+|---|---|---|
+| Terrain textures | the KTX2 representations: BC1 / BC3, zstd, 512² pre-2022 / 1024² 2022, full mips. AkA= albedo (pre-2022 YCoCg: R = Co + ½, G = Y, B = Cg + ½; 2022 RGB + tint mask in A), IkA= normal (X in A, Y in G), QkA= specular (G roughness, B emissive mask, A height). Pre-2022 albedo is ~7 levels darker than the pack's colour PNG | `matpack::build_acr` (fetched like Studio, cached `<id>_acr_ktx2-7rdo-<fid>.ktx2`; `RUSTUDIO_TERRAIN_ACR=0` or offline falls back to the pack maps) |
+| Array size | 512²: a 1024² layer's level 1 | shader: LOD never below 1 |
+| Tiling | CB2.x = table tiling × 0.25 (per 4-stud voxel); Brick 0.8 → a tile every 5 studs | `terrain_mat::VOXEL_STUDS` |
+| Detiling | CB2.y = 1 / table detiling; offset (r, ⌊2.6651442 r⌋) × CB2.y | `Tex::detiling` |
+| Axes | 18 U / V vectors (.rdata Studio; diagonals 0.7): 0 +X … 3 −Z, 4–7 XZ diagonals, 8 up, 9–12 tilted up, 13 down, 14–17 tilted down. Chooser Studio: y > 0.9 up, > 0.4 tilted, ≥ −0.6 side (diagonal when the other component ≥ half), ≥ −0.8 tilted down; cube materials the dominant axis | `terrain::AXIS_U / AXIS_V / studio_axis` |
+| Axis normal | soft: vertex normal; hard: face; hardsoft: vertex while dot(face, vertex) > 0.75, else face | `chunk_triangles` |
+| Face | axis 0–7 side, 8–12 top, 13–17 bottom; a missing bottom is the top | `face_of_axis`, `terrain_mat::parse` |
+| Corner random | boost hash_combine of the cell's global voxel index, then Wang's hash; byte 0 = texture random, corner k = its own cell | `studio_cell_hash` |
+| Quad diagonal | q1–q3 when q1, q3 share a material q0 or q2 has (every flat one-material quad), else q0–q2 | `chunk_triangles`, `build_meshes` |
+| Deform | one mode per material (last of shift, cubify, quantize): shift ± amount × (2 b / 255 − 1), b = hash bytes 0 / 1 / 2; then clamp to the cell | `cell_vertex` |
+| Vertex normals | area-weighted sum of touching triangles after deform | `chunk_triangles` (rim cells keep the field gradient) |
+| FS HQ | YCoCg texels blended then decoded unclamped; normal texels blended, bump × 1/|w|, frame (N.z,0,−N.x)/(0,1,0) for axes 0–7, (−N.y,N.x,0)/(0,−N.z,N.y) for 8–17; F0 0.04 env BRDF reflection × EnvironmentSpecularScale; emissive = Σ bary CB5 × mask | `fs_terrain` |
+| Emissive | static defaults: CrackedLava strength 2.0, tint white; others 0 | `terrain_mat::CRACKED_LAVA_EMISSIVE` |
+| MaterialColors | no rebake: a CB4 shader variant. Built-in (pre-2022) layers: HSV of default and current colour from sRGB / 255, x = clamp(V/V₀, 0, 2), s = clamp(S/S₀, 0, 2), θ = H − H₀, CB4 = (x, cos θ·s·x, sin θ·s·x); Y × x, chroma turned. Other layers (2022, MaterialVariant): CB4 = colour / 255, albedo × mix(1, colour, mask), always | `terrain_mat::recolor`, `set_override_tint` |
+| Water cover | CB3[2] = (T / (1990 T + 10), 1 − T, WaterReflectance): cover = clamp(depth × .x + .y); WaterColor squared | `water.rs` (Water 41.5 → 12.6) |
+
+Measured on the rig: live Concrete 127,102,63 → 220,40,70 comes out pale
+pink in both (rustudio Play vs Studio command bar, MAE 1.98); the
+MaterialVariant override (Brick maps, 8 studs per tile) MAE 5.54.
+
+Open: 2022 materials are unverified (this Studio draws the pre-2022 table even
+with `Use2022MaterialsXml` true in the file); Studio lowers water vertices by
+half a voxel (not applied); the TerrainVirtualTexture path; Rock / Cobblestone
+bumps a little stronger than Studio's (sun vs ambient balance).
+
+## Round 27: the Humanoid as a dynamic assembly (the only character path)
+
+The kinematic capsule of rounds 22 to 26 is gone (its code, `RUSTUDIO_HUMANOID`, `mech::CAPSULE_*`, the climb /
+turn / ragdoll timers fitted for it). A character is one rapier body driven by a port of Studio's `HUMAN::` state
+machine. The specification with every address is `checks/humanoid-physics/SPEC.md`; what is measured against
+Studio is `checks/humanoid-physics/RESULTS.md` (probes T1 to T19 from the agents' Studio) and
+`checks/humanoid-physics/ticks/` (Studio stepped one 240 Hz tick at a time).
+
+| What | How | Source |
+|---|---|---|
+| World step | 240 Hz for every body (`mech::PHYSICS_HZ`), at most 16 a frame | Studio's world step |
+| State machine, forces | `src/humanoid.rs`: Running (hip-height spring on the floor rays, horizontal PD with the friction limit, yaw servo, balance torque P 5000 / D 100), Jumping, Freefall, Landed, Climbing, Swimming, Seated, PlatformStanding, FallingDown, GettingUp, Ragdoll, Dead | Studio and the state classes' force functions (SPEC §2) |
+| Timestep level | a Running character at WalkSpeed 8 to 16 is solved on every 2nd tick over 2h and is out of the solver in between; a drop of level is immediate, a rise waits 60 ticks | Studio; probes T1, T3, T10 |
+| Jump | the take-off speed 1.06 × JumpPower in one step; the push repeats while the root part's own velocity is short of it (a spinning assembly: until the floor rays lose the floor) and never starts under a ceiling (rays 1.5 × root height + Head height up from the root) | Studio; probes T4, T19; tools/fidelity movement-Place B jump_run |
+| Mass | parts weigh their physics geometry (the Head its mesh hull); the assembly's centre and inertia are those of the joints' own pose, whatever the animation does | Studio; measured (AssemblyCenterOfMass constant under animation) |
+| AssemblyLinearVelocity | the centre of mass's velocity | measured (53.0114 against the root part's 52.9998) |
+| Contacts | touching points only (no speculative gap); up to 0.05 studs of penetration stays, 0.7 of the excess leaves per solve; friction and elasticity are the two parts' weighted means; a contact bounces at e × its closing speed when that was 1 stud/s or more and it carried no impulse before | Studio; probes T8, T10, T19. Known differences below |
+| Seats | a touch seats 3 frames later (the server's SeatWeld on its way back); only the seat just left is refused | probes T12, T13 |
+| Scripts | a script disabled while it runs ends (connections, waiting threads) | probes T8 on (Animate off) |
+| Frame order | PostSimulation and Heartbeat with what they resume, then RenderStepped | checks/humanoid-physics/feel |
+
+Gates (tools/fidelity, `tools/fidelity/movement_gates.md`): movement-r15 95.3, movement-r6 95.5, movement-Place B
+91.6, movement-nova 100; the wall places against Studio's three reference runs: R15 85.6 (Studio's own runs 86.6),
+R6 77.4 (80.9).
+
+Known differences (open, `checks/humanoid-physics/PROGRESS.md`): a pressed character's bouncing against a wall
+(rustudio's rule for a bounce is not Studio's rows: those bounce on every closing contact, and a port of them
+follows Studio tick for tick in the joints' own pose but bounces far more than Studio once the animation moves
+the head, `ticks/own-contact-solve.patch`); pushing a server-owned character (T11); Studio's contact rules for
+bodies that are not characters and their 60 Hz stepping (T14); a pushed block lagging its pusher by a tick of
+friction (T10).
 

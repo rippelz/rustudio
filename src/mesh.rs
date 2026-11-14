@@ -2,9 +2,9 @@
 //! and Wavefront OBJ text, flattened into a de-indexed triangle list.
 //!
 //! Every read is bounds-checked; malformed or unsupported input yields
-//! `Err(String)` rather than a panic. Positions, normals and UVs are
-//! extracted; tangents, colors, skinning, bones, subsets and FACS data are
-//! skipped. For multi-LOD meshes only the highest-detail LOD is used.
+//! `Err(String)` rather than a panic. Positions, normals, UVs, vertex colours
+//! and skinning are extracted; tangents, subsets and FACS data are skipped.
+//! For multi-LOD meshes only the highest-detail LOD is used.
 //!
 //! UVs follow the image convention: (0,0) is the top-left of the texture and
 //! v grows downwards. Binary Roblox meshes already store UVs this way; v1.x
@@ -20,9 +20,14 @@ pub struct MeshData {
     pub normals: Vec<glam::Vec3>,
     /// Texture coordinates, one per position; (0,0) is the image's top-left.
     pub uvs: Vec<glam::Vec2>,
-    /// Per-corner colours (sRGB 0..1, alpha 1), or empty: unions keep each
-    /// child part's colour this way (SolidMesh's fourth array).
+    /// Per-corner colours (sRGB 0..1), or empty: unions keep each child
+    /// part's colour this way (SolidMesh's fourth array, alpha 1), and
+    /// `.mesh` / OBJ files their vertex colours (see `colors_tint`).
     pub colors: Vec<glam::Vec4>,
+    /// `colors` are file vertex colours, which multiply the part's Color and
+    /// Transparency (Studio's part VS: `VARYING2 = COLOR0 × instance colour`)
+    /// rather than replace it as union child colours do.
+    pub colors_tint: bool,
     /// CSGMDL projection plane per corner; empty for authored UV meshes.
     pub projection_tags: Vec<u8>,
     /// Axis-aligned bounds of the positions.
@@ -30,6 +35,21 @@ pub struct MeshData {
     pub max: glam::Vec3,
     /// Skinning (v4+ bones and per-vertex weights), one entry per corner.
     pub skin: Option<Skin>,
+}
+
+impl MeshData {
+    /// `colors` as the renderer's vertex attribute (shader.wgsl `vcol`):
+    /// alpha 0 = none, alpha 1 = a union child colour replacing Color, and
+    /// alpha in [-2, -1] = a vertex colour tint with alpha `-a - 1`.
+    pub fn gpu_colors(&self) -> Vec<glam::Vec4> {
+        if !self.colors_tint {
+            return self.colors.clone();
+        }
+        self.colors
+            .iter()
+            .map(|c| c.truncate().extend(-1.0 - c.w.clamp(0.0, 1.0)))
+            .collect()
+    }
 }
 
 /// A mesh bone: its name, parent bone (None at the root) and bind-pose
@@ -59,6 +79,22 @@ pub struct Skin {
 /// Returns Err(String) for unsupported versions/encodings (e.g. Draco-compressed
 /// v7 geometry) or malformed data; never panics on bad input.
 pub fn parse(bytes: &[u8]) -> Result<MeshData, String> {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(bytes).take(64 * 1024 * 1024).read_to_end(&mut decoded).map_err(|e| e.to_string())?;
+        return parse(&decoded);
+    }
+    if bytes.starts_with(b"<roblox!") {
+        let dom = rbx_binary::from_reader(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+        for inst in dom.descendants() {
+            if inst.class != "PartOperationAsset" { continue; }
+            if let Some(rbx_dom_weak::types::Variant::BinaryString(blob)) = inst.properties.get(&"MeshData".into()) {
+                return parse(blob.as_ref());
+            }
+        }
+        return Err("PartOperationAsset: missing MeshData".into());
+    }
     if let Some(at) = solid_mesh_start(bytes) {
         parse_solid_mesh(&bytes[at..])
     } else if is_csgmdl(bytes) {
@@ -447,13 +483,17 @@ fn span_end(
         .ok_or_else(|| format!("mesh: truncated {what} ({count} x {stride} bytes at offset {off})"))
 }
 
-/// Position, normal and UV of one indexed vertex.
+/// Position, normal, UV and RGBA colour (white when the format has none) of
+/// one indexed vertex.
 #[derive(Clone, Copy)]
 struct Vertex {
     pos: Vec3,
     nrm: Vec3,
     uv: Vec2,
+    col: [u8; 4],
 }
+
+const WHITE: [u8; 4] = [255; 4];
 
 /// COREMESH v2: a u32 length, then a Draco bitstream holding the vertices
 /// (Position, Normal, TexCoord attributes) and triangles, decoded with
@@ -501,11 +541,13 @@ fn decode_draco_core(data: &[u8]) -> Result<(Vec<Vertex>, Vec<[u32; 3]>), String
     let pos = attrs[0].read_f32s(n, 3);
     let nrm = attrs[1].read_f32s(n, 3);
     let uv = attrs[2].read_f32s(n, 2);
+    let col = attrs[4].read_f32s(n, 4);
     let verts = (0..n)
         .map(|i| Vertex {
             pos: Vec3::new(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]),
             nrm: Vec3::new(nrm[i * 3], nrm[i * 3 + 1], nrm[i * 3 + 2]),
             uv: Vec2::new(uv[i * 2], uv[i * 2 + 1]),
+            col: [0, 1, 2, 3].map(|k| col[i * 4 + k] as u8),
         })
         .collect();
     let mut faces = Vec::with_capacity(mesh.num_faces());
@@ -521,7 +563,8 @@ fn decode_draco_core(data: &[u8]) -> Result<(Vec<Vertex>, Vec<[u32; 3]>), String
     Ok((verts, faces))
 }
 
-/// Reads position, normal and (when the record is >= 32 bytes) UV from each
+/// Reads position, normal, (when the record is >= 32 bytes) UV and (when it
+/// is >= 40 bytes: pos, normal, uv, u8×4 tangent, u8×4 RGBA) colour from each
 /// vertex record of `stride` bytes. UVs are kept as stored (v points down).
 fn read_vertices(
     data: &[u8],
@@ -542,6 +585,11 @@ fn read_vertices(
                 Vec2::new(f32_at(rec, 24), f32_at(rec, 28))
             } else {
                 Vec2::ZERO
+            },
+            col: if stride >= 40 {
+                [rec[36], rec[37], rec[38], rec[39]]
+            } else {
+                WHITE
             },
         })
         .collect();
@@ -609,6 +657,7 @@ fn build_indexed(verts: &[Vertex], faces: &[[u32; 3]]) -> Result<MeshData, Strin
         }
         let v = i.map(|i| verts[i]);
         out.push(v.map(|v| v.pos), v.map(|v| Some(v.nrm)), v.map(|v| v.uv));
+        out.push_colors(v.map(|v| glam::Vec4::from_array(v.col.map(f32::from)) / 255.0));
     }
     Ok(out.finish())
 }
@@ -673,7 +722,7 @@ fn solid_mesh_start(bytes: &[u8]) -> Option<usize> {
     head.windows(9).position(|w| w == b"SolidMesh")
 }
 
-/// Studio's SolidMesh reader (Studio, Studio measurements
+/// Studio's SolidMesh reader (Studio measurements
 /// "Unions"): `SolidMesh` + u32 version 0, then
 /// positions (u64 n, n × vec3), normals (vec3[]), UVs (u64 n, n × 2 f32),
 /// per-corner colours (vec3[], sRGB 0..1: the child parts' colours), then
@@ -783,16 +832,76 @@ fn is_csgmdl(bytes: &[u8]) -> bool {
     csgmdl_header(bytes).is_some()
 }
 
-/// CSGMDL version 5 (Studio 0.746, Studio measurements "Unions"),
+// Legacy cloud PartOperationAsset meshes encrypt the entire stream. Version 2
+// has a 32-byte identifier, then fixed-stride vertices and u32 triangle indices.
+fn parse_csgmdl_legacy(bytes: &[u8], version: u32) -> Result<MeshData, String> {
+    let key = csgmdl_key();
+    let decoded: Vec<u8> = bytes.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect();
+    let mut r = Reader::new(&decoded);
+    r.take(42)?;
+    let count = r.u32()? as usize;
+    if count > 60000 { return Err("CSGMDL: vertex count over 60000".into()); }
+    let stride = r.u32()? as usize;
+    if stride != 84 { return Err(format!("CSGMDL v2: unsupported vertex stride {stride}")); }
+    let raw = r.take(count.checked_mul(stride).ok_or("CSGMDL v2: vertex count")?)?;
+    let ni = r.u32()? as usize;
+    if ni > 120000 || ni % 3 != 0 { return Err("CSGMDL: index count".into()); }
+    let indices = r.take(ni.checked_mul(4).ok_or("CSGMDL v2: index count")?)?;
+    // Studio v4 branch: raw u32 indices, followed by
+    // a u32-counted LOD offset array, not v5 delta coding.
+    let indices = if version == 4 {
+        let nl = r.u32()? as usize;
+        if !(2..=20).contains(&nl) { return Err("CSGMDL v4: LOD count".into()); }
+        let mut lods = Vec::with_capacity(nl);
+        for _ in 0..nl { lods.push(r.u32()? as usize); }
+        if lods.iter().any(|&i| i > ni || i % 3 != 0)
+            || lods.windows(2).any(|w| w[0] > w[1]) {
+            return Err("CSGMDL v4: invalid LOD bounds".into());
+        }
+        for ix in indices.chunks_exact(4) {
+            if u32_at(ix, 0) as usize >= count { return Err("CSGMDL v4: index out of range".into()); }
+        }
+        &indices[lods[0] * 4..lods[1] * 4]
+    } else { indices };
+    let mut out = TriBuilder::with_capacity(indices.len() / 12);
+    let mut colors = Vec::with_capacity(ni);
+    let mut tags = Vec::with_capacity(ni);
+    for tri in indices.chunks_exact(12) {
+        let mut p = [Vec3::ZERO; 3];
+        let mut n = [None; 3];
+        let mut uv = [Vec2::ZERO; 3];
+        for k in 0..3 {
+            let ix = u32_at(tri, k * 4) as usize;
+            if ix >= count { return Err("CSGMDL v2: index out of range".into()); }
+            let v = &raw[ix * stride..(ix + 1) * stride];
+            p[k] = Vec3::new(f32_at(v, 0), f32_at(v, 4), f32_at(v, 8));
+            n[k] = Some(Vec3::new(f32_at(v, 12), f32_at(v, 16), f32_at(v, 20)));
+            uv[k] = Vec2::new(f32_at(v, 32), f32_at(v, 36));
+            if !p[k].is_finite() || !n[k].unwrap().is_finite() || !uv[k].is_finite() { return Err("CSGMDL: non-finite vertex".into()); }
+            colors.push(glam::Vec4::new(v[24] as f32, v[25] as f32, v[26] as f32, v[27] as f32) / 255.0);
+            tags.push(u32_at(v, 28).min(6) as u8);
+        }
+        out.push(p, n, uv);
+    }
+    let mut mesh = out.finish();
+    mesh.colors = colors;
+    mesh.projection_tags = tags;
+    Ok(mesh)
+}
+
+/// CSGMDL version 5 (Studio 0.746, Studio; STUDIO-SKY-RE.md "Unions"),
 /// after the 10-byte header, all per vertex and u16-counted (< 60001):
 /// positions (vec3), normals (u32 byte count, then 3 × u16 each: (v − 0x7fff)
 /// / 32767), colours (RGBA8), projection plane IDs (u8), UVs (2 × f32),
 /// tangents (packed like normals, unused); then an i32 index count, a u32
 /// byte length and the indices delta-coded as SolidMesh's; then a u8 LOD
 /// count and that many u32 offsets: LOD 0 is indices[lod0..lod1].
-/// Versions 2–4 aren't read yet.
+/// Version 4 uses the legacy reader with an explicit LOD array.
 fn parse_csgmdl(bytes: &[u8]) -> Result<MeshData, String> {
     let version = csgmdl_header(bytes).ok_or("CSGMDL: bad header")?;
+    if version == 2 || version == 4 {
+        return parse_csgmdl_legacy(bytes, version);
+    }
     if version != 5 {
         return Err(format!("CSGMDL version {version} isn't read yet"));
     }
@@ -945,6 +1054,8 @@ fn delta_u32s(r: &mut Reader) -> Result<Vec<u32>, String> {
 fn parse_obj(bytes: &[u8]) -> Result<MeshData, String> {
     let text = String::from_utf8_lossy(bytes);
     let mut verts: Vec<Vec3> = Vec::new();
+    // `v x y z r g b [a]` (the common vertex-colour extension), 0..1.
+    let mut vcols: Vec<glam::Vec4> = Vec::new();
     let mut vnorms: Vec<Vec3> = Vec::new();
     let mut vtex: Vec<Vec2> = Vec::new();
     let mut out = TriBuilder::with_capacity(0);
@@ -954,7 +1065,16 @@ fn parse_obj(bytes: &[u8]) -> Result<MeshData, String> {
         let mut it = line.split_whitespace();
         let err = |msg: &str| format!("obj line {}: {msg}", lineno + 1);
         match it.next() {
-            Some("v") => verts.push(obj_vec3(&mut it).ok_or_else(|| err("bad vertex"))?),
+            Some("v") => {
+                verts.push(obj_vec3(&mut it).ok_or_else(|| err("bad vertex"))?);
+                let rest: Vec<f32> = it.map_while(|s| s.parse::<f32>().ok()).collect();
+                vcols.push(match rest.as_slice() {
+                    [r, g, b, a, ..] => glam::Vec4::new(*r, *g, *b, *a),
+                    [r, g, b] => glam::Vec4::new(*r, *g, *b, 1.0),
+                    // `v x y z w` (rational weight) or nothing: no colour.
+                    _ => glam::Vec4::ONE,
+                }.clamp(glam::Vec4::ZERO, glam::Vec4::ONE));
+            }
             Some("vn") => vnorms.push(obj_vec3(&mut it).ok_or_else(|| err("bad normal"))?),
             Some("vt") => {
                 let mut f = || it.next().map(str::parse::<f32>);
@@ -968,15 +1088,15 @@ fn parse_obj(bytes: &[u8]) -> Result<MeshData, String> {
                 vtex.push(Vec2::new(u, 1.0 - v));
             }
             Some("f") => {
-                let mut corners: Vec<(Vec3, Option<Vec3>, Vec2)> = Vec::new();
+                let mut corners: Vec<(Vec3, Option<Vec3>, Vec2, glam::Vec4)> = Vec::new();
                 for tok in it {
                     let mut parts = tok.split('/');
                     let vi = parts.next().unwrap_or("");
                     let vt = parts.next().filter(|s| !s.is_empty());
                     let vn = parts.next().filter(|s| !s.is_empty());
-                    let p = obj_index(vi, verts.len())
-                        .map(|i| verts[i])
+                    let pi = obj_index(vi, verts.len())
                         .ok_or_else(|| err(&format!("bad vertex index {tok:?}")))?;
+                    let (p, col) = (verts[pi], vcols[pi]);
                     let n = match vn {
                         Some(s) => Some(
                             obj_index(s, vnorms.len())
@@ -991,7 +1111,7 @@ fn parse_obj(bytes: &[u8]) -> Result<MeshData, String> {
                             .ok_or_else(|| err(&format!("bad texture index {tok:?}")))?,
                         None => Vec2::ZERO,
                     };
-                    corners.push((p, n, t));
+                    corners.push((p, n, t, col));
                 }
                 if corners.len() < 3 {
                     return Err(err("face with fewer than 3 vertices"));
@@ -999,6 +1119,7 @@ fn parse_obj(bytes: &[u8]) -> Result<MeshData, String> {
                 for i in 1..corners.len() - 1 {
                     let c = [corners[0], corners[i], corners[i + 1]];
                     out.push(c.map(|c| c.0), c.map(|c| c.1), c.map(|c| c.2));
+                    out.push_colors(c.map(|c| c.3));
                 }
             }
             _ => {}
@@ -1038,6 +1159,9 @@ struct TriBuilder {
     positions: Vec<Vec3>,
     normals: Vec<Vec3>,
     uvs: Vec<Vec2>,
+    /// File vertex colours per corner (push_colors after each push); kept
+    /// only when some corner is not opaque white.
+    colors: Vec<glam::Vec4>,
 }
 
 impl TriBuilder {
@@ -1048,7 +1172,13 @@ impl TriBuilder {
             positions: Vec::with_capacity(n),
             normals: Vec::with_capacity(n),
             uvs: Vec::with_capacity(n),
+            colors: Vec::new(),
         }
+    }
+
+    /// The vertex colours (RGBA 0..1) of the triangle just pushed.
+    fn push_colors(&mut self, c: [glam::Vec4; 3]) {
+        self.colors.extend(c);
     }
 
     /// Adds one triangle. A corner normal that is absent, zero or non-finite is
@@ -1080,12 +1210,22 @@ impl TriBuilder {
             min = Vec3::ZERO;
             max = Vec3::ZERO;
         }
+        // All-white (or absent / partial) colours change nothing: leave them
+        // out so the mesh draws exactly as before.
+        let colors = if self.colors.len() == self.positions.len()
+            && self.colors.iter().any(|c| *c != glam::Vec4::ONE)
+        {
+            self.colors
+        } else {
+            Vec::new()
+        };
         MeshData {
+            colors_tint: !colors.is_empty(),
             positions: self.positions,
             normals: self.normals,
             uvs: self.uvs,
             projection_tags: Vec::new(),
-            colors: Vec::new(),
+            colors,
             min,
             max,
             skin: None,
@@ -1099,6 +1239,18 @@ impl TriBuilder {
 
 #[cfg(test)]
 mod tests {
+    // Public PartOperationAsset 428497732, referenced by Village v63 Leaves.
+    #[test]
+    fn village_cloud_union_leaves() {
+        let bytes = include_bytes!("../tests/fixtures/village-leaves.asset.gz");
+        let m = super::parse(bytes).unwrap();
+        assert_eq!(m.positions.len(), 834);
+        assert!((m.max - m.min - glam::Vec3::splat(8.0)).abs().max_element() < 0.001);
+        assert!(m.positions.iter().all(|p| p.is_finite()));
+        assert!(m.normals.iter().all(|n| n.is_finite() && (n.length() - 1.0).abs() < 0.001));
+        assert_eq!(m.colors.len(), m.positions.len());
+    }
+
     use super::*;
 
     /// Little-endian byte builder for synthetic binary meshes.
@@ -1624,6 +1776,71 @@ mod tests {
             let _ = parse(&data);
         }
     }
+
+    /// A v2.00 triangle with 40-byte vertices whose RGBA (bytes 36..40) is
+    /// `cols`, one per vertex.
+    fn v2_colored(cols: [[u8; 4]; 3]) -> Vec<u8> {
+        let mut b = Buf::new("version 2.00\n");
+        b.u16(12).u8(40).u8(12).u32(3).u32(1);
+        for (k, c) in cols.iter().enumerate() {
+            b.vertex(36, [k as f32, (k == 2) as u8 as f32, 0.0], [0.0, 0.0, 1.0]);
+            b.0.extend_from_slice(c);
+        }
+        b.face(0, 1, 2);
+        b.0
+    }
+
+    #[test]
+    fn mesh_vertex_colours() {
+        let m = parse(&v2_colored([[255, 0, 0, 255], [0, 255, 0, 128], [255, 255, 255, 255]])).unwrap();
+        assert!(m.colors_tint);
+        assert_eq!(m.colors.len(), 3);
+        assert_eq!(m.colors[0], glam::Vec4::new(1.0, 0.0, 0.0, 1.0));
+        assert_eq!(m.colors[1], glam::Vec4::new(0.0, 1.0, 0.0, 128.0 / 255.0));
+        assert_eq!(m.colors[2], glam::Vec4::ONE);
+        // The renderer's encoding: tint alpha a → -1 - a.
+        let g = m.gpu_colors();
+        assert_eq!(g[0].w, -2.0);
+        assert!((g[1].w + 1.0 + 128.0 / 255.0).abs() < 1e-6);
+        // v4 / v5 / v6 COREMESH share the 40-byte layout; the v4 path too.
+        let mut v4 = Buf::new("version 4.00\n");
+        v4.u16(24).u16(0).u32(3).u32(1).u16(0).u16(0).u32(0).u16(0).u8(0).u8(0);
+        v4.0.extend_from_slice(&v2_colored([[10, 20, 30, 255]; 3])[13 + 12..13 + 12 + 120]);
+        v4.face(0, 1, 2);
+        let m4 = parse(&v4.0).unwrap();
+        assert_eq!(m4.colors[0], glam::Vec4::new(10.0, 20.0, 30.0, 255.0) / 255.0);
+    }
+
+    #[test]
+    fn mesh_white_or_absent_colours_stay_unset() {
+        let m = parse(&v2_colored([[255; 4]; 3])).unwrap();
+        assert!(m.colors.is_empty() && !m.colors_tint);
+        // 36-byte vertices carry no colour.
+        let mut b = Buf::new("version 2.00\n");
+        b.u16(12).u8(36).u8(12).u32(3).u32(1);
+        for k in 0..3 {
+            b.vertex(36, [k as f32, (k == 2) as u8 as f32, 0.0], [0.0, 0.0, 1.0]);
+        }
+        b.face(0, 1, 2);
+        assert!(parse(&b.0).unwrap().colors.is_empty());
+        // Union colours keep their replace semantics.
+        assert_eq!(MeshData { colors_tint: false, ..m.clone() }.gpu_colors(), m.colors);
+    }
+
+    #[test]
+    fn obj_vertex_colours() {
+        let src = "v 0 0 0 1 0 0\nv 1 0 0 0 1 0 0.5\nv 0 1 0\nf 1 2 3\n";
+        let m = parse(src.as_bytes()).unwrap();
+        assert!(m.colors_tint);
+        assert_eq!(m.colors, vec![
+            glam::Vec4::new(1.0, 0.0, 0.0, 1.0),
+            glam::Vec4::new(0.0, 1.0, 0.0, 0.5),
+            glam::Vec4::ONE,
+        ]);
+        // Plain `v x y z` and `v x y z w`: no colours.
+        let plain = parse(b"v 0 0 0 1\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+        assert!(plain.colors.is_empty() && !plain.colors_tint);
+    }
 }
 
 #[cfg(test)]
@@ -1669,5 +1886,40 @@ mod solid_plane_bias_tests {
         assert_eq!(solid_mesh_projection_plane(Vec3::ZERO, Vec3::Y,
             Vec3::new(-1.0, 0.0, 1.0)), 0);
         assert_eq!(solid_mesh_projection_plane(Vec3::ZERO, Vec3::ZERO, Vec3::ZERO), 1);
+    }
+}
+
+#[cfg(test)]
+mod csg_v4_tests {
+    use super::*;
+    #[test]
+    fn actual_laser_tag_asset() {
+        let m = parse(include_bytes!("../tests/fixtures/laser-tag-9912496701.rbxm")).unwrap();
+        assert!(m.positions.len() > 36);
+        assert_eq!(m.positions.len() % 3, 0);
+        assert!(m.min.is_finite() && m.max.is_finite());
+        assert!((m.max - m.min).min_element() > 0.0);
+        assert_eq!(m.colors.len(), m.positions.len());
+        assert_eq!(m.uvs.len(), m.positions.len());
+        assert!(m.normals.iter().all(|v| v.is_finite()));
+        assert!(m.projection_tags.iter().all(|&v| v <= 6));
+        eprintln!("LaserTag corners={} bounds={:?}..{:?}", m.positions.len(), m.min, m.max);
+        let asset = include_bytes!("../tests/fixtures/laser-tag-9912496701.rbxm");
+        let dom = rbx_binary::from_reader(std::io::Cursor::new(asset)).unwrap();
+        let blob = dom.descendants().find_map(|i| match i.properties.get(&"MeshData".into()) {
+            Some(rbx_dom_weak::types::Variant::BinaryString(b)) => Some(AsRef::<[u8]>::as_ref(b).to_vec()), _ => None
+        }).unwrap();
+        assert_eq!(csgmdl_header(&blob), Some(4));
+        let key = csgmdl_key();
+        let mut decoded: Vec<u8> = blob.iter().enumerate().map(|(i,b)| b ^ key[i%31]).collect();
+        let index_at = 50 + u32_at(&decoded, 42) as usize * 84;
+        let lod_at = index_at + 4 + u32_at(&decoded, index_at) as usize * 4;
+        decoded[lod_at+8..lod_at+12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let bad: Vec<u8> = decoded.iter().enumerate().map(|(i,b)| b ^ key[i%31]).collect();
+        assert!(parse(&bad).unwrap_err().contains("LOD bounds"));
+        for n in [0, 9, 42, 49, index_at, lod_at, blob.len()-1] {
+            assert!(parse(&blob[..n]).is_err());
+        }
+
     }
 }

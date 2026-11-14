@@ -21,7 +21,7 @@ pub fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool, 
     menu_item_at(ui, label, shortcut, enabled, checked, MENU_W - 70.0, MENU_W)
 }
 
-fn menu_item_at(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool, checked: Option<bool>, col: f32, w: f32) -> egui::Response {
+pub(crate) fn menu_item_at(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool, checked: Option<bool>, col: f32, w: f32) -> egui::Response {
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 22.0), sense);
     let p = ui.painter();
@@ -83,7 +83,10 @@ impl Editor {
             "live_collaborators" | "invite_collaborators" => (true,None),
             "avatar_settings" => (true, open("Avatar Settings")),
             "terrain_editor" => (true, open("Terrain Editor")),
-            "about" | "exit" => (true, None),
+            "character" => (edit, Some(self.chars.open)),
+            a if a.starts_with("character:") => (edit, None),
+            "about" | "exit" | "studio_settings" => (true, None),
+            a if a.starts_with("studio_settings:") || a.starts_with("studio_settings_fill:") => (true, None),
             "undo" => (edit && self.doc.can_undo().is_some(), None),
             "redo" => (edit && self.doc.can_redo().is_some(), None),
             "cut" | "copy" | "duplicate" | "delete" => (edit && sel, None),
@@ -104,6 +107,8 @@ impl Editor {
             "zoom_in" | "zoom_out" => (true, None),
             "full_screen" => (true, Some(self.ui.fullscreen)),
             "show_grid" => (true, Some(self.show_grid)),
+            "align_dragged" => (true, Some(self.align_dragged)),
+            "dragger_menu" | "dragger_physical" | "dragger_geometric" => (true, None),
             "grid_2" => (self.show_grid, Some(self.ui.grid_size == 2.0)),
             "grid_4" => (self.show_grid, Some(self.ui.grid_size == 4.0)),
             "grid_16" => (self.show_grid, Some(self.ui.grid_size == 16.0)),
@@ -193,6 +198,8 @@ impl Editor {
                 self.cloud.refresh(client, tab);
             }
             "import_model" => self.insert_from_file(),
+            "character" => self.toggle_character_builder(),
+            a if a.starts_with("character:") => self.character_action(&a["character:".len()..]),
             // "Save to File": a place from Roblox goes to a file too (Ctrl+S
             // saves it to Roblox).
             "save" if self.doc.cloud.is_some() => match self.doc.path.clone() {
@@ -225,6 +232,11 @@ impl Editor {
             "avatar_settings" => self.ui.panel_requests.push((Tab::AvatarSettings, None)),
             "terrain_editor" => self.ui.panel_requests.push((Tab::TerrainEditor, None)),
             "about" => self.ui.about = true,
+            "studio_settings" => self.ui.studio_settings.open = true,
+            // Harness: open on a page ("studio_settings:Physics"), or filling
+            // the window like the Vinegar captures ("studio_settings_fill:…").
+            a if a.starts_with("studio_settings:") => self.ui.studio_settings.open_at(&a["studio_settings:".len()..], false),
+            a if a.starts_with("studio_settings_fill:") => self.ui.studio_settings.open_at(&a["studio_settings_fill:".len()..], true),
             "restart" => self.request(PendingAction::Restart),
             "exit" => self.request(PendingAction::Quit),
             "undo" | "redo" | "cut" | "copy" | "paste" | "paste_into" | "duplicate" | "delete" | "group"
@@ -283,6 +295,10 @@ impl Editor {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.ui.fullscreen));
             }
             "show_grid" => self.show_grid = !self.show_grid,
+            "align_dragged" => self.align_dragged = !self.align_dragged,
+            "dragger_menu" => egui::Popup::open_id(ctx, egui::Id::new(crate::studio_ribbon::DRAGGER_MENU_ID)),
+            "dragger_physical" => self.physical_drag = true,
+            "dragger_geometric" => self.physical_drag = false,
             "grid_2" => self.ui.grid_size = 2.0,
             "grid_4" => self.ui.grid_size = 4.0,
             "grid_16" => self.ui.grid_size = 16.0,
@@ -496,6 +512,22 @@ impl Editor {
             }
         });
         out
+    }
+
+    /// File > Studio Settings (Alt+S); keeps the Diagnostics counts current
+    /// and writes changed settings.
+    pub fn studio_settings_ui(&mut self, ctx: &egui::Context) {
+        if self.ui.studio_settings.open {
+            let instances = self.doc.dom.descendants_of(self.doc.dom.root_ref()).count() as i64;
+            let (models, players) = match self.play.as_ref() {
+                Some(p) if p.mode == crate::runtime::RunMode::Play => (3, 1),
+                Some(_) => (2, 0),
+                None => (1, 0),
+            };
+            crate::studio_settings::set_live([instances, players, models, 0]);
+        }
+        self.ui.studio_settings.ui(ctx);
+        crate::studio_settings::tick();
     }
 
     /// File > About rustudio.

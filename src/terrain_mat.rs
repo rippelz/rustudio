@@ -174,7 +174,7 @@ pub fn material(m: u8, use2022: bool) -> Option<&'static Material> {
 }
 
 /// Studio's recolour of a terrain albedo for MaterialColors (CB4, built by
-/// Studio / Studio): the default MaterialColor `default` and the
+/// Studio): the default MaterialColor `default` and the
 /// current `color` as HSV straight from their sRGB bytes / 255;
 /// x = clamp(V / V₀, 0, 2), s = clamp(S / S₀, 0, 2), θ = H − H₀; the shader
 /// scales luma by x and turns chroma (Co, Cg) by θ and scales it by s · x:
@@ -299,8 +299,10 @@ pub fn palette_generation(doc: &crate::doc::Document, packs: u64) -> u64 {
     crate::scene::use_2022_materials(doc).hash(&mut h);
     let parent = doc.workspace().unwrap_or(doc.dom.root_ref());
     if let Some(terrain) = doc.find_child(parent, "Terrain") {
-        if let Some(rbx_dom_weak::types::Variant::BinaryString(bytes)) = doc.prop(terrain, "MaterialColors") {
-            AsRef::<[u8]>::as_ref(&bytes).hash(&mut h);
+        match doc.prop(terrain, "MaterialColors") {
+            Some(rbx_dom_weak::types::Variant::BinaryString(bytes)) => AsRef::<[u8]>::as_ref(&bytes).hash(&mut h),
+            Some(rbx_dom_weak::types::Variant::MaterialColors(colors)) => colors.encode().hash(&mut h),
+            _ => {},
         }
     }
     for m in 2..23 {
@@ -324,6 +326,11 @@ mod live_palette_tests {
         assert_eq!(initial, palette_generation(&doc, 5));
         let mut colors = vec![0;69]; colors[12..15].copy_from_slice(&[220,40,70]);
         doc.set_prop_live(terrain, rbx_dom_weak::ustr("MaterialColors"), Variant::BinaryString(colors.into()));
+        let binary_generation = palette_generation(&doc, 5);
+        let mut typed = rbx_dom_weak::types::MaterialColors::default();
+        typed.set_color(rbx_dom_weak::types::TerrainMaterials::Grass, rbx_dom_weak::types::Color3uint8::new(180,65,45));
+        doc.set_prop_live(terrain, rbx_dom_weak::ustr("MaterialColors"), Variant::MaterialColors(typed));
+        assert_ne!(binary_generation, palette_generation(&doc, 5));
         assert_ne!(initial, palette_generation(&doc, 5));
         assert_ne!(palette_generation(&doc, 5), palette_generation(&doc, 6));
     }
@@ -345,12 +352,20 @@ pub fn terrain_override(doc: &crate::doc::Document, m: u8, use2022: bool) -> Opt
             .or_else(|| crate::scene::content_string(doc.prop(v, &format!("{key}Content"))))?;
         uri.strip_prefix("rbxassetid://").unwrap_or(&uri).parse::<u64>().ok()
     };
-    let pack = crate::matpack::Pack { color: Some(id("ColorMap")?), normal: id("NormalMap"),
-        roughness: id("RoughnessMap"), metalness: id("MetalnessMap"), tiling: 1.0, ..Default::default() };
     let studs = match doc.prop(v, "StudsPerTile") { Some(Variant::Float32(v)) => v,
         Some(Variant::Float64(v)) => v as f32, _ => 10.0 };
-    Some(Tex { pack: crate::matpack::register_terrain_variant(pack), tiling: 1.0 / studs.max(0.01),
-        blend_max: 1.0, blend_scale: 0.1, ..Default::default() })
+    // Studio draws a published variant on terrain from its hidden
+    // `TexturePack` (a texturepack XML asset naming the same four maps, e.g.
+    // Laser Tag's Walkway → 13749139929), loaded like the built-in packs:
+    // its KTX2 representations (matpack::build_acr), else the pack's maps.
+    // A variant without one (not yet published) registers its loose maps.
+    let pack = match id("TexturePack") {
+        Some(pack) => pack,
+        None => crate::matpack::register_terrain_variant(crate::matpack::Pack {
+            color: Some(id("ColorMap")?), normal: id("NormalMap"), roughness: id("RoughnessMap"),
+            metalness: id("MetalnessMap"), tiling: 1.0, ..Default::default() }),
+    };
+    Some(Tex { pack, tiling: 1.0 / studs.max(0.01), blend_max: 1.0, blend_scale: 0.1, ..Default::default() })
 }
 
 #[cfg(test)]

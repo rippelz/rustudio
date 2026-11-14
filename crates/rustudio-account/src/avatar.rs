@@ -29,6 +29,9 @@ pub struct AvatarInfo {
     pub width: f32,
     pub depth: f32,
     pub head: f32,
+    /// BodyProportionScale and BodyTypeScale (0 = Classic proportions).
+    pub proportion: f32,
+    pub body_type: f32,
     /// head, torso, left arm, right arm, left leg, right leg (RGB).
     pub colors: [[u8; 3]; 6],
     pub assets: Vec<WornAsset>,
@@ -38,6 +41,21 @@ fn hex(v: Option<&serde_json::Value>) -> Option<[u8; 3]> {
     let s = v?.as_str()?.trim_start_matches('#');
     let n = u32::from_str_radix(s, 16).ok()?;
     Some([(n >> 16) as u8, (n >> 8) as u8, n as u8])
+}
+
+/// Enum.AssetType (value, name) of an avatar-fetch animationAssetIds key.
+fn animation_type(slot: &str) -> Option<(u32, &'static str)> {
+    Some(match slot {
+        "climb" => (48, "ClimbAnimation"),
+        "fall" => (50, "FallAnimation"),
+        "idle" => (51, "IdleAnimation"),
+        "jump" => (52, "JumpAnimation"),
+        "run" => (53, "RunAnimation"),
+        "swim" => (54, "SwimAnimation"),
+        "walk" => (55, "WalkAnimation"),
+        "mood" => (78, "MoodAnimation"),
+        _ => return None,
+    })
 }
 
 /// Parses the v2 avatar JSON (also accepts the older v1 field names).
@@ -87,6 +105,24 @@ pub fn parse_avatar(user_id: u64, v: &serde_json::Value) -> AvatarInfo {
                 .collect()
         })
         .unwrap_or_default();
+    // …and the worn animation packages apart, as animationAssetIds
+    // ({"idle": id, "walk": id, …}); some (mood) are in both lists.
+    let mut fetched = fetched;
+    if let Some(map) = v.get("animationAssetIds").and_then(|m| m.as_object()) {
+        for (slot, id) in map {
+            let Some(id) = id.as_u64().filter(|i| *i != 0) else { continue };
+            if fetched.iter().any(|a| a.id == id) {
+                continue;
+            }
+            let Some((type_id, type_name)) = animation_type(slot) else { continue };
+            fetched.push(WornAsset {
+                id,
+                name: String::new(),
+                type_id,
+                type_name: type_name.to_string(),
+            });
+        }
+    }
     let assets: Vec<WornAsset> = v
         .get("assets")
         .and_then(|a| a.as_array())
@@ -121,12 +157,14 @@ pub fn parse_avatar(user_id: u64, v: &serde_json::Value) -> AvatarInfo {
         width: scale("width"),
         depth: scale("depth"),
         head: scale("head"),
+        proportion: v.pointer("/scales/proportion").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+        body_type: v.pointer("/scales/bodyType").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
         colors,
         assets: if assets.is_empty() { fetched } else { assets },
     }
 }
 
-/// Studio's avatar request (sub_1407db6c0):
+/// Studio's avatar request (sub_Studio):
 /// `GET avatar.roblox.com/v2/avatar/avatar-fetch/?placeId={p}&userId={u}`.
 pub fn avatar_fetch_url(place_id: u64, user_id: u64) -> String {
     format!("https://avatar.roblox.com/v2/avatar/avatar-fetch/?placeId={place_id}&userId={user_id}")
@@ -199,5 +237,19 @@ mod tests {
         assert_eq!(a.colors[1], [0x0d, 0x69, 0xac]);
         assert_eq!(a.assets[0].type_id, 11);
         assert!((a.height - 1.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn avatar_fetch_animation_packs() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"resolvedAvatarType":"R15",
+                "assetAndAssetTypeIds":[{"assetId":7,"assetType":{"id":78}, "assetTypeId":78}],
+                "animationAssetIds":{"mood":7,"idle":51001,"walk":55001,"emote":9}}"#,
+        )
+        .unwrap();
+        let info = parse_avatar(1, &v);
+        let mut got: Vec<(u64, &str)> = info.assets.iter().map(|a| (a.id, a.type_name.as_str())).collect();
+        got.sort();
+        assert_eq!(got, vec![(7, ""), (51001, "IdleAnimation"), (55001, "WalkAnimation")]);
     }
 }

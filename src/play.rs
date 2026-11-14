@@ -35,6 +35,10 @@ use crate::scene::f32_of;
 pub mod game;
 #[path = "play_drag.rs"]
 mod drag_input;
+#[path = "play_humanoid.rs"]
+mod hum_glue;
+#[path = "play_npc.rs"]
+mod npc;
 
 /// The player's character (refs are server-side).
 pub struct Character {
@@ -92,6 +96,8 @@ pub struct Character {
     /// before FindLadder runs again (see `ladder_interval`).
     ladder: Option<Vec3>,
     ladder_wait: u8,
+    /// Studio's Humanoid controller state (the dynamic body, play_humanoid.rs).
+    dynamic: hum_glue::HumDyn,
 }
 
 /// FindLadder's period in a state, vtable : Running (and Landed,
@@ -128,20 +134,6 @@ impl RigSource {
             RigSource::Default => "default",
         }
     }
-}
-
-/// See `Editor::client_root_movers`.
-#[derive(Default)]
-struct RootMovers {
-    plane: Option<Vec3>,
-    /// A Vector-mode LinearVelocity strong enough to hold the character:
-    /// it moves at this velocity, gravity included (Place C's ship).
-    vector: Option<Vec3>,
-    yaw: Option<f32>,
-    /// AlignOrientation without rigidity eases toward `yaw` at this
-    /// Responsiveness (per second); 0 = at once.
-    yaw_rate: f32,
-    vel_y: Option<f32>,
 }
 
 /// One side's runtime and (while not entered) its World.
@@ -199,6 +191,8 @@ pub struct PlaySession {
     pub game: game::GameState,
     /// Mouse motion (pixels) and wheel notches over the game view since last frame.
     pub mouse_delta: glam::Vec2,
+    /// Characters spawned so far (the first one keeps the joining Backpack).
+    pub spawns: u32,
     pub mouse_moved: bool,
     pub wheel: f32,
     /// The client's UserInputService.MouseBehavior (0 Default, 1 LockCenter,
@@ -210,6 +204,9 @@ pub struct PlaySession {
     pub cursor_image: Option<String>,
     /// UserGameSettings.RotationType is CameraRelative (shift-lock, first person).
     pub camera_relative: bool,
+    /// The other Humanoids in Workspace (NPCs), driven like the player's
+    /// with the dynamic Humanoid (play_npc.rs).
+    pub(crate) npcs: npc::Npcs,
 }
 
 impl PlaySession {
@@ -443,6 +440,12 @@ impl Editor {
         if self.defer_play_until_loaded(mode) {
             return;
         }
+        // Studio Settings > Output > Clear Output On Start, for runs a person
+        // drives (harness logs and --log keep everything).
+        if self.harness.plain() && crate::studio_settings::flag("Studio", "Clear Output On Start", true) {
+            self.log.clear();
+            self.output_view.log_cleared();
+        }
         // The local player is the signed-in account (identity and avatar),
         // as in Studio: a session check still running at Play is waited for.
         if mode == RunMode::Play {
@@ -574,6 +577,7 @@ impl Editor {
         }
         physics.groups = groups;
         self.play = Some(PlaySession {
+            npcs: Default::default(),
             mode,
             _scripts_running: scripts_running,
             saved_doc: Some(saved_doc),
@@ -604,6 +608,7 @@ impl Editor {
             state_log: Vec::new(),
             game: Default::default(),
             mouse_delta: glam::Vec2::ZERO,
+            spawns: 0,
             mouse_moved: false,
             wheel: 0.0,
             mouse_behavior: 0,
@@ -797,11 +802,37 @@ impl Editor {
                 .collect(),
         };
         let mut out = Vec::new();
-        for s in roots {
-            for i in d.dom.descendants_of(s) {
+        for s in &roots {
+            for i in d.dom.descendants_of(*s) {
                 let client = crate::scene::enum_u32(d.prop(i.referent(), "RunContext")) == Some(2);
                 if i.class == "Script" && !client && script_enabled(d, i.referent()) {
                     out.push(i.referent());
+                }
+            }
+        }
+        // RunContext Server Scripts run wherever they are (Studio's own
+        // StarterPlayer.PlayerModule.InputSetup; a game's in ReplicatedStorage),
+        // but not as templates in a container that copies them to players.
+        if under.is_none() {
+            for name in ["ReplicatedStorage", "ReplicatedFirst", "StarterPlayer", "Lighting", "SoundService", "Teams", "Chat", "TextChatService", "Players"] {
+                let Some(svc) = d.find_child(root, name) else { continue };
+                for i in d.dom.descendants_of(svc) {
+                    let r = i.referent();
+                    if i.class != "Script" || crate::scene::enum_u32(d.prop(r, "RunContext")) != Some(1) || !script_enabled(d, r) {
+                        continue;
+                    }
+                    let mut p = i.parent();
+                    let mut template = false;
+                    while let Some(a) = d.dom.get_by_ref(p) {
+                        if matches!(a.class.as_str(), "StarterPlayerScripts" | "StarterCharacterScripts") {
+                            template = true;
+                            break;
+                        }
+                        p = a.parent();
+                    }
+                    if !template {
+                        out.push(r);
+                    }
                 }
             }
         }
@@ -1208,11 +1239,13 @@ impl Editor {
         }
     }
 
-    /// Where characters appear: the capsule centre above the first enabled SpawnLocation.
-    fn character_spawn_point(&self) -> Vec3 {
+    /// Where characters appear: the capsule centre above the first enabled
+    /// SpawnLocation, and the yaw they face there: the spawn's own facing,
+    /// as Roblox keeps the SpawnLocation's rotation (about Y) for the root.
+    fn character_spawn_point(&self) -> (Vec3, f32) {
         // Test Here: where the camera was when the test started.
         if let Some(p) = self.play_here {
-            return p;
+            return (p, 0.0);
         }
         let d = &self.doc;
         // A team player spawns on a Neutral spawn or one in the team's colour.
@@ -1237,14 +1270,23 @@ impl Editor {
                         let size = crate::scene::vec3_of(d.prop(i.referent(), "Size"))
                             .unwrap_or(Vec3::ONE);
                         let top = xf.pos + Vec3::Y * (size.y * 0.5);
-                        return top
-                            + Vec3::Y
-                                * (mech::CHARACTER_HALF_HEIGHT + mech::CHARACTER_RADIUS + 0.5);
+                        // rot_y(yaw) * -Z = (-sin yaw, 0, -cos yaw).
+                        let look = xf.rot * Vec3::NEG_Z;
+                        let yaw = if look.x.abs() + look.z.abs() > 1e-4 {
+                            (-look.x).atan2(-look.z)
+                        } else {
+                            0.0
+                        };
+                        return (
+                            top + Vec3::Y
+                                * (mech::CHARACTER_HALF_HEIGHT + mech::CHARACTER_RADIUS + 0.5),
+                            yaw,
+                        );
                     }
                 }
             }
         }
-        Vec3::new(0.0, mech::NO_SPAWN_HEIGHT, 0.0)
+        (Vec3::new(0.0, mech::NO_SPAWN_HEIGHT, 0.0), 0.0)
     }
 
     /// The Humanoid's settings come from StarterPlayer (Character* properties).
@@ -1285,7 +1327,13 @@ impl Editor {
         let Some(ws) = self.doc.workspace() else {
             return;
         };
-        let (rig_type, colors, scales) = self.character_look();
+        let (mut rig_type, colors, scales) = self.character_look();
+        // StarterPlayer.StarterCharacter: a Model with a Humanoid is cloned
+        // as every player's character, without their avatar (as on Roblox).
+        let starter = self.starter_character();
+        if let Some((_, r)) = starter {
+            rig_type = r;
+        }
         let (_, source) = self.rig_choice();
         let rig_name = |r: RigType| if r == RigType::R15 { "R15" } else { "R6" };
         let mut why = format!(
@@ -1298,19 +1346,51 @@ impl Editor {
                 why.push_str(&format!("; the place asks for {}", rig_name(p)));
             }
         }
+        if starter.is_some() {
+            why = format!("Character: StarterPlayer.StarterCharacter ({})", rig_name(rig_type));
+        }
         self.info(why);
         let humanoid = self.humanoid_builder();
         let name = self.player_name();
-        let m = rig::insert_character(
-            &mut self.doc.dom,
-            ws,
-            &name,
-            rig_type,
-            &colors,
-            &scales,
-            humanoid,
-        );
-        self.dress_character(m);
+        let m = match starter {
+            Some((sc, _)) => {
+                let m = self.doc.dom.clone_within(sc);
+                self.doc.dom.transfer_within(m, ws);
+                if let Some(i) = self.doc.dom.get_by_ref_mut(m) {
+                    i.name = name.clone();
+                }
+                // Animate finds the Animator with FindFirstChildOfClass.
+                if let Some(h) = self.doc.dom.descendants_of(m).find(|i| i.class == "Humanoid").map(|i| i.referent()) {
+                    let has = self.doc.dom.get_by_ref(h).is_some_and(|i| {
+                        i.children().iter().any(|c| self.doc.dom.get_by_ref(*c).is_some_and(|c| c.class == "Animator"))
+                    });
+                    if !has {
+                        self.doc.dom.insert(h, InstanceBuilder::new("Animator").with_name("Animator"));
+                    }
+                }
+                m
+            }
+            None => {
+                let m = rig::insert_character(
+                    &mut self.doc.dom,
+                    ws,
+                    &name,
+                    rig_type,
+                    &colors,
+                    &scales,
+                    humanoid,
+                );
+                self.dress_character(m);
+                // The avatar's equipped emotes (Humanoid:PlayEmote, /e, the
+                // emote wheel read them from here).
+                if let Some(look) = self.account.avatar().filter(|l| !l.emotes.is_empty()).cloned() {
+                    if let Some(h) = self.doc.dom.descendants_of(m).find(|i| i.class == "Humanoid").map(|i| i.referent()) {
+                        self.doc.dom.insert(h, crate::avatar::emote_description(&look));
+                    }
+                }
+                m
+            }
+        };
         // Studio's avatar joint upgrade (StarterPlayer.AvatarJointUpgrade):
         // an R15 body's rig Motor6Ds become AnimationConstraints + ball sockets.
         if rig_type == RigType::R15 && rig::joint_upgrade(&self.doc) {
@@ -1336,6 +1416,36 @@ impl Editor {
         }
         // Roblox's Health and Animate, unless the place brought its own.
         crate::default_scripts::insert_character_scripts(&mut self.doc, m, rig_type);
+        // Animations (R15 only, as on Roblox): the avatar's packages unless
+        // the game picks Standard, then the game's per-slot overrides and
+        // custom clips (game_avatar.rs).
+        if rig_type == RigType::R15 && starter.is_none() {
+            let rules = crate::game_avatar::rules(&self.doc);
+            let client = self.account.shared_client();
+            let mut packs = if rules.player_packs {
+                self.account.avatar().map(|l| l.animations.clone()).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            for (kind, id) in &rules.overrides {
+                packs.retain(|p| &p.0 != kind);
+                if *id > 0 {
+                    match crate::game_avatar::package(client.as_ref(), *id) {
+                        Some(b) => packs.push((kind.clone(), *id, b)),
+                        None => self.warn(format!("Game animation override {kind} {id} could not be downloaded")),
+                    }
+                }
+            }
+            let slots = crate::avatar::put_on_animation_packs(&mut self.doc, m, &packs);
+            if !slots.is_empty() {
+                let whose = if rules.overrides.is_empty() { "Avatar" } else { "Avatar / game" };
+                self.info(format!("{whose} animations: {}", slots.join(", ")));
+            }
+            let clips = crate::avatar::put_on_custom_clips(&mut self.doc, m, &rules.clips);
+            if !clips.is_empty() {
+                self.info(format!("Game animation clips: {}", clips.join(", ")));
+            }
+        }
         if let Some(inst) = self.doc.dom.get_by_ref_mut(player) {
             inst.properties.insert(ustr("Character"), Variant::Ref(m));
         }
@@ -1385,7 +1495,7 @@ impl Editor {
                 },
             )
             .unwrap_or(rig.root);
-        let start = self.character_spawn_point();
+        let (start, start_yaw) = self.character_spawn_point();
         let root_lift =
             rig::root_height(&self.doc, m)
                 - (mech::CHARACTER_HALF_HEIGHT + mech::CHARACTER_RADIUS + mech::CHARACTER_HOVER);
@@ -1406,7 +1516,7 @@ impl Editor {
                 ..Default::default()
             },
             root_lift,
-            yaw: 0.0,
+            yaw: start_yaw,
             velocity: Vec3::ZERO,
             dead: false,
             touching: HashSet::new(),
@@ -1427,6 +1537,7 @@ impl Editor {
             last_move_speed: -1.0,
             ladder: None,
             ladder_wait: 0,
+            dynamic: Default::default(),
         };
         let mut ch = ch;
         let pose = character_pose(&ch, &HashMap::new());
@@ -1447,6 +1558,14 @@ impl Editor {
             p.character = Some(ch);
             p.respawn_at = None;
         }
+
+        // Fresh tools from StarterPack (not for the first character: the
+        // Backpack was filled when the player joined).
+        let first = self.play.as_ref().is_some_and(|s| s.spawns == 0);
+        if let Some(s) = self.play.as_mut() {
+            s.spawns += 1;
+        }
+        let tools = if first { Vec::new() } else { self.refill_backpack(player) };
 
         // Server: CharacterAdded, server Scripts inside the character.
         let server_scripts = self.server_scripts(Some(m));
@@ -1469,8 +1588,12 @@ impl Editor {
             let local = self
                 .play
                 .as_ref()
-                .and_then(|s| s.other_doc.as_ref())
-                .map(|cd| client_scripts(cd, &[Some(cm)]))
+                .and_then(|s| {
+                    let cd = s.other_doc.as_ref()?;
+                    let mut under = vec![Some(cm)];
+                    under.extend(tools.iter().map(|t| s.map.s2c.get(t).copied()));
+                    Some(client_scripts(cd, &under))
+                })
                 .unwrap_or_default();
             // The client's camera follows the new character's Humanoid.
             let chum = self
@@ -1498,6 +1621,19 @@ impl Editor {
                 rt.dispatch();
             });
         }
+    }
+
+    /// StarterPlayer.StarterCharacter (a Model holding a Humanoid) and its
+    /// rig type (UpperTorso = R15).
+    fn starter_character(&self) -> Option<(Ref, RigType)> {
+        let root = self.doc.dom.root_ref();
+        let sp = self.doc.find_child(root, "StarterPlayer")?;
+        let sc = self.doc.dom.get_by_ref(sp)?.children().iter().copied().find(|c| {
+            self.doc.dom.get_by_ref(*c).is_some_and(|i| i.name == "StarterCharacter" && i.class == "Model")
+        })?;
+        self.doc.dom.descendants_of(sc).find(|i| i.class == "Humanoid")?;
+        let r15 = self.doc.find_named(sc, "UpperTorso").is_some();
+        Some((sc, if r15 { RigType::R15 } else { RigType::R6 }))
     }
 
     /// The place's avatar setting (StarterPlayer.GameSettingsAvatar: R6 /
@@ -1626,8 +1762,22 @@ impl Editor {
                     .insert(ustr("CanCollide"), Variant::Bool(true));
             }
             self.doc.mark_prop(*r, ustr("CanCollide"));
+            // (The client reads it too: Studio's probe T14 sees every limb
+            // CanCollide true in the frame the joints go.)
+            self.record(RepOp::Prop(*r, "CanCollide".into()));
         }
         if let Some(s) = self.play.as_mut() {
+            // The character's assembly splits (BreakJointsOnDeath): each part
+            // its own body, keeping the velocity the assembly had.
+            {
+                let v = s.physics.humanoid_root(model).map(|(_, v, _)| v);
+                s.physics.remove_humanoid(model);
+                if let Some(v) = v {
+                    for r in &parts {
+                        s.physics.set_velocity(*r, v);
+                    }
+                }
+            }
             s.physics.skip.retain(|x| !parts.contains(x));
             s.physics.refresh(parts.iter().copied());
         }
@@ -1652,12 +1802,67 @@ impl Editor {
         if let Some(old) = self.play.as_ref().and_then(|s| s.character.as_ref()).map(|c| c.model) {
             self.fire_character_removing(old);
         }
+        // The tool it held goes with it (it isn't put back in the Backpack).
+        self.drop_equipped();
+        // Roblox destroys the old character (Destroying on it and all it
+        // holds; a no-op when a script destroyed it already).
         if let Some(old) = self.play.as_mut().and_then(|s| s.character.take()) {
-            self.doc.dom.transfer_within(old.model, Ref::none());
-            self.doc.mark_tree(old.model);
-            self.record(RepOp::Parent(old.model));
+            self.with_side(Side::Server, |rt, _, _| {
+                rt.apply_destroy(old.model);
+                rt.dispatch();
+            });
         }
         self.spawn_character();
+    }
+
+    /// Each spawn after the first: the Backpack is emptied and StarterPack
+    /// copied in again (Roblox gives every new character fresh tools). The
+    /// copies' server Scripts start now; returns them for the client's
+    /// LocalScripts once replicated.
+    fn refill_backpack(&mut self, player: Ref) -> Vec<Ref> {
+        let root = self.doc.dom.root_ref();
+        let (Some(bp), Some(pack)) = (
+            self.doc.find_child(player, "Backpack"),
+            self.doc.find_child(root, "StarterPack"),
+        ) else {
+            return Vec::new();
+        };
+        let old: Vec<Ref> = self
+            .doc
+            .dom
+            .get_by_ref(bp)
+            .map(|i| i.children().to_vec())
+            .unwrap_or_default();
+        self.with_side(Side::Server, |rt, _, _| {
+            for c in &old {
+                rt.apply_destroy(*c);
+            }
+        });
+        let mut copies = Vec::new();
+        for k in self
+            .doc
+            .dom
+            .get_by_ref(pack)
+            .map(|i| i.children().to_vec())
+            .unwrap_or_default()
+        {
+            let c = self.doc.dom.clone_within(k);
+            self.doc.dom.transfer_within(c, bp);
+            self.doc.mark_tree(c);
+            self.record(RepOp::Parent(c));
+            copies.push(c);
+        }
+        let scripts: Vec<Ref> = copies
+            .iter()
+            .flat_map(|c| self.server_scripts(Some(*c)))
+            .collect();
+        self.with_side(Side::Server, |rt, _, _| {
+            for r in scripts {
+                rt.start_collected(r);
+            }
+            rt.dispatch();
+        });
+        copies
     }
 
     /// After the client's scripts ran: UserInputService.MouseBehavior /
@@ -1710,98 +1915,6 @@ impl Editor {
                 });
             s.camera_relative = rot.as_deref() == Some("CameraRelative");
         }
-    }
-
-    /// What the client's own constraints and scripts do to its HumanoidRootPart
-    /// this frame: an enabled LinearVelocity in Plane mode sets the horizontal
-    /// velocity (PlaneVelocity along its tangent axes, world-relative), a rigid
-    /// one-attachment AlignOrientation sets the facing, and a script setting
-    /// AssemblyLinearVelocity sets the vertical speed (Roblox physics does
-    /// this with forces; rustudio's character is kinematic).
-    fn client_root_movers(&mut self) -> RootMovers {
-        let mut out = RootMovers::default();
-        let Some(s) = self.play.as_mut() else {
-            return out;
-        };
-        let Some(root) = s
-            .character
-            .as_ref()
-            .and_then(|c| s.map.s2c.get(&c.rig.root).copied())
-        else {
-            return out;
-        };
-        if let Some(w) = s.client.as_mut().and_then(|c| c.world.as_mut()) {
-            if let Some((_, v)) = w.velocity_requests.iter().rev().find(|(r, _)| *r == root) {
-                out.vel_y = Some(v.y);
-            }
-            w.velocity_requests.retain(|(r, _)| *r != root);
-        }
-        let Some(cd) = s.other_doc.as_ref() else {
-            return out;
-        };
-        let enabled = |r: Ref| !matches!(cd.prop(r, "Enabled"), Some(Variant::Bool(false)));
-        let attached_here = |r: Ref| matches!(cd.prop(r, "Attachment0"), Some(Variant::Ref(a)) if cd.dom.get_by_ref(a).is_some_and(|i| i.parent() == root));
-        let v3 = |v: Option<Variant>| match v {
-            Some(Variant::Vector3(v)) => Some(Vec3::new(v.x, v.y, v.z)),
-            _ => None,
-        };
-        for c in cd
-            .dom
-            .get_by_ref(root)
-            .map(|i| i.children().to_vec())
-            .unwrap_or_default()
-        {
-            let Some(class) = cd.class_of(c) else {
-                continue;
-            };
-            if !enabled(c) || !attached_here(c) {
-                continue;
-            }
-            match class.as_str() {
-                // VelocityConstraintMode.Plane = 1, RelativeTo World = 2
-                "LinearVelocity"
-                    if crate::scene::enum_u32(cd.prop(c, "VelocityConstraintMode")) == Some(1)
-                        && crate::scene::enum_u32(cd.prop(c, "RelativeTo")) == Some(2) =>
-                {
-                    let pv = match cd.prop(c, "PlaneVelocity") {
-                        Some(Variant::Vector2(v)) => glam::Vec2::new(v.x, v.y),
-                        _ => glam::Vec2::ZERO,
-                    };
-                    let a = v3(cd.prop(c, "PrimaryTangentAxis")).unwrap_or(Vec3::X);
-                    let b = v3(cd.prop(c, "SecondaryTangentAxis")).unwrap_or(Vec3::Z);
-                    let v = a * pv.x + b * pv.y;
-                    out.plane = Some(Vec3::new(v.x, 0.0, v.z));
-                }
-                // VelocityConstraintMode.Vector = 2 (the default), RelativeTo
-                // World (the default): with force enough to carry the
-                // character (or no limit) it sets the whole velocity.
-                "LinearVelocity"
-                    if crate::scene::enum_u32(cd.prop(c, "VelocityConstraintMode")).unwrap_or(2) == 2
-                        && crate::scene::enum_u32(cd.prop(c, "RelativeTo")).unwrap_or(2) == 2
-                        && (matches!(cd.prop(c, "ForceLimitsEnabled"), Some(Variant::Bool(false)))
-                            || crate::scene::f32_of(cd.prop(c, "MaxForce")).unwrap_or(1000.0)
-                                >= crate::mech::MOVER_HOLDS_CHARACTER_FORCE) =>
-                {
-                    out.vector = Some(v3(cd.prop(c, "VectorVelocity")).unwrap_or(Vec3::ZERO));
-                }
-                // OrientationAlignmentMode.OneAttachment = 0
-                "AlignOrientation" if crate::scene::enum_u32(cd.prop(c, "Mode")).unwrap_or(0) == 0 => {
-                    if let Some(Variant::CFrame(cf)) = cd.prop(c, "CFrame") {
-                        let look = -Xform::from_cframe(&cf).rot.z_axis;
-                        if look.x.abs() + look.z.abs() > 1e-4 {
-                            out.yaw = Some((-look.x).atan2(-look.z));
-                        }
-                    }
-                    out.yaw_rate = if matches!(cd.prop(c, "RigidityEnabled"), Some(Variant::Bool(true))) {
-                        0.0
-                    } else {
-                        crate::scene::f32_of(cd.prop(c, "Responsiveness")).unwrap_or(10.0)
-                    };
-                }
-                _ => {}
-            }
-        }
-        out
     }
 
     /// Each joint's Motor6D.Transform as its owner (the client) has it: what
@@ -1918,6 +2031,7 @@ impl Editor {
             });
             if let Some(ch) = self.play.as_mut().and_then(|s| s.character.as_mut()) {
                 ch.seat = None;
+                ch.dynamic.seat_left = Some(seat);
                 ch.seat_cooldown = mech::SEAT_COOLDOWN_S;
                 if let Some(top) = top {
                     let clear = top
@@ -1941,17 +2055,37 @@ impl Editor {
         };
         // Only a touch that began (Studio: standing on a seat after jumping
         // off it doesn't sit again; round 22 movement_probe seat).
-        let pick = asked.filter(|r| usable(&self.doc, *r)).or_else(|| {
-            (cooldown <= 0.0)
-                .then(|| {
-                    touching
-                        .iter()
-                        .copied()
-                        .filter(|r| !seen.contains(r))
-                        .find(|r| usable(&self.doc, *r) && empty(&self.doc, *r))
-                })
-                .flatten()
-        })?;
+        // The seat just left doesn't seat again for a while; another one
+        // does at once (Studio 0.747: a different Seat touched 0.7 s after
+        // leaving one seats the character, the same one doesn't).
+        let left = self.play.as_ref().and_then(|s| s.character.as_ref()).and_then(|c| c.dynamic.seat_left);
+        let touched = touching
+            .iter()
+            .copied()
+            .filter(|r| !seen.contains(r))
+            .filter(|r| cooldown <= 0.0 || Some(*r) != left)
+            .find(|r| usable(&self.doc, *r) && empty(&self.doc, *r));
+        // With the dynamic Humanoid a touch seats `SEAT_TOUCH_FRAMES` later
+        // (the server's SeatWeld on its way back: play_humanoid.rs).
+        let touched = {
+            let ch = self.play.as_mut().and_then(|s| s.character.as_mut())?;
+            match (ch.dynamic.seat_wait, touched) {
+                (None, Some(r)) => {
+                    ch.dynamic.seat_wait = Some((r, hum_glue::SEAT_TOUCH_FRAMES - 1));
+                    None
+                }
+                (Some((r, 0)), _) => {
+                    ch.dynamic.seat_wait = None;
+                    Some(r).filter(|r| usable(&self.doc, *r) && empty(&self.doc, *r))
+                }
+                (Some((r, n)), _) => {
+                    ch.dynamic.seat_wait = Some((r, n - 1));
+                    None
+                }
+                (None, None) => None,
+            }
+        };
+        let pick = asked.filter(|r| usable(&self.doc, *r)).or(touched)?;
         self.with_side(Side::Server, |rt, _, _| {
             rt.spawn_global(
                 "__rs_seat",
@@ -2138,6 +2272,16 @@ impl Editor {
         drop(sc);
         // Clicks, chat, tool keys and mouse buttons from the viewport.
         self.game_inputs();
+        // Studio's frame order (checks/humanoid-physics SPEC §0.1): the
+        // RunService events before the world steps fire before it, the
+        // Humanoid steps between PreAnimation and the Animator.
+        {
+            let _s = crate::bench::scope("p2a_lua_pre");
+            if mode == RunMode::Play {
+                self.hum_face_camera();
+            }
+            self.lua_pre_physics(mode, dt, 0);
+        }
         // 2. Character (owned by the client: written to both DataModels).
         let sc = crate::bench::scope("p2_character");
         let mut char_touches: Vec<Ref> = Vec::new();
@@ -2148,635 +2292,33 @@ impl Editor {
         let mut floor_changed: Option<u32> = None;
         let mut char_part = Ref::none();
         let mut humanoid_ref = Ref::none();
+        let mut hum_out: Option<hum_glue::HumFrameOut> = None;
         if mode == RunMode::Play && self.play_has_character() {
-            let (humanoid, touch_part) = {
-                let ch = self
-                    .play
-                    .as_ref()
-                    .and_then(|s| s.character.as_ref())
-                    .expect("character");
-                (ch.humanoid, ch.touch_part)
-            };
-            humanoid_ref = humanoid;
-            char_part = touch_part;
-            // A script moved the character (PivotTo, HumanoidRootPart.CFrame,
-            // on either side): the controller carries on from there.
+            hum_out = Some(self.hum_pre(dt));
+        }
+        {
+            let _s = crate::bench::scope("p2_npc_pre");
+            self.npc_pre(dt);
+        }
+        {
+            let _s = crate::bench::scope("p2b_lua_pre");
+            self.lua_pre_physics(mode, dt, 1);
+            // What the scripts did on Stepped / PreSimulation reaches this
+            // frame's world steps.
             if let Some(s) = self.play.as_mut() {
-                if let Some(ch) = s.character.as_mut() {
-                    if let Some(last) = ch.last_root {
-                        let root = ch.rig.root;
-                        let client = s.map.s2c.get(&root).and_then(|c| {
-                            s.other_doc
-                                .as_ref()
-                                .and_then(|cd| crate::scene::xform_of(cd, *c))
-                        });
-                        let server = crate::scene::xform_of(&self.doc, root);
-                        if let Some(xf) = [client, server]
-                            .into_iter()
-                            .flatten()
-                            .find(|xf| (xf.pos - last.pos).length() > mech::TELEPORT_MIN_STUDS)
-                        {
-                            ch.body.pos = xf.pos - Vec3::Y * ch.root_lift;
-                            ch.body.vel_y = 0.0;
-                            let look = -xf.rot.z_axis;
-                            ch.yaw = (-look.x).atan2(-look.z);
-                        }
-                    }
+                let vel = s.server.world.as_mut().map(|w| std::mem::take(&mut w.velocity_requests)).unwrap_or_default();
+                s.physics.sync(&mut self.doc);
+                if let Some(c) = s.other_doc.as_mut() {
+                    s.physics.follow_client(&self.doc, c, &s.map.c2s);
+                }
+                for (r, v) in vel {
+                    s.physics.set_velocity(r, v);
                 }
             }
-            // The client owns its character: its Humanoid's values count (a
-            // LocalScript changing WalkSpeed moves the player at once).
-            let speed = self.owned_humanoid_f32(humanoid, "WalkSpeed", mech::WALK_SPEED);
-            let use_power = matches!(
-                self.owned_humanoid_prop(humanoid, "UseJumpPower"),
-                Some(Variant::Bool(true))
-            );
-            // Studio's Humanoid jump speed: JumpPower with
-            // UseJumpPower, else √(2·g·JumpHeight) / 1.06 clamped to [0, 1000];
-            // the jump then leaves at 1.06 × that (its inverse:
-            // height = (1.06·v)² / 2g).
-            let commanded = if use_power {
-                self.owned_humanoid_f32(humanoid, "JumpPower", mech::JUMP_POWER)
-            } else {
-                let g = self
-                    .play
-                    .as_ref()
-                    .map(|s| s.physics.gravity)
-                    .unwrap_or(mech::GRAVITY);
-                ((2.0 * g * self.owned_humanoid_f32(humanoid, "JumpHeight", mech::JUMP_HEIGHT))
-                    .max(0.0)
-                    .sqrt()
-                    / mech::JUMP_TAKEOFF_FACTOR)
-                    .clamp(0.0, mech::JUMP_SPEED_MAX)
-            };
-            let jump_v = commanded * mech::JUMP_TAKEOFF_FACTOR;
-            // The client's Humanoid carries what its scripts asked for: the
-            // ControlModule's Player:Move sets MoveDirection every frame and
-            // Humanoid.Jump while Space is held (Roblox's own PlayerModule).
-            let (move_3d, auto_rotate) = self.client_move_request(humanoid);
-            // Walking uses the level part; swimming the whole of it.
-            let mut dir = Vec3::new(move_3d.x, 0.0, move_3d.z);
-            // Humanoid:MoveTo walks there until a movement key is pressed.
-            let (target, jump_req, at) = self
-                .play
-                .as_mut()
-                .map(|s| {
-                    (
-                        s.game.move_target,
-                        std::mem::take(&mut s.game.jump),
-                        s.character
-                            .as_ref()
-                            .map(|c| c.body.pos)
-                            .unwrap_or(Vec3::ZERO),
-                    )
-                })
-                .unwrap_or((None, false, Vec3::ZERO));
-            if dir != Vec3::ZERO {
-                if let Some(s) = self.play.as_mut() {
-                    s.game.move_target = None;
-                }
-            } else if let Some(t) = target {
-                let mut to = t - at;
-                to.y = 0.0;
-                if to.length() < mech::MOVE_TO_REACHED {
-                    if let Some(s) = self.play.as_mut() {
-                        s.game.move_target = None;
-                    }
-                    self.with_side(Side::Server, |rt, _, _| {
-                        rt.fire(humanoid, "MoveToFinished", vec![Value::Boolean(true)])
-                    });
-                } else {
-                    dir = to.normalize();
-                }
+            if hum_out.is_some() {
+                self.hum_pose();
             }
-            // Humanoid:ChangeState from scripts: FallingDown / GettingUp /
-            // Ragdoll / Physics hold the humanoid until they end (FallingDown
-            // gets up by itself), Seated sits it where it is, Dead kills it,
-            // the walking states end a forced one. Disabled states are ignored.
-            let (forced_req, states_off) = {
-                let s = self.play.as_mut().expect("playing");
-                (s.game.forced_state.take(), s.game.states_off.clone())
-            };
-            let mut force_dead = false;
-            if let Some(name) = forced_req.filter(|n| !states_off.contains(n)) {
-                match State::from_name(&name) {
-                    Some(State::Dead) => force_dead = true,
-                    Some(State::Seated) => {
-                        if let Some(inst) = self.doc.dom.get_by_ref_mut(humanoid) {
-                            inst.properties.insert(ustr("Sit"), Variant::Bool(true));
-                        }
-                        self.doc.mark_prop(humanoid, ustr("Sit"));
-                    }
-                    other => {
-                        let s = self.play.as_mut().expect("playing");
-                        let ch = s.character.as_mut().expect("character");
-                        match other {
-                            Some(
-                                st @ (State::FallingDown
-                                | State::GettingUp
-                                | State::Ragdoll
-                                | State::Physics),
-                            ) => {
-                                ch.forced = Some(st);
-                                ch.forced_for = 0.0;
-                            }
-                            Some(_) => ch.forced = None,
-                            None => {}
-                        }
-                    }
-                }
-            }
-            let downed = {
-                let s = self.play.as_mut().expect("playing");
-                let ch = s.character.as_mut().expect("character");
-                ch.forced_for += dt;
-                match ch.forced {
-                    Some(State::FallingDown) if ch.forced_for >= mech::FALLING_DOWN_S => {
-                        ch.forced = (!states_off.contains("GettingUp")).then_some(State::GettingUp);
-                        ch.forced_for = 0.0;
-                    }
-                    Some(State::GettingUp) if ch.forced_for >= mech::GETTING_UP_S => {
-                        ch.forced = None;
-                    }
-                    // Studio's Ragdoll: over after its 5 s timer,
-                    // or as soon as the root is slow enough (|v| and |ω| < 1;
-                    // the controller's root has no spin, so its velocity decides).
-                    Some(State::Ragdoll)
-                        if ch.state == State::Ragdoll
-                            && (ch.forced_for >= mech::RAGDOLL_TIMER_S
-                                || (jump_req && ch.forced_for >= mech::RAGDOLL_EARLY_EXIT_S)
-                                || ch.velocity.length() < mech::RAGDOLL_SLOW_ENOUGH) =>
-                    {
-                        ch.forced = (!states_off.contains("GettingUp")).then_some(State::GettingUp);
-                        ch.forced_for = 0.0;
-                    }
-                    _ => {}
-                }
-                ch.forced.is_some()
-            };
-            // Seats (jumping gets up).
-            seat_change = self.update_seat(humanoid, jump_req && !downed, dt);
-            let seat_root = self
-                .play
-                .as_ref()
-                .and_then(|s| s.character.as_ref())
-                .and_then(|c| c.seat)
-                .and_then(|seat| {
-                    // Where the SeatWeld holds the root: seat · C0 · C1⁻¹
-                    //.
-                    let xf = crate::scene::xform_of(&self.doc, seat)?;
-                    let weld = self.doc.find_named(seat, "SeatWeld")?;
-                    let cf = |k: &str| match self.doc.prop(weld, k) {
-                        Some(Variant::CFrame(c)) => Xform::from_cframe(&c),
-                        _ => Xform {
-                            pos: Vec3::ZERO,
-                            rot: glam::Mat3::IDENTITY,
-                        },
-                    };
-                    use crate::ltypes::{cf_inv, cf_mul};
-                    Some(cf_mul(&cf_mul(&xf, &cf("C0")), &cf_inv(&cf("C1"))))
-                });
-            // Sitting, PlatformStand or a forced state: no walking.
-            let sit = matches!(self.doc.prop(humanoid, "Sit"), Some(Variant::Bool(true)));
-            // PlatformStand from either side (the client owns the character;
-            // Place C sets it on the server).
-            let platform = matches!(self.doc.prop(humanoid, "PlatformStand"), Some(Variant::Bool(true)))
-                || matches!(self.owned_humanoid_prop(humanoid, "PlatformStand"), Some(Variant::Bool(true)));
-            let held = sit || platform || downed || seat_root.is_some();
-            if held {
-                dir = Vec3::ZERO;
-            }
-            let wants_jump = jump_req && !downed;
-            if wants_jump && sit {
-                if let Some(inst) = self.doc.dom.get_by_ref_mut(humanoid) {
-                    inst.properties.insert(ustr("Sit"), Variant::Bool(false));
-                }
-                self.doc.mark_prop(humanoid, ustr("Sit"));
-            }
-            let left_seat = seat_change.as_ref().is_some_and(|c| !c.active);
-            // Constraints the client put on the HumanoidRootPart (a game's own
-            // movement, e.g. Place A's LinearVelocity "pmove" with WalkSpeed 0).
-            let movers = self.client_root_movers();
-            if let Some(s) = self.play.as_mut() {
-                s.physics.sync_gravity(&self.doc);
-            }
-            let joint_xf = self.joint_transforms();
-            let own: HashSet<Ref> = self
-                .play
-                .as_ref()
-                .and_then(|s| s.character.as_ref())
-                .map(|c| {
-                    self.doc
-                        .dom
-                        .descendants_of(c.model)
-                        .filter(|i| doc::is_a(&i.class, "BasePart"))
-                        .map(|i| i.referent())
-                        .collect()
-                })
-                .unwrap_or_default();
-            // The character collides as its HumanoidRootPart's CollisionGroup
-            // (a script on either side may have set it; the client owns it).
-            let char_group = {
-                let s = self.play.as_ref().expect("playing");
-                let root = s.character.as_ref().map(|c| c.rig.root).unwrap_or_else(Ref::none);
-                let from = |d: &Document, r: Ref| match d.prop(r, "CollisionGroup") {
-                    Some(Variant::String(g)) if !g.is_empty() => Some(g),
-                    _ => None,
-                };
-                s.map
-                    .s2c
-                    .get(&root)
-                    .and_then(|c| s.other_doc.as_ref().and_then(|cd| from(cd, *c)))
-                    .filter(|g| g != crate::collision_groups::DEFAULT)
-                    .or_else(|| from(&self.doc, root))
-                    .unwrap_or_else(|| crate::collision_groups::DEFAULT.to_string())
-            };
-            let s = self.play.as_mut().expect("playing");
-            s.physics.char_group = char_group;
-            let ch = s.character.as_mut().expect("character");
-            // Accessories put on during Play (Humanoid:AddAccessory) attach
-            // the way spawn-time ones do, by matching attachment names; parts
-            // a game welds to the body go along with it (refresh_attached).
-            let accessories = self
-                .doc
-                .dom
-                .descendants_of(ch.model)
-                .filter(|i| {
-                    doc::is_a(&i.class, "Accoutrement")
-                        || doc::is_a(&i.class, "BasePart")
-                        || i.class == "WeldConstraint"
-                        || i.class == "RigidConstraint"
-                        || i.class == "Weld"
-                })
-                .count();
-            if accessories != ch.accessories_seen {
-                let carried = ch.rig.refresh_attached(&self.doc, ch.model);
-                ch.accessories_seen = accessories;
-                if !carried.is_empty() {
-                    s.physics.skip.extend(carried.iter().copied());
-                    s.physics.refresh(carried);
-                }
-            }
-            if let Some(vy) = movers.vel_y {
-                // The Humanoid controller (move_humanoid) integrates
-                // body.vel and copies its y back to vel_y afterwards, so a
-                // script's velocity has to land there too or it's lost
-                // (Place A's own jump: Jumping disabled, root velocity set to the
-                // take-off speed). Going up, the floor stops holding the root
-                // until it falls again, as after a Humanoid jump.
-                ch.body.vel_y = vy;
-                ch.body.vel.y = vy;
-                if vy > 0.0 {
-                    ch.body.grounded = false;
-                    ch.body.jump_rise = true;
-                }
-            }
-            if let Some(y) = movers.yaw {
-                if movers.yaw_rate > 0.0 {
-                    let d = (y - ch.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
-                        - std::f32::consts::PI;
-                    ch.yaw += d * (1.0 - (-movers.yaw_rate * dt).exp());
-                } else {
-                    ch.yaw = y;
-                }
-            }
-            // Facing: with the camera (RotationType CameraRelative: shift-lock,
-            // first person) or easing toward the walking direction.
-            if auto_rotate {
-                let target = if s.camera_relative {
-                    let look = -self.cam.forward();
-                    (look.x.abs() + look.z.abs() > 1e-4).then(|| look.x.atan2(look.z))
-                } else if let Some(wn) = ch.wall.filter(|wn| dir.dot(*wn) < 0.0 && ch.body.grounded) {
-                    // Pushed into a wall on a floor the body turns flush to it
-                    // (Studio's contact torque beats AutoRotate: movement_probe
-                    // wall_slide); in the air it keeps easing toward the walk
-                    // (wall_jump_diag: −0.07 → −0.46 = the walk's yaw, round 25).
-                    Some(wn.x.atan2(wn.z))
-                } else {
-                    (dir != Vec3::ZERO).then(|| (-dir.x).atan2(-dir.z))
-                };
-                if let Some(t) = target {
-                    let mut d = t - ch.yaw;
-                    d = (d + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
-                        - std::f32::consts::PI;
-                    ch.yaw += if s.camera_relative {
-                        d
-                    } else {
-                        d * (1.0 - (-mech::TURN_RATE * dt).exp())
-                    };
-                }
-            }
-            if left_seat && wants_jump {
-                // Jumping out of a seat leaves from where it sat.
-                ch.body.grounded = true;
-                ch.body.free_jump = true;
-            }
-            // Swimming: the root in terrain water. Climbing: walking into a
-            // TrussPart (and holding on to it while standing still).
-            let in_water = seat_root.is_none()
-                && !states_off.contains("Swimming")
-                && s.physics.water_at(ch.body.pos) > mech::SWIM_ENTER_WATER;
-            let facing = Vec3::new(-ch.yaw.sin(), 0.0, -ch.yaw.cos());
-            // FindLadder (Studio → Studio) looks along the root's
-            // look vector. It runs only in states whose row of the transition
-            // table (Studio, 0x4c per state) has a ladder entry —
-            // Running and Freefall (→ Climbing) and Climbing (lost → Running);
-            // Jumping and Landed have none — and then every vtable 
-            // updates: Climbing and Freefall 0 (Studio: every update),
-            // Running 2 (Studio: every third). Between runs the sensor
-            // keeps its last result; a new state starts its count at 0.
-            let ladder_state = matches!(ch.state, State::Running | State::Freefall | State::Climbing);
-            if !ladder_state {
-                ch.ladder_wait = 0;
-            } else if ch.ladder_wait > 0 {
-                ch.ladder_wait -= 1;
-            } else {
-                ch.ladder = s.physics.ladder_normal_scaled(&self.doc, ch.body.pos + Vec3::Y * ch.root_lift, facing,
-                    ch.shape.hip + ch.shape.root_size.y * 0.5,
-                    (if ch.shape.r6 { mech::CLIMB_REACH } else { mech::CLIMB_REACH_R15 }) *
-                        self.doc.find_named(ch.model, "Head").and_then(|r| crate::scene::vec3_of(self.doc.prop(r, "Size"))).map_or(1.0, |s| s.y), &own);
-                ch.ladder_wait = ladder_interval(ch.state);
-            }
-            let ladder_normal = ch.ladder.filter(|_| ladder_state);
-            let on_truss = seat_root.is_none()
-                && !in_water
-                && !held
-                && !states_off.contains("Climbing")
-                && ladder_normal.is_some();
-            let was_grounded = ch.body.grounded;
-            let mut walk = movers.plane.unwrap_or(dir * speed);
-            let mut hum_jumped = false;
-            let mut swimming_now = false;
-            let mut swim_jumped = false;
-            let mut hum_floor: Option<Option<Ref>> = None;
-            let mut hum_velocity: Option<Vec3> = None;
-            let mut climbing = false;
-            if let Some(xf) = seat_root {
-                ch.body.pos = xf.pos - Vec3::Y * ch.root_lift;
-                ch.body.vel_y = 0.0;
-                ch.body.grounded = true;
-                let look = -xf.rot.z_axis;
-                ch.yaw = (-look.x).atan2(-look.z);
-                walk = Vec3::ZERO;
-                char_touches = ch.touching.iter().copied().collect();
-            } else if let Some(v) = movers.vector {
-                // A LinearVelocity holds the root: its velocity, no gravity.
-                ch.body.vel_y = v.y;
-                walk = Vec3::new(v.x, 0.0, v.z);
-                char_touches = s.physics.move_character_floating(&mut ch.body, walk, dt, &own);
-            } else if in_water {
-                // Studio's Swimming: a move whose level part is
-                // over SWIM_FLAT_RATIO × its vertical swims level at the full
-                // speed; a steeper one (the camera looking down or up) dives
-                // or rises along it.
-                let swim_move = if movers.plane.is_some() || dir != Vec3::new(move_3d.x, 0.0, move_3d.z) {
-                    None
-                } else {
-                    let flat = Vec3::new(move_3d.x, 0.0, move_3d.z);
-                    (move_3d.y.abs() * mech::SWIM_FLAT_RATIO >= flat.length() && move_3d.y.abs() > 1e-3)
-                        .then_some(move_3d * speed)
-                };
-                if let Some(m) = swim_move {
-                    walk = Vec3::new(m.x, 0.0, m.z);
-                } else if walk.length() > 1e-4 {
-                    // Level: the whole move's length along the level part.
-                    let full = if movers.plane.is_some() { walk.length() } else { move_3d.length().max(dir.length()) * speed };
-                    walk = walk.normalize() * full;
-                }
-                // The float fades out just under the surface (root centre).
-                let root_y = ch.body.pos.y + ch.root_lift;
-                let float = s
-                    .physics
-                    .water_top(ch.body.pos)
-                    .map(|top| ((top - mech::SWIM_SURFACE_GAP - root_y) / mech::SWIM_SURFACE_FADE).clamp(0.0, 1.0))
-                    .unwrap_or(0.0);
-                // Studio's Swimming pulls the velocity toward
-                // the move vector at SWIM_GAIN /s; Jump adds mass × 500 up,
-                // which settles at 500 / 35 studs/s. (The idle float is the
-                // water's buoyancy, still an estimate here.)
-                // Jump while swimming: Studio jumps at full speed (Jumping,
-                // then Swimming again a step later; held, it leaves the water).
-                if jump_req {
-                    ch.body.vel_y = jump_v;
-                    swim_jumped = true;
-                }
-                let drag_k = mech::SWIM_GAIN
-                    / (mech::SWIM_GAIN + mech::WATER_DRAG_PER_PART * ch.shape.parts as f32 / ch.shape.mass.max(1.0));
-                let target = if jump_req {
-                    jump_v
-                } else if let Some(m) = swim_move {
-                    m.y * drag_k
-                } else if ch.rig_type == RigType::R6 {
-                    mech::SWIM_FLOAT_SPEED_R6 * float
-                } else {
-                    mech::SWIM_FLOAT_SPEED * float
-                };
-                // The swim force is clamped per axis (..ce92, limits
-                //): up at most SWIM_FORCE_UP_MAX, down
-                // SWIM_FORCE_MAX (× the body scale³, 1 here), so a fall into
-                // water is braked at 1000 / mass, not stopped at once.
-                let dv = (target - ch.body.vel_y) * (1.0 - (-mech::SWIM_GAIN * dt).exp());
-                let m = ch.shape.mass.max(1.0);
-                ch.body.vel_y += if jump_req {
-                    dv
-                } else {
-                    dv.clamp(-mech::SWIM_FORCE_MAX / m * dt, mech::SWIM_FORCE_UP_MAX / m * dt)
-                };
-                // Water drag against the swim force: per part over the mass
-                // (R15 0.695 × the move speed, R6 0.829 in Studio).
-                let drag = mech::WATER_DRAG_PER_PART * ch.shape.parts as f32 / ch.shape.mass.max(1.0);
-                walk *= mech::SWIM_GAIN / (mech::SWIM_GAIN + drag);
-                swimming_now = walk.length() > mech::CLIMB_MIN_INPUT;
-                char_touches = s.physics.move_character_floating(&mut ch.body, walk, dt, &own);
-            } else if crate::physics::climbs(ch.state == State::Climbing, ch.body.grounded, on_truss, wants_jump) {
-                // Held Jump doesn't keep it off the ladder: from Freefall it
-                // grabs again, and Climbing's next frame jumps off again.
-                // Studio's Climbing (Studio; physics::climb_step).
-                climbing = true;
-                let shape = ch.shape;
-                char_touches = s.physics.climb_step(&mut ch.body, &shape, ch.yaw, walk, facing,
-                    ladder_normal.unwrap_or(-facing), dt, &own);
-                walk = Vec3::new(ch.body.vel.x, 0.0, ch.body.vel.z);
-            } else {
-                if ch.state == State::Climbing && wants_jump {
-                    // Studio: impulse along normalize(up - flat look),
-                    // only when the previous state was Climbing (12).
-                    ch.body.grounded = true;
-                    ch.body.free_jump = true;
-                    ch.body.vel = Vec3::Y * ch.body.vel_y;
-                    ch.body.climb_jump = Some((Vec3::Y - facing) * mech::CLIMB_JUMP_COMPONENT);
-                }
-                // Studio's Humanoid controller (round 22): floor rays, the hip
-                // spring, the body box (physics::move_humanoid).
-                if ch.hum_mode_left {
-                    // Back from a floating mode: carry its vertical speed.
-                    ch.body.vel.y = ch.body.vel_y;
-                    ch.hum_mode_left = false;
-                }
-                // A Plane LinearVelocity holds the horizontal velocity itself.
-                ch.body.walk_exact = movers.plane.is_some_and(|p| p == walk);
-                let shape = ch.shape;
-                let m = s.physics.move_humanoid(
-                    &self.doc,
-                    &mut ch.body,
-                    &mut ch.yaw,
-                    &shape,
-                    walk,
-                    wants_jump.then_some(jump_v),
-                    !platform,
-                    dt,
-                    &own,
-                );
-                ch.body.vel_y = ch.body.vel.y;
-                ch.wall = m.wall;
-                char_touches = m.touched;
-                // Still Jumping while the take-off speed is held against a wall.
-                hum_jumped = m.jumped || m.jumping;
-                hum_floor = Some(m.floor);
-                hum_velocity = Some(m.velocity);
-            }
-            if hum_floor.is_none() {
-                ch.hum_mode_left = true;
-            }
-            // Swimming along: the body lies flat, easing in; upright again
-            // out of the water.
-            let tilt = if swimming_now { -std::f32::consts::FRAC_PI_2 } else { 0.0 };
-            ch.pitch += (tilt - ch.pitch) * (1.0 - (-mech::SWIM_TILT_RATE * dt).exp());
-            let jumped = hum_jumped
-                || swim_jumped
-                || (wants_jump && was_grounded && !ch.body.grounded && hum_floor.is_none());
-            // Humanoid.FloorMaterial: Air in the air, else the floor part's
-            // Material; on terrain the voxel's material under the feet.
-            let floor_part = match hum_floor {
-                Some(f) => f,
-                None => s.physics.floor_under(&ch.body, &own),
-            };
-            let floor = match floor_part {
-                None => mech::MATERIAL_AIR,
-                Some(p) if self.doc.class_of(p).is_some_and(|k| k == "Terrain") => s
-                    .physics
-                    .terrain_material_under(ch.body.pos)
-                    .and_then(|m| {
-                        crate::ltypes::LEnumItem::from_name("Material", crate::terrain::material_name(m))
-                    })
-                    .map(|e| e.value)
-                    .unwrap_or(256),
-                Some(p) => crate::scene::enum_u32(self.doc.prop(p, "Material")).unwrap_or(256),
-            };
-            // Seated, PlatformStanding, FallingDown…: Studio reads Air.
-            let floor = if held { mech::MATERIAL_AIR } else { floor };
-            if floor != ch.floor_material {
-                ch.floor_material = floor;
-                floor_changed = Some(floor);
-            }
-            ch.velocity = hum_velocity.unwrap_or(Vec3::new(walk.x, ch.body.vel_y, walk.z));
-            let horizontal = Vec3::new(walk.x, 0.0, walk.z).length();
-            // Humanoid states.
-            let next = if seat_root.is_some() || (sit && ch.forced.is_none()) {
-                State::Seated
-            } else if let Some(f) = ch.forced {
-                f
-            } else if platform {
-                State::PlatformStanding
-            } else if in_water && !swim_jumped {
-                State::Swimming
-            } else if climbing {
-                State::Climbing
-            } else if ch.state == State::Climbing && !jumped {
-                // Losing the last rung enters Running before its floor test
-                // takes the character into Freefall on the following step.
-                State::Running
-            } else if !ch.body.grounded {
-                // Studio's Jumping lasts one step, then Freefall (longer
-                // against a wall: physics::move_humanoid's hold).
-                if jumped {
-                    State::Jumping
-                } else {
-                    State::Freefall
-                }
-            } else if matches!(ch.state, State::Freefall | State::Jumping) {
-                ch.landed_for = 0.0;
-                State::Landed
-            } else if ch.state == State::Landed && ch.landed_for + dt * 0.5 < mech::LANDED_TO_RUNNING_S {
-                ch.landed_for += dt;
-                State::Landed
-            } else {
-                State::Running
-            };
-            if next != ch.state {
-                state_change = Some((ch.state, next));
-                s.state_log.push(next.enum_name().to_string());
-                // Back on its feet: Running reports the speed again.
-                // Entering Running (after landing, too) always reports it:
-                // Animate goes back to idle on Running(0), else a character
-                // that fell or jumped in place keeps its fall pose.
-                if next == State::Running
-                    || !matches!(ch.state, State::Running | State::Landed | State::Freefall | State::Jumping)
-                {
-                    ch.last_speed = -1.0;
-                }
-                ch.last_move_speed = -1.0;
-                ch.ladder_wait = 0;
-                ch.state = next;
-            }
-            // Humanoid.Climbing(speed) / Swimming(speed) when the speed changes.
-            if matches!(ch.state, State::Climbing | State::Swimming) {
-                let sp = if ch.state == State::Climbing {
-                    ch.body.vel_y.abs()
-                } else {
-                    Vec3::new(walk.x, ch.body.vel_y, walk.z).length()
-                };
-                if (sp - ch.last_move_speed).abs() > 0.1 {
-                    move_event = Some((ch.state.enum_name(), sp));
-                    ch.last_move_speed = sp;
-                }
-            }
-            if ch.body.grounded
-                && matches!(ch.state, State::Running | State::Landed)
-                && (horizontal - ch.last_speed).abs() > 0.1
-            {
-                running_speed = Some(horizontal);
-                ch.last_speed = horizontal;
-            }
-            let fell = ch.body.pos.y < mech::FALLEN_PARTS_HEIGHT || force_dead;
-            let mut pose = character_pose(ch, &joint_xf);
-            ch.last_root = pose
-                .iter()
-                .find(|(r, _)| *r == ch.rig.root)
-                .map(|(_, x)| *x);
-            // The equipped tool rides in the right hand.
-            pose.extend(self.tool_pose(&pose));
-            // Client first (it owns the character), then the server copy.
-            if let Some(s) = self.play.as_mut() {
-                if let Some(cdoc) = s.other_doc.as_mut() {
-                    rig::write_pose(cdoc, &pose, Some(&s.map.s2c));
-                }
-            }
-            rig::write_pose(&mut self.doc, &pose, None);
-            if let Some(m) = floor_changed {
-                let v = Variant::Enum(rbx_dom_weak::types::Enum::from_u32(m));
-                if let Some(inst) = self.doc.dom.get_by_ref_mut(humanoid) {
-                    inst.properties.insert(ustr("FloorMaterial"), v.clone());
-                }
-                self.doc.mark_prop(humanoid, ustr("FloorMaterial"));
-                if let Some(s) = self.play.as_mut() {
-                    if let (Some(c), Some(cdoc)) = (s.map.s2c.get(&humanoid).copied(), s.other_doc.as_mut()) {
-                        if let Some(inst) = cdoc.dom.get_by_ref_mut(c) {
-                            inst.properties.insert(ustr("FloorMaterial"), v);
-                        }
-                        cdoc.mark_prop(c, ustr("FloorMaterial"));
-                    }
-                }
-            }
-            if fell {
-                if let Some(inst) = self.doc.dom.get_by_ref_mut(humanoid) {
-                    inst.properties
-                        .insert(ustr("Health"), Variant::Float32(0.0));
-                }
-                self.doc.mark_prop(humanoid, ustr("Health"));
-                self.record(RepOp::Prop(humanoid, "Health".into()));
-                self.kill_character();
-            }
+            self.npc_pose();
         }
 
         drop(sc);
@@ -2786,6 +2328,25 @@ impl Editor {
             let s = self.play.as_mut().expect("playing");
             s.physics.step(&mut self.doc, dt)
         };
+        {
+            let _s = crate::bench::scope("p3a_npc_post");
+            self.npc_post();
+        }
+        if let Some(mut o) = hum_out.take() {
+            let _s = crate::bench::scope("p3a_humanoid_post");
+            self.hum_post(&mut o);
+            char_touches = std::mem::take(&mut o.touches);
+            state_change = o.state_change;
+            if let (Some((_, next)), Some(s)) = (state_change, self.play.as_mut()) {
+                s.state_log.push(next.enum_name().to_string());
+            }
+            seat_change = o.seat_change.take();
+            move_event = o.move_event;
+            running_speed = o.running_speed;
+            floor_changed = o.floor_changed;
+            char_part = o.char_part;
+            humanoid_ref = o.humanoid;
+        }
         for (r, _) in &result.moved {
             self.record(RepOp::Moved(*r));
         }
@@ -2829,12 +2390,63 @@ impl Editor {
             .map(|s| s.physics.velocities())
             .unwrap_or_default();
         let time = self.play.as_ref().map(|s| s.time).unwrap_or(0.0);
-        let state_names: HashMap<Ref, &'static str> = self
+        let mut state_names: HashMap<Ref, &'static str> = self
             .play
             .as_ref()
             .and_then(|s| s.character.as_ref())
             .map(|c| HashMap::from([(c.humanoid, c.state.enum_name())]))
             .unwrap_or_default();
+        // The other Humanoids (play_npc.rs): their states and this frame's
+        // StateChanged / Running / Climbing / Swimming events.
+        let npc_events: Vec<npc::NpcEvent> = match self.play.as_mut() {
+            Some(s) => {
+                state_names.extend(s.npcs.states());
+                std::mem::take(&mut s.npcs.events)
+            }
+            None => Vec::new(),
+        };
+        let fire_npcs = |rt: &Runtime, map: Option<&HashMap<Ref, Ref>>| {
+            let m = |r: Ref| match map {
+                Some(m) => m.get(&r).copied(),
+                None => Some(r),
+            };
+            for e in &npc_events {
+                match e {
+                    npc::NpcEvent::State(h, old, new) => {
+                        let Some(h) = m(*h) else { continue };
+                        let item = |s: State| {
+                            LEnumItem::from_name("HumanoidStateType", s.enum_name())
+                                .and_then(|e| crate::ltypes::enum_value(&rt.lua, e).ok())
+                                .unwrap_or(Value::Nil)
+                        };
+                        rt.fire(h, "StateChanged", vec![item(*old), item(*new)]);
+                        match new {
+                            State::Jumping => rt.fire(h, "Jumping", vec![Value::Boolean(true)]),
+                            State::Freefall => rt.fire(h, "FreeFalling", vec![Value::Boolean(true)]),
+                            _ => {}
+                        }
+                        if *old == State::Freefall {
+                            rt.fire(h, "FreeFalling", vec![Value::Boolean(false)]);
+                        }
+                        for (s, on) in [(*old, false), (*new, true)] {
+                            if matches!(s, State::FallingDown | State::GettingUp | State::Ragdoll) {
+                                rt.fire(h, s.enum_name(), vec![Value::Boolean(on)]);
+                            }
+                        }
+                    }
+                    npc::NpcEvent::Running(h, sp) => {
+                        if let Some(h) = m(*h) {
+                            rt.fire(h, "Running", vec![Value::Number(*sp as f64)]);
+                        }
+                    }
+                    npc::NpcEvent::Move(h, ev, sp) => {
+                        if let Some(h) = m(*h) {
+                            rt.fire(h, ev, vec![Value::Number(*sp as f64)]);
+                        }
+                    }
+                }
+            }
+        };
 
         // 4. Server scripts.
         let fire_touches = |rt: &Runtime, map: Option<&HashMap<Ref, Ref>>| {
@@ -2947,17 +2559,13 @@ impl Editor {
                 }
                 fire_touches(rt, None);
                 fire_humanoid(rt, humanoid_server, seat_server, false);
+                fire_npcs(rt, None);
                 if let Some(rs) = run_service {
                     // A server frame in Studio's order (Run mode probe):
                     // PreAnimation (then the Animator), Stepped,
                     // PreSimulation, PostSimulation, Heartbeat (then tweens).
-                    rt.fire(rs, "PreAnimation", vec![Value::Number(dt as f64)]);
-                    rt.fire(
-                        rs,
-                        "Stepped",
-                        vec![Value::Number(time), Value::Number(dt as f64)],
-                    );
-                    rt.fire(rs, "PreSimulation", vec![Value::Number(dt as f64)]);
+                    // (With the dynamic Humanoid the first three fired before
+                    // the world steps: lua_pre_physics.)
                     rt.fire(rs, "PostSimulation", vec![Value::Number(dt as f64)]);
                     rt.fire(rs, "Heartbeat", vec![Value::Number(dt as f64)]);
                 }
@@ -3171,7 +2779,7 @@ impl Editor {
                         ],
                     );
                 };
-                rt.spawn_global("__rs_input_frame_end", vec![]);
+                rt.spawn_global("__rs_input_frame_end", vec![Value::Number(dt as f64)]);
                 // A press reaches UserInputService.InputBegan before the GUI's
                 // MouseButton1Down / Up / Click / Activated, even when press and
                 // release land in the same frame (the harness's --click).
@@ -3220,6 +2828,7 @@ impl Editor {
                 mouse_buttons(false);
                 fire_touches(rt, Some(&map_s2c));
                 fire_humanoid(rt, humanoid_client, seat_server.and_then(|s| map_s2c.get(&s).copied()), true);
+                fire_npcs(rt, Some(&map_s2c));
                 if let Some(mut w) = rt.world_mut() {
                     w.input.gamepads = pads_now;
                 }
@@ -3244,23 +2853,43 @@ impl Editor {
                 if let Some(rs) = crs {
                     // A client frame in Roblox's order: PreRender (RenderStepped),
                     // PreAnimation, PreSimulation (Stepped), PostSimulation (Heartbeat).
-                    rt.fire(rs, "RenderStepped", vec![Value::Number(dt as f64)]);
-                    rt.fire(rs, "PreRender", vec![Value::Number(dt as f64)]);
-                    rt.fire(rs, "PreAnimation", vec![Value::Number(dt as f64)]);
-                    rt.fire(
-                        rs,
-                        "Stepped",
-                        vec![Value::Number(time), Value::Number(dt as f64)],
-                    );
-                    rt.fire(rs, "PreSimulation", vec![Value::Number(dt as f64)]);
-                    rt.fire(rs, "PostSimulation", vec![Value::Number(dt as f64)]);
-                    rt.fire(rs, "Heartbeat", vec![Value::Number(dt as f64)]);
+                    // With the split frame order (the dynamic Humanoid) the
+                    // events before the world steps fired there, and
+                    // RenderStepped is the last thing before the frame is
+                    // drawn: Studio renders the state RenderStepped leaves,
+                    // so the camera a script placed there and the character
+                    // it followed are drawn together (fired before the world
+                    // steps, the drawn character was a frame of motion ahead
+                    // of its camera: checks/humanoid-physics/feel).
+                    let d = || Value::Number(dt as f64);
+                    {
+                        // PostSimulation and Heartbeat with everything they
+                        // resume (waits end at Heartbeat) run before
+                        // RenderStepped fires: what a thread connects or
+                        // sets when Heartbeat:Wait() or task.wait() returns
+                        // is there for the render step that follows, as in
+                        // Studio, where that render step opens the next
+                        // frame. (Fired together, the render step missed a
+                        // connection made at Heartbeat and a script's first
+                        // Move came a frame late: tools/fidelity sprint.)
+                        rt.fire(rs, "PostSimulation", vec![d()]);
+                        rt.fire(rs, "Heartbeat", vec![d()]);
+                        if let Some(mut w) = rt.world_mut() {
+                            w.realtime = realtime;
+                        }
+                        rt.step(dt as f64);
+                        rt.fire(rs, "RenderStepped", vec![d()]);
+                        rt.fire(rs, "PreRender", vec![d()]);
+                        rt.dispatch();
+                    }
                 }
                 if let Some(mut w) = rt.world_mut() {
                     w.realtime = realtime;
                 }
                 let _s = crate::bench::scope("p6b_rt_step");
-                rt.step(dt as f64);
+                if crs.is_none() {
+                    rt.step(dt as f64);
+                }
             });
             drop(lua_sc);
             let req = crate::bench::scope("p6c_requests");
@@ -3378,6 +3007,33 @@ impl Editor {
             self.cam.ortho = None;
             self.cam.stretch = 1.0;
         }
+        // RUSTUDIO_FEEL_TRACE: what this frame draws (the view's camera and
+        // the character's root as they are when the tick ends), for
+        // checks/humanoid-physics/feel.
+        if feel_trace() {
+            if let Some(s) = self.play.as_ref() {
+                let root = s.character.as_ref().and_then(|c| {
+                    let cr = s.map.s2c.get(&c.rig.root).copied()?;
+                    crate::scene::xform_of(s.other_doc.as_ref()?, cr)
+                });
+                if let Some(r) = root {
+                    let yaw = |look: Vec3| (-look.x).atan2(-look.z);
+                    crate::app::tee_log(&format!(
+                        "FEELR|{:.4}|{:.4}|{:.4},{:.4},{:.4}|{:.5}|{:.4},{:.4},{:.4}|{:.5}",
+                        s.time,
+                        dt,
+                        r.pos.x,
+                        r.pos.y,
+                        r.pos.z,
+                        yaw(-r.rot.z_axis),
+                        self.cam.pos.x,
+                        self.cam.pos.y,
+                        self.cam.pos.z,
+                        yaw(self.cam.forward()),
+                    ));
+                }
+            }
+        }
         self.shown_front();
     }
 
@@ -3395,7 +3051,11 @@ impl Editor {
             let out = crate::runtime::security::with_main_identity(&rt.lua, id, || {
                 // Scripts' _G and shared, with every host global.
                 let env = crate::globals_parity::harness_env(&rt.lua)?;
-                rt.lua.load(code).set_name("=harness").set_environment(env).exec()
+                // As a thread, like the Studio command bar: the chunk may
+                // yield (task.wait), and its errors still come back here.
+                let f = rt.lua.load(code).set_name("=harness").set_environment(env).into_function()?;
+                let th = crate::runtime::domains::assets_cloud::scene::create_thread(&rt.lua, f)?;
+                th.resume::<mlua::MultiValue>(()).map(|_| ())
             })
             .err()
             .map(|e| crate::runtime::describe_error(&e));
@@ -3442,6 +3102,12 @@ impl Editor {
 
 /// Gamepads plugged in: the kernel's joystick devices
 /// (/dev/input/by-id/*-event-joystick), sorted so slots stay stable.
+/// `RUSTUDIO_FEEL_TRACE` is set (the per-frame FEELR lines, with RUSTUDIO_LOG_TEE).
+fn feel_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTUDIO_FEEL_TRACE").is_some())
+}
+
 fn gamepad_devices() -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir("/dev/input/by-id")
         .map(|rd| {
@@ -3538,7 +3204,7 @@ fn hum_shape(doc: &Document, model: Ref, root_lift: f32) -> crate::physics::HumS
 }
 
 /// Whether a character part collides on Studio's spawned character.
-fn studio_collides(name: &str, rig: RigType) -> bool {
+pub(crate) fn studio_collides(name: &str, rig: RigType) -> bool {
     match rig {
         RigType::R15 => matches!(name, "HumanoidRootPart" | "UpperTorso" | "LowerTorso" | "Head"),
         RigType::R6 => matches!(name, "Torso" | "Head"),

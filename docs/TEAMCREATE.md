@@ -434,7 +434,7 @@ Each phase can ship on its own and is useful alone.
 
 | Unknown | Experiment |
 |---|---|
-| Exact `/v1/team-create` reply, status codes and polling cadence | With the user's OK, open a TC place in a offline Studio signed in to a real collaborator account, with `mockblox` passing gamejoin through and logging bodies. Or have the offline Studio's mock answer `/v1/team-create` and log what Studio sends and expects. |
+| Exact `/v1/team-create` reply, status codes and polling cadence | With the user's OK, open a TC place in a offline Studio signed in to a real collaborator account, with `the local backend` passing gamejoin through and logging bodies. Or have the offline Studio's mock answer `/v1/team-create` and log what Studio sends and expects. |
 | Whether the TC toggle is `POST` or `PATCH`, and its reply | Read the native `dispatchTurnOn` request builder . Or capture one toggle the user does by hand on a throwaway universe. |
 | Fix for `GetCanCollaborate` / `MultiGetCanCollaborate` "Request Context Failure" | One `GetCanCollaborate` POST with `robloxctx-authenticated-userid`, which is read-only but needs the user's OK as a new POST. |
 | SessionCrypto: algorithms, box format, key-exchange version, which side picks the encryption | Then confirm against a local RCC-less an offline Studio "Server & Clients" test, where Studio is both client and server, so both ends are observable offline. |

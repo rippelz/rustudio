@@ -17,6 +17,7 @@ enum Show {
     Tab(RibbonTab),
     Click(&'static str),
     Plain,
+    View(&'static str, glam::Vec3),
     /// Select this object (Studio's reference set) and show its Properties.
     Props(&'static str),
     /// Run Studio's Output test script (print, warn, error) with timestamps.
@@ -36,6 +37,7 @@ pub struct UiShots {
     queue: Vec<Event>,
     asked: bool,
     rects: serde_json::Map<String, serde_json::Value>,
+    view_baseline: Option<(crate::camera::Camera, Vec<rbx_dom_weak::types::Ref>)>,
     pub done: bool,
 }
 
@@ -43,7 +45,16 @@ impl UiShots {
     pub fn new(dir: PathBuf) -> Self {
         if std::env::var("RUSTUDIO_UI_SHOTS").as_deref()==Ok("live") {
             let _=std::fs::create_dir_all(&dir);
-            return UiShots {dir,shots:vec![("live-collaborators".into(),Show::LiveCollaborators),("live-script-draft".into(),Show::LiveDraft)],i:0,t:0,queue:Vec::new(),asked:false,rects:Default::default(),done:false};
+            return UiShots {dir,shots:vec![("live-collaborators".into(),Show::LiveCollaborators),("live-script-draft".into(),Show::LiveDraft)],i:0,t:0,queue:Vec::new(),asked:false,rects:Default::default(),view_baseline: None, done:false};
+        }
+        if std::env::var("RUSTUDIO_UI_SHOTS").as_deref() == Ok("views") {
+            let _ = std::fs::create_dir_all(&dir);
+            let shots = [("top", glam::Vec3::Y), ("front", -glam::Vec3::Z),
+                ("right", glam::Vec3::X), ("bottom", -glam::Vec3::Y),
+                ("back", glam::Vec3::Z), ("left", -glam::Vec3::X)]
+                .into_iter().map(|(n,d)| (format!("view-{n}"), Show::View(n,d))).collect();
+            return UiShots { dir, shots, i:0, t:0, queue:Vec::new(), asked:false,
+                rects:Default::default(), view_baseline:None, done:false };
         }
         // RUSTUDIO_UI_SHOTS=props: the Properties panel for the objects
         // Studio's were captured with (run with a tall --window).
@@ -53,13 +64,13 @@ impl UiShots {
                 .map(|n| (format!("props-{n}"), Show::Props(n)))
                 .collect();
             let _ = std::fs::create_dir_all(&dir);
-            return UiShots { dir, shots, i: 0, t: 0, queue: Vec::new(), asked: false, rects: Default::default(), done: false };
+            return UiShots { dir, shots, i: 0, t: 0, queue: Vec::new(), asked: false, rects: Default::default(), view_baseline: None, done: false };
         }
         // RUSTUDIO_UI_SHOTS=editors: the Properties editors (round 18).
         if std::env::var("RUSTUDIO_UI_SHOTS").as_deref() == Ok("editors") {
             let _ = std::fs::create_dir_all(&dir);
             let shots = ["brickcolor", "color", "slider", "material-enum", "ribbon-material", "ribbon-color"].into_iter().map(|n| (format!("edit-{n}"), Show::Editor(n))).collect();
-            return UiShots { dir, shots, i: 0, t: 0, queue: Vec::new(), asked: false, rects: Default::default(), done: false };
+            return UiShots { dir, shots, i: 0, t: 0, queue: Vec::new(), asked: false, rects: Default::default(), view_baseline: None, done: false };
         }
         // RUSTUDIO_UI_SHOTS=terrain: the Terrain Editor with Draw, then Generate.
         if std::env::var("RUSTUDIO_UI_SHOTS").as_deref() == Ok("terrain") {
@@ -83,13 +94,13 @@ impl UiShots {
                 .into_iter()
                 .map(|(n, t)| (format!("terrain-{n}"), Show::Terrain(t)))
                 .collect();
-            return UiShots { dir, shots, i: 0, t: 0, queue: Vec::new(), asked: false, rects: Default::default(), done: false };
+            return UiShots { dir, shots, i: 0, t: 0, queue: Vec::new(), asked: false, rects: Default::default(), view_baseline: None, done: false };
         }
         // RUSTUDIO_UI_SHOTS=output: the Output after Studio's test script.
         if std::env::var("RUSTUDIO_UI_SHOTS").as_deref() == Ok("output") {
             let _ = std::fs::create_dir_all(&dir);
             let shots = vec![("output-run-ts".to_string(), Show::OutputRun)];
-            return UiShots { dir, shots, i: 0, t: 0, queue: Vec::new(), asked: false, rects: Default::default(), done: false };
+            return UiShots { dir, shots, i: 0, t: 0, queue: Vec::new(), asked: false, rects: Default::default(), view_baseline: None, done: false };
         }
         let mut shots: Vec<(String, Show)> = RibbonTab::ALL
             .iter()
@@ -102,7 +113,7 @@ impl UiShots {
         shots.push(("test-dropdown".into(), Show::Click("test.type")));
         shots.push(("account-menu".into(), Show::Click("account")));
         let _ = std::fs::create_dir_all(&dir);
-        UiShots { dir, shots, i: 0, t: 0, queue: Vec::new(), asked: false, rects: Default::default(), done: false }
+        UiShots { dir, shots, i: 0, t: 0, queue: Vec::new(), asked: false, rects: Default::default(), view_baseline: None, done: false }
     }
 
     pub fn inject(&mut self, raw: &mut RawInput) {
@@ -175,6 +186,7 @@ impl Editor {
         let Some((name, show)) = s.shots.get(s.i) else {
             let _ = std::fs::write(s.dir.join("rects.json"), serde_json::to_string_pretty(&s.rects).unwrap_or_default());
             s.done = true;
+            if s.view_baseline.is_some() { self.doc.mark_saved_at(self.doc.revision); }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             self.harness.ui_shots = Some(s);
             return;
@@ -185,8 +197,48 @@ impl Editor {
             self.harness.ui_shots=Some(s);return;
         }
 
+        if matches!(show, Show::View(_, _)) && s.t == 5 && self.cam.view_transition.is_some() {
+            ctx.request_repaint();
+            self.harness.ui_shots = Some(s);
+            return;
+        }
         let click_at = |key: &str, ed: &Editor| ed.ui_rects.get(key).map(|r| r.center());
         match (s.t, show) {
+            (0, Show::View(_, direction)) => {
+                self.cam.select_view((*direction + if direction.y.abs() > 0.9 { glam::Vec3::Z * 0.3 } else { glam::Vec3::Y * 0.3 }).normalize());
+                let target = self.ui_shots_reference("Part");
+                self.select(target.into_iter().collect());
+                s.view_baseline = Some((self.cam.clone(), self.doc.selection.clone()));
+            }
+            (2 | 3, Show::View(label, _)) => {
+                let key = format!("view.{label}");
+                let r = *self.ui_rects.get(key.as_str()).expect("selector must be laid out");
+                assert!(self.viewport_rect.contains_rect(r), "selector outside viewport");
+                assert!(r.width() >= 20.0 && r.height() >= 20.0);
+                let p = r.center();
+                s.queue.push(Event::PointerMoved(p));
+                s.queue.push(Event::PointerButton { pos:p, button:PointerButton::Primary,
+                    pressed:s.t == 2, modifiers:Modifiers::NONE });
+            }
+            (5, Show::View(label, direction)) => {
+                let (before, selection) = s.view_baseline.as_ref().unwrap();
+                assert_eq!(&self.doc.selection, selection, "selector leaked selection");
+                assert!(self.drag.is_none() && self.marquee.is_none(), "selector leaked drag");
+                assert_eq!(self.cam.focus, before.focus);
+                assert!((self.cam.pos.distance(self.cam.focus) - before.pos.distance(before.focus)).abs() < 1e-4);
+                assert!((self.cam.forward() + *direction).length() < 1e-5);
+                assert!(self.cam.view().is_finite());
+                assert_eq!(self.cam.fov_deg, before.fov_deg);
+                std::fs::write(s.dir.join(format!("view-{label}.validation.json")),
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "view": label, "selection_preserved": true, "no_drag_or_marquee": true,
+                        "focus": self.cam.focus.to_array(), "distance": self.cam.pos.distance(self.cam.focus),
+                        "forward": self.cam.forward().to_array(), "lens_preserved": true,
+                        "button_inside_viewport": true
+                    })).unwrap()).expect("write view validation");
+                s.queue.push(Event::PointerMoved(self.viewport_rect.center()));
+                eprintln!("VIEW VALIDATED {label}: selection preserved, no drag/marquee, focus {:?}, distance {}, forward {:?}", self.cam.focus, self.cam.pos.distance(self.cam.focus), self.cam.forward());
+            }
             (0,Show::LiveCollaborators)=>self.cloud.live_collaborators_open=true,
             (0,Show::LiveDraft)=>{
                 self.cloud.live_collaborators_open=false;

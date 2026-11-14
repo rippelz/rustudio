@@ -589,12 +589,14 @@ pub fn install_globals(lua: &Lua) -> mlua::Result<()> {
 /// install-time globals gone.
 pub fn seal(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
-    let the_settings: Value = match g.get::<Value>("settings")? {
-        Value::Function(f) => f.call(())?,
-        _ => Value::Nil,
-    };
+    // library.luau's settings() makes GlobalSettings on first use (the
+    // runtime has no document yet while this runs).
+    let make_settings: Option<Function> = g.get::<Option<Function>>("settings")?;
     let settings = lua.create_function(move |lua, ()| {
-        let r = check_global(lua, "settings").map(|_| MultiValue::from_iter([the_settings.clone()]));
+        let r = check_global(lua, "settings").and_then(|_| match &make_settings {
+            Some(f) => f.call::<Value>(()).map(|v| MultiValue::from_iter([v])),
+            None => Ok(MultiValue::new()),
+        });
         checked(lua, r)
     })?;
     g.set("settings", crate::cmeta::wrap(lua, settings, true)?)?;

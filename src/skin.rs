@@ -55,6 +55,7 @@ pub fn base(id: &str, bytes: &[u8]) -> Option<Arc<Base>> {
         }
         let extent = (m.max - m.min).max(Vec3::splat(1e-4));
         let center = (m.max + m.min) * 0.5;
+        let colors = m.gpu_colors();
         let (firsts, corner_unique) = uniques(&skin.corner_vertex, m.positions.len());
         Some(Arc::new(Base {
             firsts,
@@ -62,7 +63,7 @@ pub fn base(id: &str, bytes: &[u8]) -> Option<Arc<Base>> {
             positions: m.positions.iter().map(|p| (*p - center) / extent).collect(),
             normals: m.normals.iter().map(|n| *n * extent).collect(),
             uvs: m.uvs,
-            colors: m.colors,
+            colors,
             extent,
             center,
             skin,

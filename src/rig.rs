@@ -56,17 +56,73 @@ pub struct Scales {
     pub width: f32,
     pub depth: f32,
     pub head: f32,
+    /// BodyTypeScale / ProportionScale: how far Classic parts go toward the
+    /// ProportionsNormal / ProportionsSlender shapes.
+    pub body_type: f32,
+    pub proportion: f32,
 }
 
 impl Default for Scales {
+    /// A default HumanoidDescription's (Studio's own Play character when no
+    /// avatar is loaded): BodyTypeScale 0.3, ProportionScale 1.
     fn default() -> Self {
         Scales {
             height: 1.0,
             width: 1.0,
             depth: 1.0,
             head: 1.0,
+            body_type: 0.3,
+            proportion: 1.0,
         }
     }
+}
+
+/// Which R15 body-type proportion row a part takes.
+pub(crate) fn part_kind(name: &str) -> Option<usize> {
+    Some(match name {
+        "UpperTorso" => 0,
+        "LowerTorso" => 1,
+        "Head" => 2,
+        "LeftUpperArm" | "LeftLowerArm" | "RightUpperArm" | "RightLowerArm" => 3,
+        "LeftHand" | "RightHand" => 4,
+        "LeftUpperLeg" | "RightUpperLeg" => 5,
+        "LeftLowerLeg" | "RightLowerLeg" => 6,
+        "LeftFoot" | "RightFoot" => 7,
+        _ => return None,
+    })
+}
+
+/// Studio's R15 body-type factors relative to Classic (measured,
+/// domains/avatar_apply.luau): BodyType 1 with Proportion 0
+/// (ProportionsNormal) and with Proportion 1 (ProportionsSlender).
+pub(crate) const PROPORTIONS_NORMAL: [[f32; 3]; 8] = [
+    [1.033, 1.309, 1.14],
+    [1.033, 1.309, 1.14],
+    [0.942, 0.942, 0.942],
+    [1.129, 1.342, 1.132],
+    [1.066, 1.174, 1.231],
+    [1.023, 1.506, 1.023],
+    [1.023, 1.506, 1.023],
+    [1.079, 1.267, 1.129],
+];
+pub(crate) const PROPORTIONS_SLENDER: [[f32; 3]; 8] = [
+    [0.905346, 1.204232, 1.013333],
+    [0.985687, 1.004605, 1.013333],
+    [0.896289, 0.942, 0.896289],
+    [1.003556, 1.207921, 1.006222],
+    [0.947556, 1.174, 1.094222],
+    [0.976145, 1.40093, 0.909333],
+    [0.976145, 1.300518, 0.909333],
+    [1.02958, 1.133274, 1.003556],
+];
+
+/// The proportions a body type / proportion pair asks of a part, relative
+/// to Classic: lerp(1, lerp(Normal, Slender, proportion), body_type).
+pub(crate) fn proportion_target(name: &str, proportion: f32, body_type: f32) -> Vec3 {
+    let Some(k) = part_kind(name) else { return Vec3::ONE };
+    let n = Vec3::from(PROPORTIONS_NORMAL[k]);
+    let sl = Vec3::from(PROPORTIONS_SLENDER[k]);
+    Vec3::ONE.lerp(n.lerp(sl, proportion), body_type)
 }
 
 /// Which body colour a part takes.
@@ -728,6 +784,11 @@ fn set(dom: &mut rbx_dom_weak::WeakDom, r: Ref, key: &str, v: impl Into<Variant>
 }
 
 /// Which body colour an R6 / R15 part name takes.
+/// A character body part's name (R6 or R15, Head included).
+pub fn is_body_part_name(name: &str) -> bool {
+    limb_of(name).is_some()
+}
+
 fn limb_of(name: &str) -> Option<Limb> {
     Some(match name {
         "Head" => Limb::Head,
@@ -939,8 +1000,12 @@ fn studio_character(
 
 /// R15 body scaling the way the avatar scale values work on Classic parts:
 /// every part's OriginalSize and every attachment's OriginalPosition (both
-/// kept in the file) times (width, height, depth) — the head by its own
-/// scale — and each Motor6D re-seated on its two RigAttachments.
+/// kept in the file) times the body type's proportions for that part
+/// (`proportion_target`) and (width, height, depth) — the head by its own
+/// scale — and each Motor6D re-seated on its two RigAttachments. With a
+/// default HumanoidDescription (BodyTypeScale 0.3, ProportionScale 1) this
+/// gives Studio's own Play character's sizes (mech::R15_DEFAULT_PART_SIZES);
+/// an avatar with BodyTypeScale 0 keeps the file's sizes.
 fn apply_r15_scales(dom: &mut rbx_dom_weak::WeakDom, m: Ref, s: &Scales) {
     let v3_of = |dom: &rbx_dom_weak::WeakDom, r: Ref, k: &str| match dom
         .get_by_ref(r)
@@ -953,32 +1018,20 @@ fn apply_r15_scales(dom: &mut rbx_dom_weak::WeakDom, m: Ref, s: &Scales) {
         .get_by_ref(m)
         .map(|i| i.children().to_vec())
         .unwrap_or_default();
-    let default = *s == Scales::default();
+    let unit_hwd = s.height == 1.0 && s.width == 1.0 && s.depth == 1.0 && s.head == 1.0;
     for p in &parts {
         let name = dom.get_by_ref(*p).map(|i| i.name.clone()).unwrap_or_default();
         let head = name == "Head";
         let orig = dom_child(dom, *p, "OriginalSize").and_then(|o| v3_of(dom, o, "Value"));
-        // Default scales: each part takes the size Studio's own Play
-        // character has (measured by tools/fidelity), its attachments
-        // scaled by the same ratio. Other scales: width / height / depth.
-        let ratio = match (default, orig) {
-            (true, Some(o)) => mech::R15_DEFAULT_PART_SIZES
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, t)| Vec3::from(*t) / o.max(Vec3::splat(1e-4))),
-            _ => Some(Vec3::ONE),
-        };
-        // A part Studio's table doesn't size (the HumanoidRootPart) keeps
-        // its file CFrames: its RootRigAttachment's OriginalPosition in the
-        // body file is stale (-0.35 against the real -1.0).
-        let Some(ratio) = ratio else { continue };
-        let scale = |v: Vec3| {
-            if default {
-                v * ratio
-            } else {
-                scale_vec(v, s, head)
-            }
-        };
+        // A part the body type doesn't shape (the HumanoidRootPart) keeps
+        // its file CFrames at unit scales: its RootRigAttachment's
+        // OriginalPosition in the body file is stale (-0.35 against the
+        // real -1.0).
+        if part_kind(&name).is_none() && unit_hwd {
+            continue;
+        }
+        let ratio = proportion_target(&name, s.proportion, s.body_type);
+        let scale = |v: Vec3| scale_vec(v * ratio, s, head);
         if let Some(orig) = orig {
             set(dom, *p, "Size", rv(scale(orig)));
         }
@@ -1576,6 +1629,44 @@ mod hip_tests {
 
     /// Studio's R15 body file: hip height 2.0 as it stands; with Studio's
     /// default Play sizes, Studio's own Play character measures 2.1924.
+    /// A default HumanoidDescription (BodyTypeScale 0.3, ProportionScale 1)
+    /// gives Studio's own Play character's part sizes; BodyTypeScale 0 (the
+    /// user's avatar in checks/avatar-parity) keeps the body file's sizes,
+    /// as Studio's Play character for that avatar measures.
+    #[test]
+    fn body_type_sizes_match_studio() {
+        let Some(path) = studio_character_file(RigType::R15) else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let size = |s: &Scales| {
+            let mut file = Document::decode(&bytes).unwrap();
+            let root = file.root_ref();
+            let m = dom_class_child(&file, root, "Model").unwrap();
+            apply_r15_scales(&mut file, m, s);
+            let mut out = HashMap::new();
+            for p in file.get_by_ref(m).unwrap().children().to_vec() {
+                let i = file.get_by_ref(p).unwrap();
+                if let Some(Variant::Vector3(v)) = i.properties.get(&ustr("Size")) {
+                    out.insert(i.name.clone(), Vec3::new(v.x, v.y, v.z));
+                }
+            }
+            out
+        };
+        let def = size(&Scales::default());
+        for (name, want) in mech::R15_DEFAULT_PART_SIZES {
+            if *name == "Head" {
+                continue; // the file's head is replaced by the dynamic head
+            }
+            let got = def[*name];
+            assert!((got - Vec3::from(*want)).abs().max_element() < 0.0011, "{name}: {got} vs {want:?}");
+        }
+        let classic = size(&Scales { body_type: 0.0, proportion: 0.0, ..Scales::default() });
+        assert!((classic["LeftUpperArm"] - Vec3::new(1.0, 1.1687, 1.0)).abs().max_element() < 1e-3);
+        assert!((classic["LeftHand"] - Vec3::new(1.0, 0.3001, 1.0)).abs().max_element() < 1e-3);
+        assert!((classic["UpperTorso"] - Vec3::new(2.0, 1.6, 1.0)).abs().max_element() < 1e-3);
+    }
+
     #[test]
     fn hip_height_from_the_legs() {
         let Some(path) = studio_character_file(RigType::R15) else {

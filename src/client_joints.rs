@@ -5,6 +5,12 @@
 //! anchored part: Part1 = Part0 · C0 · Transform · C1⁻¹ (and the inverse
 //! when the anchored side is Part1). Parts the server also has are left
 //! alone: server physics and replication own them.
+//!
+//! WeldConstraint and RigidConstraint hold their parts too (one assembly in
+//! Studio): a WeldConstraint keeps the offset its parts had when it is first
+//! seen here, a RigidConstraint Attachment0 · Attachment1⁻¹. Without them a
+//! Laser Tag view model's Trim pieces, welded to its animated Body, stayed in
+//! the rest pose while the Body swung through Reload.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -16,6 +22,12 @@ use crate::math::Xform;
 
 /// Joint classes that hold two parts by C0 / C1.
 const JOINTS: [&str; 7] = ["Motor6D", "Weld", "Motor", "ManualWeld", "Snap", "Glue", "AnimationConstraint"];
+/// Rigid constraints without C0 / C1 (see the module note).
+const RIGID: [&str; 2] = ["WeldConstraint", "RigidConstraint"];
+
+fn joint_class(class: &str) -> bool {
+    JOINTS.contains(&class) || RIGID.contains(&class)
+}
 
 #[derive(Default)]
 pub struct ClientJoints {
@@ -29,12 +41,14 @@ pub struct ClientJoints {
     /// every 60 frames.
     rigs: Vec<Ref>,
     frame: u64,
+    /// WeldConstraint → (Part0, Part1, Part0⁻¹ · Part1 when first seen).
+    welds: HashMap<Ref, (Ref, Ref, Xform)>,
 }
 
 fn is_joint(cd: &Document, r: Ref) -> bool {
     cd.dom
         .get_by_ref(r)
-        .is_some_and(|i| JOINTS.contains(&i.class.as_str()))
+        .is_some_and(|i| joint_class(i.class.as_str()))
 }
 
 fn compose(a: &Xform, b: &Xform) -> Xform {
@@ -91,7 +105,7 @@ impl ClientJoints {
                     Some(ws) => cd
                         .dom
                         .descendants_of(ws)
-                        .filter(|i| JOINTS.contains(&i.class.as_str()))
+                        .filter(|i| joint_class(i.class.as_str()))
                         .map(|i| i.referent())
                         .filter(|r| !c2s.contains_key(r))
                         .collect(),
@@ -99,17 +113,18 @@ impl ClientJoints {
                 };
             }
         }
+        if self.welds.len() > self.joints.len() * 2 + 64 {
+            self.welds.retain(|j, _| cd.dom.get_by_ref(*j).is_some());
+        }
         if self.joints.is_empty() {
             return;
         }
         // (joint, part0, part1, C0 · Transform, C1)
         let mut edges: Vec<(Ref, Ref, Xform, Xform)> = Vec::new();
         let mut by_part: HashMap<Ref, Vec<usize>> = HashMap::new();
-        for &j in &self.joints {
-            if matches!(cd.prop(j, "Enabled"), Some(Variant::Bool(false))) {
-                continue;
-            }
-            let Some((p0, p1, c0, c1)) = crate::rig::joint_frames(cd, j) else {
+        let joints: Vec<Ref> = self.joints.iter().copied().collect();
+        for j in joints {
+            let Some((p0, p1, c0, c1)) = self.frames(cd, j) else {
                 continue;
             };
             let is_part = |r: Ref| {
@@ -178,6 +193,35 @@ impl ClientJoints {
 }
 
 impl ClientJoints {
+    /// A joint's (Part0, Part1, C0, C1), or None when it is off or not
+    /// between two parts.
+    fn frames(&mut self, cd: &Document, j: Ref) -> Option<(Ref, Ref, Xform, Xform)> {
+        let class = cd.class_of(j)?;
+        if !RIGID.contains(&class.as_str()) {
+            if matches!(cd.prop(j, "Enabled"), Some(Variant::Bool(false))) {
+                return None;
+            }
+            return crate::rig::joint_frames(cd, j);
+        }
+        if !crate::physics::joint_enabled(cd, j) {
+            return None;
+        }
+        let (p0, p1) = crate::physics::joint_parts(cd, j)?;
+        let ident = Xform::from_cframe(&rbx_dom_weak::types::CFrame::identity());
+        if class == "RigidConstraint" {
+            let a = |k: &str| part_ref(cd, j, k).and_then(|a| cframe(cd, a, "CFrame")).unwrap_or(ident);
+            return Some((p0, p1, a("Attachment0"), a("Attachment1")));
+        }
+        match self.welds.get(&j) {
+            Some(&(a, b, rel)) if a == p0 && b == p1 => Some((p0, p1, rel, ident)),
+            _ => {
+                let rel = compose(&cframe(cd, p0, "CFrame")?.inverse(), &cframe(cd, p1, "CFrame")?);
+                self.welds.insert(j, (p0, p1, rel));
+                Some((p0, p1, rel, ident))
+            }
+        }
+    }
+
     /// Server-owned rigs as the client sees them: each frame its own
     /// simulation poses them from their Motor6D.Transform (what the
     /// Animator wrote, replicated), outward from the root part the server
@@ -190,7 +234,8 @@ impl ClientJoints {
         self.frame += 1;
         let ident = Xform::from_cframe(&rbx_dom_weak::types::CFrame::identity());
         let mut writes: Vec<(Ref, Xform)> = Vec::new();
-        for &root in &self.rigs {
+        let rigs = self.rigs.clone();
+        for &root in &rigs {
             if !c2s.contains_key(&root) {
                 continue;
             }
@@ -204,15 +249,14 @@ impl ClientJoints {
             }
             let Some(at) = cframe(cd, root, "CFrame") else { continue };
             let mut edges: Vec<(Ref, Ref, Xform, Xform)> = Vec::new();
-            for i in cd.dom.descendants_of(model) {
-                if !JOINTS.contains(&i.class.as_str()) {
-                    continue;
-                }
-                let j = i.referent();
-                if matches!(cd.prop(j, "Enabled"), Some(Variant::Bool(false))) {
-                    continue;
-                }
-                let Some((p0, p1, c0, c1)) = crate::rig::joint_frames(cd, j) else {
+            let found: Vec<Ref> = cd
+                .dom
+                .descendants_of(model)
+                .filter(|i| joint_class(i.class.as_str()))
+                .map(|i| i.referent())
+                .collect();
+            for j in found {
+                let Some((p0, p1, c0, c1)) = self.frames(cd, j) else {
                     continue;
                 };
                 let t = cframe(cd, j, "Transform").unwrap_or(ident);
@@ -288,6 +332,55 @@ mod tests {
 
     fn at(x: f32, y: f32, z: f32) -> CFrame {
         CFrame::new(Vector3::new(x, y, z), Matrix3::identity())
+    }
+
+    /// A Laser Tag view model: anchored Root → Motor6D (animated) → Body,
+    /// with a Trim held to Body by a WeldConstraint and a Sight by a
+    /// RigidConstraint. Both follow Body's animated pose.
+    #[test]
+    fn rigid_constraints_follow_an_animated_part() {
+        let mut d = Document::new_place();
+        let ws = d.find_child(d.dom.root_ref(), "Workspace").unwrap();
+        let model = d.dom.insert(ws, InstanceBuilder::new("Model"));
+        let root = d.dom.insert(
+            model,
+            InstanceBuilder::new("Part").with_property("Anchored", true).with_property("CFrame", at(0.0, 10.0, 0.0)),
+        );
+        let body = d.dom.insert(model, InstanceBuilder::new("Part").with_property("CFrame", at(0.0, 10.0, -1.0)));
+        let trim = d.dom.insert(model, InstanceBuilder::new("Part").with_property("CFrame", at(0.0, 11.0, -1.0)));
+        let sight = d.dom.insert(model, InstanceBuilder::new("Part").with_property("CFrame", at(0.0, 0.0, 0.0)));
+        // Transform: 90° about X, so Body's +Y (where Trim sits) turns to +Z.
+        let quarter = CFrame::new(
+            Vector3::new(0.0, 0.0, 0.0),
+            Matrix3 { x: Vector3::new(1.0, 0.0, 0.0), y: Vector3::new(0.0, 0.0, -1.0), z: Vector3::new(0.0, 1.0, 0.0) },
+        );
+        d.dom.insert(
+            body,
+            InstanceBuilder::new("Motor6D")
+                .with_property("Part0", root)
+                .with_property("Part1", body)
+                .with_property("C0", at(0.0, 0.0, -1.0))
+                .with_property("C1", at(0.0, 0.0, 0.0))
+                .with_property("Transform", quarter),
+        );
+        d.dom.insert(
+            trim,
+            InstanceBuilder::new("WeldConstraint").with_property("Part0", body).with_property("Part1", trim),
+        );
+        let a0 = d.dom.insert(body, InstanceBuilder::new("Attachment").with_property("CFrame", at(0.0, 2.0, 0.0)));
+        let a1 = d.dom.insert(sight, InstanceBuilder::new("Attachment").with_property("CFrame", at(0.0, 0.0, 0.0)));
+        d.dom.insert(
+            sight,
+            InstanceBuilder::new("RigidConstraint").with_property("Attachment0", a0).with_property("Attachment1", a1),
+        );
+        d.mark_all();
+        let mut cj = ClientJoints::default();
+        cj.solve(&mut d, &HashMap::new());
+        let pos = |p| cframe(&d, p, "CFrame").unwrap().pos;
+        assert!((pos(body) - Vec3::new(0.0, 10.0, -1.0)).length() < 1e-4, "{:?}", pos(body));
+        // Body's local +Y is world +Z after the quarter turn.
+        assert!((pos(trim) - Vec3::new(0.0, 10.0, 0.0)).length() < 1e-4, "{:?}", pos(trim));
+        assert!((pos(sight) - Vec3::new(0.0, 10.0, 1.0)).length() < 1e-4, "{:?}", pos(sight));
     }
 
     /// An anchored root moved by script carries a client-made limb with it.

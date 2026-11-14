@@ -73,6 +73,11 @@ impl Editor {
             self.snap_move = grid.is_some();
             self.move_inc = grid.unwrap_or(1.0);
             self.join_surfaces = false;
+            // (Measured with these off: see part_drag::studio_cases.)
+            self.align_dragged = false;
+            self.part_snap = false;
+            self.use_bounding_boxes = false;
+            self.physical_drag = false;
             let (refs, select) = self.drag_parity_place(name);
             self.scene = crate::scene::Scene::default();
             self.select(select);
@@ -155,6 +160,135 @@ impl Editor {
         if self.doc.dom.get_by_ref(probe).unwrap().children().iter().any(|c| self.doc.class_of(*c).is_some_and(|k| k == "Weld")) {
             bad.push("join: undo kept the weld".into());
         }
-        (CASES.len() + 1, bad)
+        let n = self.regression_dragger_modes(&mut bad);
+        (CASES.len() + 1 + n, bad)
+    }
+
+    /// A mode_cases scene as a place; the Probe is returned selected.
+    fn dragger_mode_place(&mut self, name: &str, anchored: bool) -> Vec<(&'static str, Ref)> {
+        self.doc = crate::doc::Document::new_place();
+        let ws = self.doc.workspace().unwrap();
+        let old: Vec<Ref> = self.doc.dom.get_by_ref(ws).unwrap().children().to_vec();
+        for c in old {
+            if self.doc.class_of(c).is_some_and(|k| crate::doc::is_a(&k, "BasePart") && k != "Terrain") {
+                self.doc.dom.destroy(c);
+            }
+        }
+        let mut refs = Vec::new();
+        for (n, s) in crate::part_drag::mode_cases::scene(name) {
+            let shape = if s.kind == MeshKind::Wedge { 3 } else { 1 };
+            let r = self.doc.dom.insert(ws, crate::doc::new_part(n, shape, s.xf.pos, s.size, [163, 162, 165]));
+            self.doc.set_prop_live(r, ustr("CFrame"), Variant::CFrame(s.xf.to_cframe()));
+            self.doc.set_prop_live(r, ustr("Anchored"), Variant::Bool(n != "Probe" || anchored));
+            if n == "Baseplate" {
+                self.doc.set_prop_live(r, ustr("Locked"), Variant::Bool(true));
+            }
+            refs.push((n, r));
+        }
+        self.scene = crate::scene::Scene::default();
+        self.scene.sync(&mut self.doc);
+        self.doc.clear_history();
+        refs
+    }
+
+    /// Drags the Probe from `a` to `b` on the 1506x842 mode_cases view;
+    /// returns its CFrame after.
+    fn dragger_mode_drag(&mut self, refs: &[(&'static str, Ref)], a: Pos2, b: Pos2) -> Option<Xform> {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(crate::part_drag::mode_cases::W, crate::part_drag::mode_cases::H));
+        self.cam = crate::part_drag::mode_cases::camera();
+        // Studio's measured mouse rays, as pixels of this view.
+        let px = |p: Pos2| -> Pos2 {
+            crate::part_drag::mode_cases::studio_ray(p.x, p.y)
+                .and_then(|d| self.cam.project(rect, self.cam.pos + d * 10.0))
+                .unwrap_or(p)
+        };
+        let (a, b) = (px(a), px(b));
+        self.tool = Tool::Select;
+        let probe = refs.iter().find(|(n, _)| *n == "Probe")?.1;
+        self.select(vec![probe]);
+        if !self.start_part_drag(rect, a, false) {
+            return None;
+        }
+        for k in 1..=20 {
+            self.update_part_drag(rect, a + (b - a) * (k as f32 / 20.0));
+            self.scene.sync(&mut self.doc);
+        }
+        self.finish_part_drag();
+        match self.doc.prop(probe, "CFrame") {
+            Some(Variant::CFrame(cf)) => Some(Xform::from_cframe(&cf)),
+            _ => None,
+        }
+    }
+
+    /// The dragger settings menu and Align Dragged Objects against the
+    /// drags measured in Studio (part_drag::mode_cases; Physical mode with
+    /// Studio's IK results, which lag the camera-plane target by ~2 %).
+    fn regression_dragger_modes(&mut self, bad: &mut Vec<String>) -> usize {
+        let mut n = 0;
+        self.physical_drag = false;
+        self.join_surfaces = false;
+        for (name, press, release, grid, align, bbox, snap, want) in crate::part_drag::mode_cases::CASES {
+            n += 1;
+            self.snap_move = grid.is_some();
+            self.move_inc = grid.unwrap_or(1.0);
+            self.align_dragged = *align;
+            self.use_bounding_boxes = *bbox;
+            self.part_snap = *snap;
+            // Collisions don't change a geometric free drag (target_overlap).
+            self.collisions = *name == "target_overlap";
+            let refs = self.dragger_mode_place(name, true);
+            let Some(xf) = self.dragger_mode_drag(&refs, Pos2::new(press.0, press.1), Pos2::new(release.0, release.1)) else {
+                bad.push(format!("modes/{name}: no drag"));
+                continue;
+            };
+            let pos_err = (xf.pos - Vec3::new(want[0], want[1], want[2])).abs().max_element();
+            let mut rot_err = 0.0f32;
+            for i in 0..3 {
+                for j in 0..3 {
+                    rot_err = rot_err.max((xf.rot.col(j)[i] - want[3 + i * 3 + j]).abs());
+                }
+            }
+            if pos_err > 0.002 || rot_err > 2e-5 {
+                bad.push(format!("modes/{name}: got {:?} pos err {pos_err} rot err {rot_err}", xf.pos));
+            }
+        }
+        // Physical: (scene, anchored, collisions, release, Studio's result, tolerance).
+        self.snap_move = false;
+        self.part_snap = true;
+        self.align_dragged = true;
+        self.use_bounding_boxes = false;
+        self.physical_drag = true;
+        let phys: [(&str, bool, bool, (f32, f32), [f32; 3], f32); 4] = [
+            // Lifted off the ground in the camera plane (Studio IK: −2.104, 5.697, −2.957).
+            ("plain", false, false, (700.0, 380.0), [-2.1445, 5.7915, -3.0332], 0.12),
+            // Anchored: Studio's physical dragger doesn't move it.
+            ("plain", true, false, (700.0, 380.0), [0.0, 2.0, 0.0], 1e-4),
+            // Through the wall without Collisions (Studio: 7.809, 2, 0).
+            ("wall", false, false, (951.0, 500.0), [8.01, 2.0, 0.0], 0.25),
+            // Stopped by it with Collisions (Studio: 3.024, 1.990, 0.990).
+            ("wall", false, true, (951.0, 500.0), [3.0, 2.0, 0.0], 0.05),
+        ];
+        for (scene, anchored, collisions, release, want, tol) in phys {
+            n += 1;
+            self.collisions = collisions;
+            let refs = self.dragger_mode_place(scene, anchored);
+            let got = self.dragger_mode_drag(&refs, Pos2::new(753.0, 500.0), Pos2::new(release.0, release.1));
+            let label = format!("physical/{scene}{}{}", if anchored { "/anchored" } else { "" }, if collisions { "/collisions" } else { "" });
+            match got {
+                Some(xf) => {
+                    let err = (xf.pos - Vec3::from(want)).abs().max_element();
+                    if err > tol {
+                        bad.push(format!("{label}: got {:?}, want {want:?} ±{tol}", xf.pos));
+                    }
+                }
+                None => bad.push(format!("{label}: no drag")),
+            }
+        }
+        // Back to the defaults.
+        self.physical_drag = false;
+        self.collisions = false;
+        self.align_dragged = crate::mech::ALIGN_DRAGGED_BY_DEFAULT;
+        self.part_snap = crate::mech::PART_SNAP_ON_BY_DEFAULT;
+        n
     }
 }

@@ -586,6 +586,9 @@ impl Document {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        if kind == DocKind::Place {
+            crate::assets::note_opened_place(path);
+        }
         let mut doc = Self::from_dom(dom, kind, Some(path.to_path_buf()), title);
         doc.ensure_services();
         Ok(doc)
@@ -800,6 +803,9 @@ impl Document {
     pub fn prop_key(&self, r: Ref, key: rbx_dom_weak::Ustr) -> Option<Variant> {
         let name = key.as_str();
         let inst = self.dom.get_by_ref(r)?;
+        if inst.class == "ScreenGui" && matches!(name, "IgnoreGuiInset" | "ScreenInsets") {
+            return Some(screen_insets_read(inst, name));
+        }
         if let Some(v) = inst.properties.get(&key) {
             return Some(v.clone());
         }
@@ -1025,6 +1031,15 @@ impl Document {
         merge_key: Option<String>,
     ) {
         let mut changes = Vec::new();
+        let mut edits = edits;
+        let twins: Vec<_> = edits
+            .iter()
+            .filter_map(|(r, name, value)| {
+                let class = self.dom.get_by_ref(*r)?.class;
+                screen_insets_twin(class.as_str(), name.as_str(), value).map(|(n, v)| (*r, ustr(n), v))
+            })
+            .collect();
+        edits.extend(twins);
         for (r, name, value) in edits {
             let Some(inst) = self.dom.get_by_ref_mut(r) else {
                 continue;
@@ -1408,6 +1423,33 @@ impl Document {
 mod tests {
     use super::*;
 
+    /// ScreenGui.IgnoreGuiInset is ScreenInsets ≠ CoreUISafeInsets, both ways
+    /// (measured in Studio 0.744 on Laser Tag's GameplayGui / ReticleGui).
+    #[test]
+    fn screen_gui_inset_is_screen_insets() {
+        use rbx_dom_weak::types::Enum;
+        let mut d = Document::new_place();
+        let sg = d.find_child(d.dom.root_ref(), "StarterGui").unwrap();
+        let fresh = d.insert(sg, InstanceBuilder::new("ScreenGui"));
+        assert_eq!(d.prop(fresh, "ScreenInsets"), Some(Variant::Enum(Enum::from_u32(2))));
+        assert_eq!(d.prop(fresh, "IgnoreGuiInset"), Some(Variant::Bool(false)));
+        for (si, ignore) in [(0, true), (1, true), (2, false), (3, true)] {
+            let g = d.insert(
+                sg,
+                InstanceBuilder::new("ScreenGui")
+                    .with_property("ScreenInsets", Enum::from_u32(si))
+                    .with_property("IgnoreGuiInset", !ignore),
+            );
+            assert_eq!(d.prop(g, "IgnoreGuiInset"), Some(Variant::Bool(ignore)), "ScreenInsets {si}");
+        }
+        let legacy = d.insert(sg, InstanceBuilder::new("ScreenGui").with_property("IgnoreGuiInset", true));
+        assert_eq!(d.prop(legacy, "ScreenInsets"), Some(Variant::Enum(Enum::from_u32(1))));
+        d.set_props("t", vec![(legacy, ustr("IgnoreGuiInset"), Variant::Bool(false))], None);
+        assert_eq!(d.prop(legacy, "ScreenInsets"), Some(Variant::Enum(Enum::from_u32(2))));
+        d.set_props("t", vec![(legacy, ustr("ScreenInsets"), Variant::Enum(Enum::from_u32(0)))], None);
+        assert_eq!(d.prop(legacy, "IgnoreGuiInset"), Some(Variant::Bool(true)));
+    }
+
     #[test]
     fn undo_redo_insert_delete() {
         let mut d = Document::new_place();
@@ -1437,6 +1479,43 @@ mod tests {
     }
 }
 
+/// ScreenGui.IgnoreGuiInset is ScreenInsets seen as a bool in Studio 0.744
+/// (Studio, Laser Tag template): IgnoreGuiInset = ScreenInsets ≠
+/// CoreUISafeInsets (2); a new ScreenGui is CoreUISafeInsets. Files save
+/// ScreenInsets (older ones only IgnoreGuiInset), so a saved ScreenInsets wins.
+fn screen_insets_read(inst: &rbx_dom_weak::Instance, name: &str) -> Variant {
+    use rbx_dom_weak::types::Enum;
+    let si = match inst.properties.get(&ustr("ScreenInsets")) {
+        Some(Variant::Enum(e)) => e.to_u32(),
+        _ => match inst.properties.get(&ustr("IgnoreGuiInset")) {
+            Some(Variant::Bool(true)) => 1,
+            _ => 2,
+        },
+    };
+    if name == "IgnoreGuiInset" {
+        Variant::Bool(si != 2)
+    } else {
+        Variant::Enum(Enum::from_u32(si))
+    }
+}
+
+/// The other half of a ScreenGui inset write: IgnoreGuiInset true/false sets
+/// ScreenInsets DeviceSafeInsets / CoreUISafeInsets, and ScreenInsets sets
+/// IgnoreGuiInset (measured in Studio: assignments either way stay in step).
+pub fn screen_insets_twin(class: &str, name: &str, value: &Variant) -> Option<(&'static str, Variant)> {
+    use rbx_dom_weak::types::Enum;
+    if class != "ScreenGui" {
+        return None;
+    }
+    match (name, value) {
+        ("IgnoreGuiInset", Variant::Bool(b)) => {
+            Some(("ScreenInsets", Variant::Enum(Enum::from_u32(if *b { 1 } else { 2 }))))
+        }
+        ("ScreenInsets", Variant::Enum(e)) => Some(("IgnoreGuiInset", Variant::Bool(e.to_u32() != 2))),
+        _ => None,
+    }
+}
+
 /// The Content twin newer files keep a legacy asset-id property in
 /// (MeshId → MeshContent …). Roblox treats the pair as one property: setting
 /// either changes both.
@@ -1453,6 +1532,9 @@ pub fn content_twin(name: &str) -> Option<&'static str> {
         "MetalnessMap" => "MetalnessMapContent",
         "RoughnessMap" => "RoughnessMapContent",
         "SoundId" => "AudioContent",
+        // AudioPlayer (the only class with Asset): files keep AudioContent,
+        // scripts read Asset ("rbxassetid://…" in Studio, not "").
+        "Asset" => "AudioContent",
         "AnimationId" => "AnimationContent",
         // Sky (2026-11-05: Place B saves only these; rustudio
         // drew the default sky instead of its own).
@@ -1471,9 +1553,9 @@ pub fn content_twin(name: &str) -> Option<&'static str> {
 /// The legacy names whose Content twin is `twin` (TextureContent → Texture,
 /// TextureID, TextureId).
 pub fn content_legacy_names(twin: &str) -> Vec<&'static str> {
-    const LEGACY: [&str; 22] = [
+    const LEGACY: [&str; 23] = [
         "MeshId", "TextureID", "TextureId", "Texture", "ShirtTemplate", "PantsTemplate", "Graphic",
-        "Image", "ColorMap", "NormalMap", "MetalnessMap", "RoughnessMap", "SoundId", "AnimationId",
+        "Image", "ColorMap", "NormalMap", "MetalnessMap", "RoughnessMap", "SoundId", "Asset", "AnimationId",
         "SkyboxBk", "SkyboxDn", "SkyboxFt", "SkyboxLf", "SkyboxRt", "SkyboxUp", "SunTextureId",
         "MoonTextureId",
     ];

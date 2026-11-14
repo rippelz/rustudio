@@ -251,7 +251,24 @@ impl World {
             // Legacy Scripts also run in a player's Backpack and PlayerGui
             // (tools; StarterGui's server Scripts, as in Studio).
             (Side::Server, "Script") => {
-                ctx != 2
+                // RunContext Server: wherever it is (Studio's own
+                // StarterPlayer.PlayerModule.InputSetup runs in StarterPlayer),
+                // but not in ServerStorage or as a template the engine
+                // copies to players.
+                let server_anywhere = ctx == 1 && !under("ServerStorage") && {
+                    let mut p = i.parent();
+                    let mut template = false;
+                    while let Some(a) = d.dom.get_by_ref(p) {
+                        if matches!(a.class.as_str(), "StarterPlayerScripts" | "StarterCharacterScripts" | "StarterGui" | "StarterPack") {
+                            template = true;
+                            break;
+                        }
+                        p = a.parent();
+                    }
+                    !template
+                };
+                server_anywhere
+                    || ctx != 2
                     && (under("Workspace")
                         || under("ServerScriptService")
                         || d.find_child(root, "Players").is_some_and(|ps| {
@@ -886,6 +903,11 @@ const LUA_METHODS: &[(&str, &str)] = &[
 /// Property lookup through the class chain; aliases resolve to their
 /// canonical property. Returns (canonical name, type, read-only).
 fn prop_desc(class: &str, name: &str) -> Option<(&'static str, DataType<'static>, bool)> {
+    // Sound.Pitch is a deprecated alias of PlaybackSpeed in Roblox, but the
+    // reflection database lists it as its own property (RbxCharacterSounds sets it).
+    if name == "Pitch" && class == "Sound" {
+        return prop_desc(class, "PlaybackSpeed");
+    }
     let db = doc::db();
     let c = db.classes.get(class)?;
     for cls in db.superclasses_iter(c) {
@@ -2011,7 +2033,11 @@ fn prop_get_plain(
             let (stored, v) = {
                 let w = world(lua)?;
                 let d = w.d();
-                match d.dom.get_by_ref(r).and_then(|i| i.properties.get(&p.canon)) {
+                // (ScreenGui's IgnoreGuiInset / ScreenInsets are one value: doc.rs)
+                let derived = |i: &rbx_dom_weak::Instance| {
+                    i.class == "ScreenGui" && matches!(p.canon.as_str(), "IgnoreGuiInset" | "ScreenInsets")
+                };
+                match d.dom.get_by_ref(r).filter(|i| !derived(i)).and_then(|i| i.properties.get(&p.canon)) {
                     Some(v) => (true, Some(v.clone())),
                     None => (false, d.prop_key(r, p.canon)),
                 }
@@ -2286,6 +2312,9 @@ fn store_prop_key(lua: &Lua, r: Ref, key: rbx_dom_weak::Ustr, v: Variant) -> mlu
             return Err(rt_err("the Instance no longer exists"));
         };
         let old = inst.properties.insert(key, v.clone());
+        if let Some((twin, tv)) = doc::screen_insets_twin(inst.class.as_str(), name, &v) {
+            inst.properties.insert(ustr(twin), tv);
+        }
         // A legacy asset id and its Content twin are one property in Roblox
         // (Texture / TextureContent …): keep the twin in step, or readers that
         // take the twin first see a stale value or the class default (every
@@ -2437,6 +2466,9 @@ fn newindex_routed(
         "Enabled" if matches!(class, "Script" | "LocalScript") => {
             let on = !matches!(value, Value::Nil | Value::Boolean(false));
             store_prop(lua, r, "Disabled", Variant::Bool(!on))?;
+            if !on {
+                stop_script(lua, r);
+            }
             {
                 let mut w = world(lua)?;
                 if let Some(i) = w.dm().dom.get_by_ref_mut(r) {
@@ -2482,6 +2514,38 @@ fn newindex_routed(
                         pos: v,
                         rot: local.rot,
                     },
+                    // Axis / SecondaryAxis turn the attachment (Studio 0.747,
+                    // checks/humanoid-physics/measure/attachment-axis.md):
+                    // Axis becomes the X axis, the old secondary axis is
+                    // made perpendicular to it (the old Z axis kept when
+                    // they are parallel); SecondaryAxis keeps X and takes
+                    // its part perpendicular to X (ignored when parallel);
+                    // Z = X × Y. A zero vector changes nothing. They were
+                    // read as an Orientation here, so a PrismaticConstraint
+                    // a script aimed with Axis = (0, 1, 0) slid along X.
+                    "Axis" | "WorldAxis" | "SecondaryAxis" | "WorldSecondaryAxis" => {
+                        let world_key = key.starts_with("World");
+                        let v = if world_key { part.rot.transpose() * v } else { v };
+                        let (x0, y0, z0) = (local.rot.x_axis, local.rot.y_axis, local.rot.z_axis);
+                        let rot = if v.length_squared() < 1e-12 {
+                            local.rot
+                        } else if key.ends_with("SecondaryAxis") {
+                            let y = v - x0 * v.dot(x0);
+                            if y.length_squared() < 1e-10 {
+                                local.rot
+                            } else {
+                                let y = y.normalize();
+                                glam::Mat3::from_cols(x0, y, x0.cross(y))
+                            }
+                        } else {
+                            let x = v.normalize();
+                            let y = y0 - x * y0.dot(x);
+                            let y = if y.length_squared() < 1e-10 { z0.cross(x) } else { y };
+                            let y = y.normalize();
+                            glam::Mat3::from_cols(x, y, x.cross(y))
+                        };
+                        Xform { pos: local.pos, rot }
+                    }
                     _ => Xform::from_orientation_deg(local.pos, v),
                 }
             }
@@ -2593,11 +2657,86 @@ fn newindex_routed(
     let enabling = canon == "Disabled"
         && matches!(v, Variant::Bool(false))
         && matches!(class, "Script" | "LocalScript");
+    let disabling = canon == "Disabled"
+        && matches!(v, Variant::Bool(true))
+        && matches!(class, "Script" | "LocalScript");
     store_prop_key(lua, r, info.canon, v)?;
     if enabling {
         start_if_enabled(lua, r)?;
     }
+    if disabling {
+        stop_script(lua, r);
+    }
     Ok(())
+}
+
+/// The script a function was written in: its environment's `script`.
+fn script_of_function(f: &Function) -> Option<Ref> {
+    f.environment().and_then(|e| e.raw_get::<Value>("script").ok()).as_ref().and_then(opt_inst)
+}
+
+/// The script a suspended thread is running: the first Lua frame's.
+fn script_of_thread(lua: &Lua, th: &Thread) -> Option<Ref> {
+    let info = lua.globals().get::<Table>("debug").and_then(|d| d.get::<Function>("info")).ok()?;
+    for level in 0..8 {
+        match info.call::<Option<Function>>((th.clone(), level, "f")) {
+            Ok(Some(f)) => {
+                if let Some(r) = script_of_function(&f) {
+                    return Some(r);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+    }
+    None
+}
+
+/// A running Script / LocalScript is disabled: it ends, as in Roblox. Its
+/// connections are disconnected and its threads (waiting on a signal, in
+/// task.wait / task.delay / task.defer) never resume. Enabled again it runs
+/// from the top. (A character's Animate script disabled by a game stops
+/// playing its walk and run tracks: measured in Studio 0.747, the default
+/// rig then stands in its joints' own pose while it moves.)
+fn stop_script(lua: &Lua, r: Ref) {
+    let was_running = world(lua).is_ok_and(|mut w| w.started.remove(&r));
+    if !was_running {
+        return;
+    }
+    // (lists taken out while Lua's debug.info runs)
+    let (mut conns, mut waiters) = match lua.app_data_mut::<Signals>() {
+        Some(mut s) => (std::mem::take(&mut s.conns), std::mem::take(&mut s.waiters)),
+        None => return,
+    };
+    for list in conns.values_mut() {
+        list.retain(|c| script_of_function(&c.func) != Some(r));
+    }
+    for list in waiters.values_mut() {
+        list.retain(|(_, th)| script_of_thread(lua, th) != Some(r));
+    }
+    if let Some(mut s) = lua.app_data_mut::<Signals>() {
+        // (what connected while the lists were out stays)
+        for (k, mut v) in std::mem::take(&mut s.conns) {
+            conns.entry(k).or_default().append(&mut v);
+        }
+        for (k, mut v) in std::mem::take(&mut s.waiters) {
+            waiters.entry(k).or_default().append(&mut v);
+        }
+        s.conns = conns;
+        s.waiters = waiters;
+    }
+    let (mut timers, mut deferred) = match lua.app_data_mut::<Sched>() {
+        Some(mut s) => (std::mem::take(&mut s.timers), std::mem::take(&mut s.deferred)),
+        None => return,
+    };
+    timers.retain(|t| script_of_thread(lua, &t.thread) != Some(r));
+    deferred.retain(|(th, _)| script_of_thread(lua, th) != Some(r));
+    if let Some(mut s) = lua.app_data_mut::<Sched>() {
+        timers.append(&mut s.timers);
+        deferred.append(&mut s.deferred);
+        s.timers = timers;
+        s.deferred = deferred;
+    }
 }
 
 /// Whether a script is enabled: not Disabled (and no saved Enabled false).
@@ -2969,6 +3108,23 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
         w.record(RepOp::Destroy(r));
     }
     set_parent(lua, r, Ref::none())?;
+    // Destroy goes on to every descendant (Roblox: "calls Destroy on all
+    // children"), so each fires its own Destroying too: a tool's cleanup
+    // bound to it (LaserTag's bindToInstanceDestroyed) runs when the
+    // character holding it is destroyed. Only where someone listens.
+    {
+        let mut w = world(lua)?;
+        let heard: Vec<Ref> = w
+            .d()
+            .dom
+            .descendants_of(r)
+            .map(|i| i.referent())
+            .filter(|d| *d != r && w.listening.contains(d))
+            .collect();
+        for d in heard {
+            w.fire(d, "Destroying", vec![]);
+        }
+    }
     let order = detach_descendants(lua, r)?;
     // Connections go only when something in the subtree has any (a walk of
     // every connection in the DataModel otherwise: 125 us per Destroy in
@@ -3973,7 +4129,10 @@ impl Runtime {
             interrupt_watchdog::disarm(callbacks);
             if let Some(b) = lua.app_data_ref::<Budget>() {
                 if let Some(s) = b.start {
-                    if s.elapsed() > Duration::from_secs_f32(mech::SCRIPT_TIMEOUT_S) {
+                    // Studio Settings > Debugger > Script Timeout Length
+                    // (0 or less: no limit).
+                    let limit = crate::studio_settings::studio("ScriptTimeoutLength", mech::SCRIPT_TIMEOUT_S as f64);
+                    if limit > 0.0 && s.elapsed() > Duration::from_secs_f64(limit.min(1e9)) {
                         // Name the script and line that ran too long.
                         let at = (0..32)
                             .map_while(|level| {
@@ -4661,7 +4820,13 @@ impl Runtime {
         // RUSTUDIO_CPU_CLOCK=1 (benchmarks only): the calling thread's CPU
         // time instead, so per-call costs can be timed on a loaded machine.
         let cpu_clock = std::env::var_os("RUSTUDIO_CPU_CLOCK").is_some();
+        // RUSTUDIO_GAME_CLOCK=1 (tests only, with RUSTUDIO_FIXED_DT): the
+        // game's time, so wall-clock probes are deterministic on a loaded machine.
+        let game_clock = std::env::var_os("RUSTUDIO_GAME_CLOCK").is_some();
         let clock = lua.create_function(move |lua, ()| {
+            if game_clock {
+                return Ok(world(lua).map(|w| w.time).unwrap_or(0.0) + 1000.0);
+            }
             // (Unix only; elsewhere the wall clock below.)
             #[cfg(unix)]
             if cpu_clock {
@@ -4752,6 +4917,25 @@ impl Runtime {
             w.fire(r, name, args);
             if let Some((h, dt)) = hook {
                 w.queue_hook(r, name, h, dt.unwrap_or(Value::Nil));
+            }
+        }
+    }
+
+    /// Fires a RunService event without its native frame step: Studio runs
+    /// stepHumanoid between PreAnimation and the Animator (gameStep
+    /// Studio), so Play queues the Animator itself (`queue_frame_hook`).
+    pub fn fire_bare(&self, r: Ref, name: &str, args: Vec<Value>) {
+        if let Some(mut w) = self.lua.app_data_mut::<World>() {
+            w.fire(r, name, args);
+        }
+    }
+
+    /// Queues the native frame step that follows `after` (the Animator after
+    /// PreAnimation) at this point of the event queue.
+    pub fn queue_frame_hook(&self, r: Ref, after: &str, dt: f64) {
+        if let Some(mut w) = self.lua.app_data_mut::<World>() {
+            if let Some(h) = domains::anim::hook_after(w.side, after) {
+                w.queue_hook(r, after, h, Value::Number(dt));
             }
         }
     }

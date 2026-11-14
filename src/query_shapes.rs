@@ -261,10 +261,25 @@ pub fn sweep_part(
     size: Vec3,
     kind: u8,
 ) -> Option<(f32, Vec3, Vec3)> {
+    // Boxes exactly: parry's GJK cast drifts on big parts (a 0.4 sphere met
+    // Laser Tag's 121×5×381 FLOOR up to 0.29 studs early at a grazing angle,
+    // where Studio is exact).
+    if kind == BOX && probe_kind == BALL {
+        return sphere_box(probe.pos, probe_size.min_element() * 0.5, dir, len, part, size);
+    }
+    let toi = if kind == BOX && probe_kind == BOX {
+        Some(box_box_toi(probe, probe_size, dir, len, part, size)?)
+    } else {
+        None
+    };
     let (st, ot) = parry_shape(kind, size);
     let (sp, op) = parry_shape(probe_kind, probe_size);
+    // With the exact time known, parry only finds the touching point, cast
+    // from just short of it.
+    let back = toi.map_or(0.0, |(t, _)| (t - 0.05).max(0.0));
+    let start = Xform { pos: probe.pos + dir * back, rot: probe.rot };
     let opts = parry::query::ShapeCastOptions {
-        max_time_of_impact: len,
+        max_time_of_impact: if toi.is_some() { (len - back).min(1.0) } else { len },
         target_distance: 0.0,
         stop_at_penetration: true,
         compute_impact_geometry_on_penetration: false,
@@ -273,19 +288,188 @@ pub fn sweep_part(
         &parry_pose(part, ot),
         rp::Vector::ZERO,
         &*st,
-        &parry_pose(probe, op),
+        &parry_pose(&start, op),
         rv(dir),
         &*sp,
         opts,
     )
-    .ok()??;
-    if hit.time_of_impact <= 1e-5 {
+    .ok()
+    .flatten();
+    let rot = part.rot * ot;
+    match (toi, hit) {
+        (Some((t, n)), Some(hit)) => Some((t, part.pos + rot * gv(hit.witness1), n)),
+        (Some((t, n)), None) => Some((t, probe.pos + dir * t, n)),
+        (None, Some(hit)) if hit.time_of_impact > 1e-5 => {
+            let point = part.pos + rot * gv(hit.witness1);
+            let n = (rot * gv(hit.normal1)).normalize_or_zero();
+            Some((hit.time_of_impact, point, n))
+        }
+        _ => None,
+    }
+}
+
+/// A sphere (centre `c`, radius `r`) swept along unit `dir` for `len`
+/// against a box: (distance, the touching point on the box, its normal).
+/// The distance from the centre to the box is convex along the path, so the
+/// first contact is a root left of its minimum. None when the sphere starts
+/// touching the box (Roblox skips parts a cast starts in).
+fn sphere_box(c: Vec3, r: f32, dir: Vec3, len: f32, part: &Xform, size: Vec3) -> Option<(f32, Vec3, Vec3)> {
+    use glam::DVec3;
+    let inv = part.rot.transpose();
+    let o = (inv * (c - part.pos)).as_dvec3();
+    let d = (inv * dir).as_dvec3();
+    let h = (size * 0.5).as_dvec3();
+    let r = r as f64;
+    let gap = |t: f64| {
+        let p = o + d * t;
+        (p - p.clamp(-h, h)).length() - r
+    };
+    if gap(0.0) <= 0.0 {
         return None;
     }
-    let rot = part.rot * ot;
-    let point = part.pos + rot * gv(hit.witness1);
-    let n = (rot * gv(hit.normal1)).normalize_or_zero();
-    Some((hit.time_of_impact, point, n))
+    // Where the path crosses the box grown by r (the rounded box lies inside).
+    let (mut a, mut b) = (0.0f64, len as f64);
+    for k in 0..3 {
+        let g = h[k] + r;
+        if d[k].abs() < 1e-12 {
+            if o[k].abs() > g {
+                return None;
+            }
+        } else {
+            let (t1, t2) = ((-g - o[k]) / d[k], (g - o[k]) / d[k]);
+            a = a.max(t1.min(t2));
+            b = b.min(t1.max(t2));
+        }
+    }
+    if a > b {
+        return None;
+    }
+    // The nearest approach in [a, b] (golden section), then the first root.
+    let (mut lo, mut hi) = (a, b);
+    let k = 0.5 * (5f64.sqrt() - 1.0);
+    for _ in 0..90 {
+        let (m1, m2) = (hi - k * (hi - lo), lo + k * (hi - lo));
+        if gap(m1) < gap(m2) {
+            hi = m2;
+        } else {
+            lo = m1;
+        }
+    }
+    let tm = 0.5 * (lo + hi);
+    if gap(tm) > 1e-9 {
+        return None;
+    }
+    let (mut lo, mut hi) = (a, tm);
+    for _ in 0..80 {
+        let m = 0.5 * (lo + hi);
+        if gap(m) > 0.0 {
+            lo = m;
+        } else {
+            hi = m;
+        }
+    }
+    let t = hi;
+    let p = o + d * t;
+    let q = p.clamp(-h, h);
+    let mut n = p - q;
+    if n.length() < 1e-9 {
+        let a = (p / h).abs();
+        n = if a.x >= a.y && a.x >= a.z {
+            DVec3::X * p.x.signum()
+        } else if a.y >= a.z {
+            DVec3::Y * p.y.signum()
+        } else {
+            DVec3::Z * p.z.signum()
+        };
+    }
+    let n = (part.rot * n.normalize().as_vec3()).normalize_or_zero();
+    Some((t as f32, part.pos + part.rot * q.as_vec3(), n))
+}
+
+/// A box (`probe`, `probe_size`) moving along unit `dir` for `len` against
+/// a box: the time of first contact and the part's face normal there, by the
+/// moving separating-axis test (the 15 axes of two boxes). None when it
+/// misses or starts overlapping.
+fn box_box_toi(probe: &Xform, probe_size: Vec3, dir: Vec3, len: f32, part: &Xform, size: Vec3) -> Option<(f32, Vec3)> {
+    use glam::DVec3;
+    let ax: [DVec3; 3] = [probe.rot.x_axis, probe.rot.y_axis, probe.rot.z_axis].map(|v| v.as_dvec3());
+    let bx: [DVec3; 3] = [part.rot.x_axis, part.rot.y_axis, part.rot.z_axis].map(|v| v.as_dvec3());
+    let (ha, hb) = ((probe_size * 0.5).as_dvec3(), (size * 0.5).as_dvec3());
+    let c0 = (part.pos - probe.pos).as_dvec3();
+    let v = dir.as_dvec3();
+    let mut axes: Vec<DVec3> = ax.iter().chain(bx.iter()).copied().collect();
+    for a in &ax {
+        for b in &bx {
+            let c = a.cross(*b);
+            if c.length() > 1e-6 {
+                axes.push(c.normalize());
+            }
+        }
+    }
+    let (mut enter, mut exit) = (f64::NEG_INFINITY, f64::INFINITY);
+    let mut normal = DVec3::ZERO;
+    for l in axes {
+        let ra: f64 = (0..3).map(|i| ha[i] * ax[i].dot(l).abs()).sum();
+        let rb: f64 = (0..3).map(|i| hb[i] * bx[i].dot(l).abs()).sum();
+        let rr = ra + rb;
+        let (cl, vl) = (c0.dot(l), v.dot(l));
+        if vl.abs() < 1e-12 {
+            if cl.abs() > rr {
+                return None;
+            }
+            continue;
+        }
+        let (t1, t2) = ((cl - rr) / vl, (cl + rr) / vl);
+        let (t1, t2) = (t1.min(t2), t1.max(t2));
+        if t1 > enter {
+            enter = t1;
+            // From the part towards the probe at contact.
+            normal = if (c0 - v * t1).dot(l) > 0.0 { -l } else { l };
+        }
+        exit = exit.min(t2);
+    }
+    if enter > exit || enter <= 0.0 || enter > len as f64 {
+        return None;
+    }
+    Some((enter as f32, normal.as_vec3().normalize_or_zero()))
+}
+
+/// A probe (as for `sweep_part`) swept against a part's collision pieces
+/// (parry shapes in the part's space, posed by `part`): the first piece it
+/// meets as (distance, touching point, the piece's normal there). A piece
+/// the probe starts overlapping isn't hit; the others still are.
+#[allow(clippy::too_many_arguments)]
+pub fn sweep_pieces(
+    probe: &Xform,
+    probe_size: Vec3,
+    probe_kind: u8,
+    dir: Vec3,
+    len: f32,
+    part: &Xform,
+    pieces: &[rp::SharedShape],
+) -> Option<(f32, Vec3, Vec3)> {
+    let (sp, op) = parry_shape(probe_kind, probe_size);
+    let pose = parry_pose(probe, op);
+    let ppose = parry_pose(part, Mat3::IDENTITY);
+    let mut best: Option<(f32, Vec3, Vec3)> = None;
+    for s in pieces {
+        let opts = parry::query::ShapeCastOptions {
+            max_time_of_impact: best.map_or(len, |b| b.0),
+            target_distance: 0.0,
+            stop_at_penetration: true,
+            compute_impact_geometry_on_penetration: false,
+        };
+        let Ok(Some(hit)) = parry::query::cast_shapes(&ppose, rp::Vector::ZERO, &**s, &pose, rv(dir), &*sp, opts) else {
+            continue;
+        };
+        if hit.time_of_impact <= 1e-5 || best.is_some_and(|b| hit.time_of_impact >= b.0) {
+            continue;
+        }
+        let point = part.pos + part.rot * gv(hit.witness1);
+        let n = (part.rot * gv(hit.normal1)).normalize_or_zero();
+        best = Some((hit.time_of_impact, point, n));
+    }
+    best
 }
 
 /// A shape (as for `sweep_part`) swept against terrain triangles (world,
@@ -546,6 +730,41 @@ mod tests {
         // Past a box's corner diagonally: the grown box would hit, the sphere doesn't.
         assert!(sweep_part(&at(Vec3::new(2.4, 10.0, 2.4)), Vec3::splat(1.0), BALL, -Vec3::Y, 20.0,
             &at(Vec3::ZERO), Vec3::splat(4.0), BOX).is_none());
+    }
+
+    /// Laser Tag's FLOOR (121×5×381.5) and its sky-high containment slab,
+    /// Studio's Spherecast / Blockcast numbers (checks/laser-tag-parity/
+    /// raycast): exact at grazing angles, where parry's GJK came up short.
+    #[test]
+    fn sweeps_meet_big_boxes_exactly() {
+        let floor = at(Vec3::new(-83.5, 2.5, 160.75));
+        let fsize = Vec3::new(121.0, 5.0, 381.5);
+        let o = at(Vec3::new(-83.0, 9.0, 160.0));
+        for (d, r, want) in [
+            (Vec3::new(10.0, -1.0, 0.0), 0.4, 36.1796),
+            (Vec3::new(10.0, -1.0, 0.0), 0.1, 39.1945),
+            (Vec3::new(10.0, -1.0, 0.0), 2.0, 20.0980),
+            (Vec3::new(3.0, -1.0, 0.0), 0.4, 11.3842),
+            (Vec3::new(0.0, -1.0, 0.0), 0.4, 3.5999),
+        ] {
+            let (t, p, n) = sweep_part(&o, Vec3::splat(r * 2.0), BALL, d.normalize(), 100.0, &floor, fsize, BOX).unwrap();
+            assert!((t - want).abs() < 2e-3 && (p.y - 5.0).abs() < 1e-3 && close(n, Vec3::Y), "{d} {r}: {t} {p} {n}");
+        }
+        let (t, _, n) = sweep_part(&o, Vec3::ONE, BOX, Vec3::new(10.0, -1.0, 0.0).normalize(), 100.0, &floor, fsize, BOX).unwrap();
+        assert!((t - 35.1746).abs() < 2e-3 && close(n, Vec3::Y), "{t} {n}");
+        let slab = Xform {
+            pos: Vec3::new(40.6045532, 42.3855896, 153.331039),
+            rot: Mat3::from_cols(-Vec3::X, Vec3::Y, -Vec3::Z),
+        };
+        let ssize = Vec3::new(378.88, 31.752857, 389.20905);
+        let o = at(Vec3::new(40.0, 12.0, 153.0));
+        let up = Vec3::new(3.0, 1.0, 0.0).normalize();
+        let (t, _, n) = sweep_part(&o, Vec3::splat(0.8), BALL, up, 100.0, &slab, ssize, BOX).unwrap();
+        assert!((t - 44.6161).abs() < 2e-3 && close(n, -Vec3::Y), "{t} {n}");
+        let (t, _, _) = sweep_part(&o, Vec3::ONE, BOX, up, 100.0, &slab, ssize, BOX).unwrap();
+        assert!((t - 44.3009).abs() < 2e-3, "{t}");
+        // Starting inside / touching: skipped.
+        assert!(sweep_part(&at(Vec3::new(-83.0, 5.3, 160.0)), Vec3::splat(0.8), BALL, -Vec3::Y, 10.0, &floor, fsize, BOX).is_none());
     }
 
     /// A slab mesh (unit cube triangles) only overlaps where it really is.

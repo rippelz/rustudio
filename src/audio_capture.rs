@@ -1,4 +1,6 @@
 //! Silent, real-time offline output. IEEE float stereo WAV, unclipped for analysis.
+//! The header is rewritten about once a second, so the file stays readable
+//! when the process exits without stopping the capture.
 use rodio::Source;
 use std::{
     fs::File,
@@ -6,6 +8,27 @@ use std::{
     sync::mpsc::Receiver,
     time::{Duration, Instant},
 };
+
+fn header(f: &mut BufWriter<File>, frames: u32) -> std::io::Result<()> {
+    let n = frames * 8;
+    let end = f.stream_position()?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(b"RIFF")?;
+    f.write_all(&(n + 36).to_le_bytes())?;
+    f.write_all(b"WAVEfmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&3u16.to_le_bytes())?;
+    f.write_all(&2u16.to_le_bytes())?;
+    f.write_all(&48000u32.to_le_bytes())?;
+    f.write_all(&384000u32.to_le_bytes())?;
+    f.write_all(&8u16.to_le_bytes())?;
+    f.write_all(&32u16.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&n.to_le_bytes())?;
+    f.seek(SeekFrom::Start(end.max(44)))?;
+    f.flush()
+}
+
 pub fn run(
     path: std::path::PathBuf,
     mut source: impl Source,
@@ -22,6 +45,9 @@ pub fn run(
             }
             frames += 1;
         }
+        if frames % 48000 == 0 {
+            header(&mut f, frames)?;
+        }
         if stop
             .try_recv()
             .is_err_and(|e| matches!(e, std::sync::mpsc::TryRecvError::Disconnected))
@@ -33,19 +59,5 @@ pub fn run(
             std::thread::sleep(wait);
         }
     }
-    let n = frames * 8;
-    f.seek(SeekFrom::Start(0))?;
-    f.write_all(b"RIFF")?;
-    f.write_all(&(n + 36).to_le_bytes())?;
-    f.write_all(b"WAVEfmt ")?;
-    f.write_all(&16u32.to_le_bytes())?;
-    f.write_all(&3u16.to_le_bytes())?;
-    f.write_all(&2u16.to_le_bytes())?;
-    f.write_all(&48000u32.to_le_bytes())?;
-    f.write_all(&384000u32.to_le_bytes())?;
-    f.write_all(&8u16.to_le_bytes())?;
-    f.write_all(&32u16.to_le_bytes())?;
-    f.write_all(b"data")?;
-    f.write_all(&n.to_le_bytes())?;
-    f.flush()
+    header(&mut f, frames)
 }

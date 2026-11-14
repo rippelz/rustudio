@@ -8,6 +8,9 @@ use crate::app::{Editor, Tool};
 use crate::studio_ui::{run_type_key, tab_rect_key, RibbonTab, RunType};
 use crate::theme;
 
+/// The dragger settings drop-down's popup id (the `dragger_menu` action opens it).
+pub(crate) const DRAGGER_MENU_ID: &str = "dragger_menu";
+
 fn divider(ui: &mut egui::Ui) {
     ui.add_space(4.0);
     let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, 46.0), Sense::hover());
@@ -36,9 +39,28 @@ pub fn ribbon_button(ui: &mut egui::Ui, icon: &str, label: &str, active: bool, e
     } else {
         theme::TEXT
     };
-    crate::ti::paint(p, icon_r, icon, col);
+    let icon_color = ribbon_icon_color(icon);
+    let icon_color = if enabled { icon_color } else { icon_color.gamma_multiply(0.55) };
+    crate::ti::paint(p, icon_r, icon, icon_color);
     p.text(egui::pos2(r.center().x, r.max.y - 7.0), egui::Align2::CENTER_CENTER, label, font, col);
     resp
+}
+
+/// Palette audited against ../checks/ui/studio/ribbon-{Home,Model,Avatar,UI,Script,Plugins}.png.
+/// Neutral tools retain Studio's cool white; disabled icons retain their hue at reduced brightness.
+fn ribbon_icon_color(icon: &str) -> Color32 {
+    let rgb = match icon {
+        "cube" | "circle-dot" | "link" | "link-plus" | "sparkles" => [183, 135, 242],
+        "mountain" => [89, 210, 190],
+        "user-plus" | "user-cog" | "accessible" | "hanger" | "shirt" | "checklist" |
+        "movie" | "chart-line" => [255, 160, 35],
+        "app-window" | "square" | "typography" | "forms" | "border-corner-rounded" |
+        "layout-list" | "aspect-ratio" => [229, 126, 174],
+        "file-code" | "indent-increase" | "search" | "list-numbers" | "terminal-2" |
+        "terminal" | "point" | "stack-2" | "chart-bar" | "activity" => [190, 218, 86],
+        _ => [225, 229, 241],
+    };
+    Color32::from_rgb(rgb[0], rgb[1], rgb[2])
 }
 
 /// A top-row icon button (Play, Pause, Stop, Notifications…).
@@ -199,7 +221,8 @@ impl Editor {
                     self.ribbon_tools(ui, a);
                     self.part_button(ui, a);
                     self.rb(ui, "mountain", "Terrain", "terrain_editor", false, a);
-                    self.rb(ui, "user-plus", "Character", "character", false, a);
+                    let r = self.rb(ui, "user-plus", "Character", "character", self.chars.open, a);
+                    self.ui_rects.insert("home.character", r);
                     self.rb(ui, "app-window", "GUI", "gui", false, a);
                     self.rb(ui, "file-code", "Script", "script", false, a);
                     self.rb(ui, "file-import", "Import", "import_model", false, a);
@@ -250,7 +273,8 @@ impl Editor {
                     let r = self.rb(ui, "user-cog", "Settings", "avatar_settings", open, a);
                     self.ui_rects.insert("avatar.settings", r);
                     divider(ui);
-                    self.rb(ui, "user-plus", "Character", "character", false, a);
+                    let r = self.rb(ui, "user-plus", "Character", "character", self.chars.open, a);
+                    self.ui_rects.insert("avatar.character", r);
                     self.rb(ui, "accessible", "Setup", "avatar_setup", false, a);
                     self.rb(ui, "hanger", "Accessory", "accessory_editor", false, a);
                     self.rb(ui, "shirt", "Adaptive…", "adaptive", false, a);
@@ -383,18 +407,68 @@ impl Editor {
         });
     }
 
-    /// Geometric (the dragger's movement mode) with its menu: Collisions and
-    /// Join Surfaces (plugin.CollisionEnabled, plugin:GetJoinMode()).
+    /// The dragger settings drop-down, labelled with the movement mode
+    /// (Studio's "Geometric ▾"): Dragger modes Geometric | Physical
+    /// (DraggerService.DraggerMovementMode), Collisions (plugin.CollisionEnabled),
+    /// Join Surfaces (plugin:GetJoinMode()), then Snap: Use Bounding Boxes
+    /// (DraggerService.UseBoundingBoxes) and Snap to Parts (PartSnapEnabled).
     fn movement_mode_button(&mut self, ui: &mut egui::Ui) {
-        let resp = ribbon_button(ui, "geometry", "Geometric", false, true);
+        let mode = if self.physical_drag { "Physical" } else { "Geometric" };
+        let resp = ribbon_button(ui, if self.physical_drag { "atom-2" } else { "geometry" }, mode, false, true);
         self.ui_rects.insert("model.geometric", resp.rect);
-        let resp = resp.on_hover_text("Geometric movement: Collisions and Join Surfaces");
-        egui::Popup::menu(&resp).show(|ui| {
-            ui.checkbox(&mut self.collisions, "Collisions")
-                .on_hover_text("Moving or scaling with handles stops where parts would overlap");
-            ui.checkbox(&mut self.join_surfaces, "Join Surfaces")
-                .on_hover_text("Dropped parts are welded to the parts they touch");
-        });
+        let arrow = Rect::from_min_size(resp.rect.right_top() + Vec2::new(-13.0, 18.0), Vec2::splat(12.0));
+        crate::ti::paint(ui.painter(), arrow, "chevron-down", theme::TEXT_DIM);
+        let resp = resp.on_hover_text("Dragger settings: movement mode, collisions, joins and snapping");
+        egui::Popup::menu(&resp)
+            .id(egui::Id::new(DRAGGER_MENU_ID))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| self.dragger_menu(ui));
+    }
+
+    fn dragger_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_width(186.0);
+        ui.spacing_mut().item_spacing.y = 6.0;
+        let head = |ui: &mut egui::Ui, t: &str| {
+            ui.label(egui::RichText::new(t).size(12.5).color(theme::TEXT));
+        };
+        ui.add_space(2.0);
+        head(ui, "Dragger modes");
+        // Segmented Geometric | Physical toggle.
+        let (r, _) = ui.allocate_exact_size(Vec2::new(186.0, 26.0), Sense::hover());
+        ui.painter().rect_filled(r, 4.0, Color32::from_rgb(30, 31, 35));
+        ui.painter().rect_stroke(r, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(70, 72, 78)), egui::StrokeKind::Inside);
+        for (i, (label, physical)) in [("Geometric", false), ("Physical", true)].into_iter().enumerate() {
+            let half = Rect::from_min_size(r.min + Vec2::new(i as f32 * r.width() / 2.0, 0.0), Vec2::new(r.width() / 2.0, r.height()));
+            let resp = ui.interact(half, egui::Id::new(("dragger_mode", i)), Sense::click());
+            self.ui_rects.insert(if physical { "dragger.physical" } else { "dragger.geometric" }, half);
+            let on = self.physical_drag == physical;
+            if on {
+                ui.painter().rect_filled(half.shrink(2.0), 3.0, Color32::from_rgb(64, 66, 72));
+            } else if resp.hovered() {
+                ui.painter().rect_filled(half.shrink(2.0), 3.0, theme::HOVER_BG);
+            }
+            ui.painter().text(half.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(13.0),
+                if on { Color32::WHITE } else { theme::TEXT });
+            if resp.clicked() {
+                self.physical_drag = physical;
+            }
+        }
+        ui.add_space(2.0);
+        let r = ui.checkbox(&mut self.collisions, "Collisions")
+            .on_hover_text("Physical drags and handle moves / scales stop where parts would overlap");
+        self.ui_rects.insert("dragger.collisions", r.rect);
+        let r = ui.checkbox(&mut self.join_surfaces, "Join Surfaces")
+            .on_hover_text("Dropped parts are welded to the parts they touch");
+        self.ui_rects.insert("dragger.join", r.rect);
+        ui.add_space(2.0);
+        head(ui, "Snap");
+        let r = ui.checkbox(&mut self.use_bounding_boxes, "Use Bounding Boxes")
+            .on_hover_text("Drop onto the bounding box of the part under the mouse instead of its shape");
+        self.ui_rects.insert("dragger.bbox", r.rect);
+        let r = ui.checkbox(&mut self.part_snap, "Snap to Parts")
+            .on_hover_text("Snap the dragged selection's edges and centre to the target's (Shift+C)");
+        self.ui_rects.insert("dragger.part_snap", r.rect);
+        ui.add_space(2.0);
     }
 
     /// Studio's snap controls: a check box and an increment for moves, then

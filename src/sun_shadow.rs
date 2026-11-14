@@ -226,6 +226,7 @@ struct SunPass {
     hw: array<vec4<f32>, 3>,    // across: centre weight, then one per texel out
     vw: array<vec4<f32>, 2>,    // down: centre weight, then one per tap pair
     vo: vec4<f32>,              // down: the tap pairs' texel offsets
+    centre: vec4<f32>,          // the cascade's sphere centre (grass sink)
 };
 @group(0) @binding(0) var<uniform> u: SunPass;
 @group(0) @binding(1) var depth_tex: texture_depth_2d;
@@ -286,6 +287,11 @@ struct PassRaw {
     hw: [f32; 12],
     vw: [f32; 8],
     vo: [f32; 4],
+    /// The cascade's sphere centre: Studio's caster Globals CameraPosition
+    /// (cb0[11]) in the sun passes, which the grass caster's distance sink
+    /// measures from (GrassShadowVS_; capture checks/grass-full-re/sweep
+    /// writer-constants-f32.json event 267: clip (0, 0, 0.518) of its box).
+    centre: [f32; 4],
 }
 
 /// What a cascade's tile was last drawn from.
@@ -500,6 +506,7 @@ impl SunShadows {
                 hw: [0.0; 12],
                 vw: [0.0; 8],
                 vo: EVSM_V_OFFSETS[k],
+                centre: c.centre.extend(0.0).to_array(),
             };
             raw.hw[..9].copy_from_slice(&EVSM_H_WEIGHTS[k]);
             raw.vw[..5].copy_from_slice(&EVSM_V_WEIGHTS[k]);

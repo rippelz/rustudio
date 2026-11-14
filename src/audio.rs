@@ -388,13 +388,21 @@ pub fn master_volume() -> f32 {
     f32::from_bits(MASTER.load(Ordering::Relaxed))
 }
 
+/// Studio Settings > Audio > Main Volume (0..1) as f32 bits.
+static STUDIO_MAIN: AtomicU32 = AtomicU32::new(0x3f80_0000);
+
+pub fn set_studio_main(v: f32) {
+    let v = if v.is_nan() { 1.0 } else { v.clamp(0.0, 1.0) };
+    STUDIO_MAIN.store(v.to_bits(), Ordering::Relaxed);
+}
+
 /// What every sound's own volume is multiplied by: 0 when muted, else the
-/// master volume.
+/// master volume times Studio's Main Volume.
 fn out_gain() -> f32 {
     if muted() {
         0.0
     } else {
-        master_volume()
+        master_volume() * f32::from_bits(STUDIO_MAIN.load(Ordering::Relaxed))
     }
 }
 
@@ -916,6 +924,65 @@ mod tests {
         Arc::new(b)
     }
 
+    /// Laser Tag's blaster clips (Ogg Vorbis): TimeLength / Ended stop at the
+    /// last page's granule position like Studio, not after the padded packet.
+    #[test]
+    fn ogg_vorbis_stops_at_the_last_granule() {
+        let b = Arc::new(include_bytes!("../tests/fixtures/tail-padded-22050.ogg").to_vec());
+        assert_eq!(ogg_vorbis_frames(&b), Some(2212));
+        let p = decode_pcm(&b).expect("decode");
+        assert_eq!(p.rate, 22050);
+        assert_eq!(p.chans[0].len(), 2212, "ffprobe duration_ts of the fixture");
+        assert_eq!(ogg_vorbis_frames(&wav(0.1, 8000)), None);
+    }
+
+    /// The Audio* graph feeds the device on the device's clock: a device
+    /// pulling 10 ms periods while game frames arrive every 7..33 ms (and
+    /// once after a 150 ms stall) never runs dry except during the stall, and
+    /// the graph's time stays locked to the device's (the stall is rendered
+    /// and dropped, not played late).
+    #[test]
+    fn graph_feed_follows_the_device_clock() {
+        let rate = dsp::RATE as usize;
+        let (mut queued, mut starved, mut fed) = (0usize, 0usize, false);
+        let (mut rendered, mut played, mut dry_outside_stall) = (0usize, 0usize, 0usize);
+        let mut device_t = 0.0f64;
+        let mut t = 0.0f64;
+        let mut last = None::<f64>;
+        let mut peak = 0.0f64;
+        let mut k = 0u32;
+        while t < 10.0 {
+            // Next game frame: a fixed pseudo-random 7..33 ms, one 150 ms stall at 5 s.
+            k = k.wrapping_mul(1103515245).wrapping_add(12345);
+            let dt = if (5.0..5.02).contains(&t) { 0.150 } else { 0.007 + (k >> 16) as f64 % 26.0 / 1000.0 };
+            let stall = dt > 0.1;
+            t += dt;
+            // The device takes 480-frame periods up to now.
+            while device_t + 0.01 <= t {
+                device_t += 0.01;
+                let take = queued.min(480);
+                queued -= take;
+                let dry = 480 - take;
+                starved += dry;
+                if !stall && fed {
+                    dry_outside_stall += dry;
+                }
+                played += 480;
+            }
+            let frame = last.map_or(0.0, |l| t - l);
+            peak = graph_peak(peak, frame);
+            last = Some(t);
+            let (drop, keep) = graph_fill(queued, std::mem::take(&mut starved), fed, frame, peak);
+            rendered += drop + keep;
+            queued += keep;
+            fed = true;
+        }
+        assert_eq!(dry_outside_stall, 0, "device ran dry between frames");
+        // Graph time = device time + what's queued (≤ the latency cap).
+        let ahead = rendered as f64 - played as f64;
+        assert!(ahead >= 0.0 && ahead <= GRAPH_LATENCY_CAP * rate as f64, "graph {ahead} frames ahead of the device");
+    }
+
     #[test]
     fn audio_length_of_wav() {
         let l = Audio::length(&wav(0.5, 8000)).expect("length");
@@ -1236,62 +1303,206 @@ pub fn decode_pcm(bytes: &Arc<Vec<u8>>) -> Result<Pcm, String> {
     for (i, s) in dec.enumerate() {
         chans[i % ch.max(1)].push(s);
     }
-    let n = chans.iter().map(|c| c.len()).min().unwrap_or(0);
+    let mut n = chans.iter().map(|c| c.len()).min().unwrap_or(0);
+    if let Some(end) = ogg_vorbis_frames(bytes) {
+        n = n.min(end);
+    }
     for c in chans.iter_mut() {
         c.truncate(n);
     }
     Ok(Pcm { rate, chans })
 }
 
-/// AudioDeviceOutput: interleaved stereo 48 kHz blocks the Audio* graph
-/// renders, played on the default device. Opened on first use from a helper
-/// thread; never opened with RUSTUDIO_NO_AUDIO (tests stay silent). Muted /
-/// master volume apply as for Sounds.
-pub fn graph_output(stereo: &[f32]) {
-    use std::collections::VecDeque;
-    static QUEUE: OnceLock<Option<Arc<Mutex<VecDeque<f32>>>>> = OnceLock::new();
-    let q = QUEUE.get_or_init(|| {
+/// Ogg Vorbis: the last page's granule position is the stream's length in
+/// frames; the final packet is padded past it. Studio (TimeLength, Ended)
+/// and ffmpeg stop there, lewton returns the padded packet whole (MagIn of
+/// the Laser Tag blaster: 24448 frames, lewton 25027, 6 ms too long).
+fn ogg_vorbis_frames(b: &[u8]) -> Option<usize> {
+    let head = &b[..b.len().min(256)];
+    if !b.starts_with(b"OggS") || !head.windows(7).any(|w| w == b"\x01vorbis") {
+        return None;
+    }
+    let i = b.windows(4).rposition(|w| w == b"OggS")?;
+    let g = i64::from_le_bytes(b.get(i + 6..i + 14)?.try_into().ok()?);
+    (g > 0).then_some(g as usize)
+}
+
+/// AudioDeviceOutput's device: the Audio* graph's interleaved stereo 48 kHz
+/// blocks, played on the default device (opened on first use from a helper
+/// thread) or, with RUSTUDIO_GRAPH_CAPTURE=path.wav, written to a float WAV
+/// by a thread that pulls them in real time like a device (silent; for
+/// parity captures). Never opened with RUSTUDIO_NO_AUDIO and no capture.
+/// Muted / master volume apply as for Sounds.
+///
+/// The graph runs on the device's clock, as Studio's mixer thread does: each
+/// game frame asks [`graph_demand`] how much to render (the queue is kept
+/// [`GRAPH_LATENCY`] ahead of the device), so slow or uneven frames neither
+/// starve the device (dropouts and clicks every period) nor slow the sound
+/// down. Time the device played as silence while the game stalled is
+/// rendered and dropped, so a sound resumes where Studio's would be.
+struct GraphDevice {
+    q: Mutex<std::collections::VecDeque<f32>>,
+    /// Samples the device took from an empty queue since the last demand.
+    starved: AtomicU64,
+    /// The game has fed the queue since it opened (startup silence isn't a stall).
+    fed: AtomicBool,
+    /// (last demand, recent peak frame time).
+    last: Mutex<(Option<Instant>, f64)>,
+}
+
+/// How far ahead of the device the graph renders: at least FMOD's default
+/// mixer buffer (4 × 1024 frames at 48 kHz, 85 ms; Roblox's mixer is FMOD),
+/// so an ordinary hitch (equipping spawns a viewmodel: ~90 ms frames) plays
+/// through, and 1.5× the longest recent game frame when frames are slower,
+/// up to 200 ms (a longer stall is rendered and dropped instead). The recent
+/// peak decays over about a second, so the render-ahead (and with it when
+/// Ended fires) stays steady through ordinary jitter.
+pub const GRAPH_LATENCY: f64 = 4.0 * 1024.0 / 48000.0;
+const GRAPH_LATENCY_CAP: f64 = 0.2;
+/// The longest stall made up for by rendering and dropping (and the queue's
+/// bound when the device stalls).
+const GRAPH_LATENCY_MAX: f64 = 0.25;
+
+fn graph_device() -> Option<&'static Arc<GraphDevice>> {
+    static DEV: OnceLock<Option<Arc<GraphDevice>>> = OnceLock::new();
+    DEV.get_or_init(|| {
+        let capture = std::env::var_os("RUSTUDIO_GRAPH_CAPTURE").filter(|v| !v.is_empty());
         let off = std::env::var_os("RUSTUDIO_NO_AUDIO").is_some_and(|v| !v.is_empty() && v != "0");
-        if off {
+        // Unit tests never open the speakers.
+        if (off || cfg!(test)) && capture.is_none() {
             return None;
         }
-        let q = Arc::new(Mutex::new(VecDeque::<f32>::new()));
-        let src = GraphSource { q: q.clone() };
-        let ok = std::thread::Builder::new()
-            .name("rustudio-graph-audio".into())
-            .spawn(move || {
-                if let Ok(mut sink) = rodio::DeviceSinkBuilder::open_default_sink() {
-                    sink.log_on_drop(false);
-                    sink.mixer().add(src);
-                    // The sink lives as long as the process.
-                    loop {
-                        std::thread::park();
+        let dev = Arc::new(GraphDevice {
+            q: Mutex::new(std::collections::VecDeque::new()),
+            starved: AtomicU64::new(0),
+            fed: AtomicBool::new(false),
+            last: Mutex::new((None, 0.0)),
+        });
+        let src = GraphSource { dev: dev.clone(), buf: Vec::new(), at: 0 };
+        let ok = match capture {
+            Some(path) => {
+                let (tx, rx) = mpsc::channel::<()>();
+                // The sender lives as long as the process: the capture runs until exit
+                // and the WAV header is rewritten every second.
+                std::mem::forget(tx);
+                std::thread::Builder::new()
+                    .name("rustudio-graph-capture".into())
+                    .spawn(move || {
+                        if let Err(e) = crate::audio_capture::run(path.into(), src, rx) {
+                            eprintln!("graph capture: {e}");
+                        }
+                    })
+                    .is_ok()
+            }
+            None => std::thread::Builder::new()
+                .name("rustudio-graph-audio".into())
+                .spawn(move || {
+                    if let Ok(mut sink) = rodio::DeviceSinkBuilder::open_default_sink() {
+                        sink.log_on_drop(false);
+                        sink.mixer().add(src);
+                        // The sink lives as long as the process.
+                        loop {
+                            std::thread::park();
+                        }
                     }
-                }
-            })
-            .is_ok();
-        ok.then_some(q)
-    });
-    let Some(q) = q else { return };
-    if let Ok(mut q) = q.lock() {
-        // Keep at most ~0.25 s queued: a stalled device must not grow it.
-        let max = 48000 / 2;
+                })
+                .is_ok(),
+        };
+        ok.then_some(dev)
+    })
+    .as_ref()
+}
+
+/// How many frames the graph renders this game frame for the device:
+/// `(drop, keep)`: render `drop + keep` frames, discard the first `drop`
+/// (the device already played that time as silence during a stall) and queue
+/// the rest. `None` without a device: the caller renders by game time.
+pub fn graph_demand() -> Option<(usize, usize)> {
+    let dev = graph_device()?;
+    let now = Instant::now();
+    let (frame, peak) = {
+        let mut last = dev.last.lock().ok()?;
+        let f = last.0.map_or(0.0, |l| now.duration_since(l).as_secs_f64());
+        last.1 = graph_peak(last.1, f);
+        last.0 = Some(now);
+        (f, last.1)
+    };
+    let queued = dev.q.lock().ok()?.len() / 2;
+    let starved = dev.starved.swap(0, Ordering::Relaxed) as usize / 2;
+    let fill = graph_fill(queued, starved, dev.fed.load(Ordering::Relaxed), frame, peak);
+    if fill.0 > 0 && std::env::var_os("RUSTUDIO_GRAPH_CAPTURE").is_some() {
+        // Parity captures: say where a gap comes from (a game-thread stall).
+        eprintln!(
+            "graph audio: the game stalled {:.0} ms; {:.1} ms the device played as silence were dropped",
+            frame * 1000.0,
+            fill.0 as f64 / dsp::RATE as f64 * 1000.0
+        );
+    }
+    Some(fill)
+}
+
+/// The recent peak frame time: jumps to a longer frame, decays ~2 %/frame.
+fn graph_peak(peak: f64, frame: f64) -> f64 {
+    (peak * 0.98).max(frame.min(1.0))
+}
+
+/// [`graph_demand`]'s arithmetic: `queued` frames waiting, `starved` frames
+/// the device played from an empty queue, `frame` seconds since the last
+/// call, `peak` the recent peak frame time ([`graph_peak`]).
+fn graph_fill(queued: usize, starved: usize, fed: bool, frame: f64, peak: f64) -> (usize, usize) {
+    let target = (1.5 * peak).clamp(GRAPH_LATENCY, GRAPH_LATENCY_CAP);
+    let target = (target * dsp::RATE as f64) as usize;
+    // A gap over a second is a new session (or a paused one), not a stall.
+    let drop = if fed && frame <= 1.0 {
+        starved.min((GRAPH_LATENCY_MAX * dsp::RATE as f64) as usize)
+    } else {
+        0
+    };
+    (drop, target.saturating_sub(queued))
+}
+
+/// Queues interleaved stereo for the device (see [`graph_demand`]).
+pub fn graph_output(stereo: &[f32]) {
+    let Some(dev) = graph_device() else { return };
+    dev.fed.store(true, Ordering::Relaxed);
+    if let Ok(mut q) = dev.q.lock() {
         let g = out_gain();
         q.extend(stereo.iter().map(|s| s * g));
-        while q.len() > max {
-            q.pop_front();
+        // A stalled device must not grow it without bound.
+        let max = (GRAPH_LATENCY_MAX * 2.0 * dsp::RATE as f64) as usize * 2;
+        let extra = q.len().saturating_sub(max);
+        if extra > 0 {
+            q.drain(..extra);
         }
     }
 }
 
 struct GraphSource {
-    q: Arc<Mutex<std::collections::VecDeque<f32>>>,
+    dev: Arc<GraphDevice>,
+    /// Samples taken from the queue in one lock (the device pulls per sample).
+    buf: Vec<f32>,
+    at: usize,
 }
 
 impl Iterator for GraphSource {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
-        Some(self.q.lock().ok().and_then(|mut q| q.pop_front()).unwrap_or(0.0))
+        if self.at >= self.buf.len() {
+            self.buf.clear();
+            self.at = 0;
+            if let Ok(mut q) = self.dev.q.lock() {
+                let n = q.len().min(256) & !1;
+                self.buf.extend(q.drain(..n));
+            }
+            if self.buf.is_empty() {
+                // Starved: a stereo frame of silence.
+                self.dev.starved.fetch_add(2, Ordering::Relaxed);
+                self.buf.extend([0.0, 0.0]);
+            }
+        }
+        let s = self.buf[self.at];
+        self.at += 1;
+        Some(s)
     }
 }
 

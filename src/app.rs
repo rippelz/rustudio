@@ -111,6 +111,9 @@ pub struct Harness {
     /// `--click X,Y@S` / `--key NAME@S`: input at S seconds (X,Y in the 3D
     /// view, pixels from its top-left).
     pub actions: Vec<(f32, HarnessAction)>,
+    /// The pointer's last window position seen in the input (harness clicks
+    /// while the game holds the mouse press there).
+    pub pointer: Option<egui::Pos2>,
     pub started: Instant,
     pub screenshot: Option<PathBuf>,
     pub selftest: Option<SelfTest>,
@@ -170,11 +173,27 @@ pub struct Editor {
     pub collisions: bool,
     /// Model tab Join Surfaces: drops weld touching faces (JointPairs).
     pub join_surfaces: bool,
+    /// Dragger modes: Physical (DraggerMovementMode.Physical) drags in the
+    /// camera plane like Studio's IK dragger; Geometric rests on surfaces.
+    pub physical_drag: bool,
+    /// Snap to Parts (DraggerService.PartSnapEnabled): free drags snap the
+    /// selection's edges / centre to the target face's (soft snaps).
+    pub part_snap: bool,
+    /// Use Bounding Boxes (DraggerService.UseBoundingBoxes): the part under
+    /// the mouse is treated as its box when building the drop surface.
+    pub use_bounding_boxes: bool,
+    /// Align Dragged Objects (StudioService.AlignDraggedObjects): dropped
+    /// selections turn to the nearest axis alignment of the target surface.
+    pub align_dragged: bool,
     pub move_inc: f32,
     pub snap_rotate: bool,
     pub rotate_inc: f32,
     pub local_space: bool,
     pub show_grid: bool,
+    /// The scene alone in the 3D view, without the editor's own drawing (the
+    /// ground grid, selection and hover boxes, handles, the drag box, the
+    /// tool readout and axis compass): comparison captures (src/control.rs).
+    pub clean_view: bool,
     pub log: Vec<LogLine>,
     pub clipboard: Option<Vec<u8>>,
     pub render_state: Option<egui_wgpu::RenderState>,
@@ -192,10 +211,13 @@ pub struct Editor {
     pub explorer: ExplorerState,
     pub props: PropertiesState,
     pub account: AccountUi,
+    /// The character builder window (Home / Avatar → Character).
+    pub chars: crate::char_builder::CharBuilder,
     /// Places stored on Roblox: File > Open from Roblox, Save to Roblox.
     pub cloud: crate::cloud_ui::CloudUi,
     /// Scripts to open (or focus) as editor tabs at the end of the frame.
     pub open_script: Vec<Ref>,
+    document_tabs_reset: bool,
     pub scripts: crate::script_editor::ScriptTabs,
     /// The running Play / Run session, if any.
     pub play: Option<crate::play::PlaySession>,
@@ -222,6 +244,9 @@ pub struct Editor {
     pub draw_stats: [usize; 4],
     /// What the renderer holds per part.
     pub draw_cache: crate::viewport::DrawCache,
+    /// RUSTUDIO_CONTROL: the comparison-capture socket (src/control.rs).
+    #[cfg(unix)]
+    pub control: Option<crate::control::Control>,
     /// Bumped whenever a downloaded asset arrives (parts waiting on one are redone).
     pub asset_gen: u64,
     pub draws_asset_gen: u64,
@@ -251,6 +276,8 @@ pub struct Editor {
     pub terrain_water_look: Option<([u8; 3], f32, f32)>,
     /// Terrain water's waves and clearness for the water pass (round 24).
     pub water_waves: crate::water::WaterLook,
+    /// Studio's scene environment probe (env_probe.rs).
+    pub env_probe: crate::env_probe::EnvProbe,
     /// The Terrain Editor's tools and settings.
     pub terrain_ed: crate::terrain_editor::TerrainEditor,
     /// A brush stroke's voxels, the chunks it touched and whether water may
@@ -378,11 +405,16 @@ impl RustudioApp {
             snap_move: mech::SNAP_ON_BY_DEFAULT,
             collisions: mech::COLLISIONS_ON_BY_DEFAULT,
             join_surfaces: mech::JOIN_SURFACES_ON_BY_DEFAULT,
+            physical_drag: mech::PHYSICAL_DRAG_BY_DEFAULT,
+            part_snap: mech::PART_SNAP_ON_BY_DEFAULT,
+            use_bounding_boxes: mech::USE_BOUNDING_BOXES_BY_DEFAULT,
+            align_dragged: mech::ALIGN_DRAGGED_BY_DEFAULT,
             move_inc: mech::MOVE_SNAP,
             snap_rotate: mech::SNAP_ON_BY_DEFAULT,
             rotate_inc: mech::ROTATE_SNAP_DEG,
             local_space: false,
             show_grid: true,
+            clean_view: false,
             log: Vec::new(),
             clipboard: None,
             render_state,
@@ -397,8 +429,10 @@ impl RustudioApp {
             explorer: ExplorerState::default(),
             props: PropertiesState::default(),
             account: AccountUi::new(),
+            chars: Default::default(),
             cloud: crate::cloud_ui::CloudUi::new(),
             open_script: Vec::new(),
+            document_tabs_reset: false,
             scripts: Default::default(),
             play: None,
             fixed_dt: None,
@@ -412,6 +446,8 @@ impl RustudioApp {
             play_shows_client: true,
             draw_stats: [0; 4],
             draw_cache: Default::default(),
+            #[cfg(unix)]
+            control: None,
             asset_gen: 0,
             draws_asset_gen: 0,
             material_gen: 0,
@@ -428,6 +464,7 @@ impl RustudioApp {
             terrain_grass_length: -1.0,
             terrain_water_look: None,
             water_waves: Default::default(),
+            env_probe: Default::default(),
             terrain_ed: Default::default(),
             terrain_brushed: None,
             phys: Default::default(),
@@ -484,6 +521,12 @@ impl RustudioApp {
             // Deterministic play-session timing for the scripted test.
             ed.fixed_dt = Some(1.0 / 60.0);
         }
+        // RUSTUDIO_FIXED_DT=HZ (tests only): Play steps 1/HZ s a frame however
+        // long frames take (with RUSTUDIO_GAME_CLOCK, probes timed by os.clock
+        // see an unloaded machine).
+        if let Some(hz) = std::env::var("RUSTUDIO_FIXED_DT").ok().and_then(|v| v.parse::<f32>().ok()).filter(|h| *h > 0.0) {
+            ed.fixed_dt = Some(1.0 / hz);
+        }
         if ((ed.harness.selftest.is_none() && ed.harness.bench.is_none())
             || std::env::var_os("RUSTUDIO_SESSION").is_some())
             && std::env::var_os("RUSTUDIO_NO_SESSION").is_none()
@@ -499,6 +542,16 @@ impl RustudioApp {
         ed.cloud.open_when_ready = ed.harness.open_roblox.map(|(p, copy)| (p, None, copy));
         ed.cloud.picker_when_ready = ed.harness.roblox_picker;
         ed.cloud.settings_open = ed.harness.roblox_settings;
+        #[cfg(unix)]
+        if let Ok(path) = std::env::var("RUSTUDIO_CONTROL") {
+            match crate::control::Control::listen(&path) {
+                Ok(c) => {
+                    ed.control = Some(c);
+                    ed.clean_view = true;
+                }
+                Err(e) => eprintln!("[control] can't listen on {path}: {e}"),
+            }
+        }
         if let Some([x, y, z, yaw, pitch]) = ed.harness.camera {
             ed.cam.pos = Vec3::new(x, y, z);
             ed.cam.yaw = yaw.to_radians();
@@ -533,6 +586,12 @@ impl RustudioApp {
             }
             layout = Some(crate::layout_store::Saver::new(saved.as_ref()));
         }
+        // Comparison captures (src/control.rs) want the 3D view as big as the
+        // other program's: the view alone, no Explorer / Properties / Output.
+        #[cfg(unix)]
+        if ed.control.is_some() && layout.is_none() {
+            dock = DockState::new(vec![Tab::Viewport]);
+        }
         // `--play` starts once the 3D view has its size (Camera.ViewportSize).
         RustudioApp {
             watchdog: crate::frame_watchdog::Watchdog::new(cc.egui_ctx.clone()),
@@ -560,20 +619,45 @@ fn timestamp() -> String {
     format!("{:02}:{:02}:{:02}.{:03}", s / 3600, (s / 60) % 60, s % 60, ms % 1000)
 }
 
+/// `RUSTUDIO_LOG_TEE=FILE`: every Output line is also appended to FILE as it
+/// is logged (the Output keeps only its newest lines; per-frame traces such
+/// as checks/humanoid-physics/feel need them all).
+pub(crate) fn tee_log(text: &str) {
+    use std::io::Write;
+    static TEE: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    let tee = TEE.get_or_init(|| {
+        let path = std::env::var_os("RUSTUDIO_LOG_TEE")?;
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(std::sync::Mutex::new(std::io::BufWriter::new(f)))
+    });
+    if let Some(f) = tee {
+        if let Ok(mut f) = f.lock() {
+            let _ = writeln!(f, "{text}");
+            // Whole lines reach the file even if the run is killed.
+            let _ = f.flush();
+        }
+    }
+}
+
 impl Editor {
     pub fn push_log(&mut self, level: Level, text: impl Into<String>) {
         let text = text.into();
         if level != Level::Info {
             eprintln!("[{level:?}] {text}");
         }
+        tee_log(&text);
         self.log.push(LogLine {
             at: timestamp(),
             level,
             text,
         });
-        if self.log.len() > 5000 {
-            self.log.drain(0..1000);
-            self.output_view.log_drained(1000);
+        // Studio Settings > Output > Maximum Output Lines (5000: past it the
+        // oldest fifth goes).
+        let max = crate::studio_settings::studio("Maximum Output Lines", 5000.0).clamp(10.0, 1e7) as usize;
+        if self.log.len() > max {
+            let n = self.log.len() - max - 1 + max / 5;
+            self.log.drain(0..n);
+            self.output_view.log_drained(n);
         }
     }
     pub fn info(&mut self, t: impl Into<String>) {
@@ -594,6 +678,12 @@ impl Editor {
         // Another document closes the open project (open_project sets it again).
         self.project = None;
         crate::project_config::set_active(None);
+        self.document_tabs_reset = true;
+        self.ui.insert_popup = None;
+        self.last_selection.clear();
+        self.marquee_base.clear();
+        self.ui.dock_moves.clear();
+        self.ui.panel_requests.retain(|(tab, _)| !matches!(tab, Tab::Script(_)));
         self.doc = doc;
         self.scene = Scene::default();
         self.drag = None;
@@ -921,6 +1011,9 @@ impl Editor {
         if self.doc.selection == self.last_selection {
             return;
         }
+        if std::env::var_os("RUSTUDIO_PICK_TRACE").is_some() {
+            eprintln!("[pick selection] {:?}", self.doc.selection.iter().map(|r| self.doc.dom.get_by_ref(*r).map(|i| (&i.name, &i.class))).collect::<Vec<_>>());
+        }
         let added: Vec<Ref> = self
             .doc
             .selection
@@ -1076,7 +1169,7 @@ impl Editor {
     }
 
     /// Where a new part lands: the point under the screen centre, snapped.
-    fn spawn_point(&mut self, size: Vec3) -> Vec3 {
+    pub(crate) fn spawn_point(&mut self, size: Vec3) -> Vec3 {
         self.scene.sync(&mut self.doc);
         let rect = if self.viewport_rect.is_positive() {
             self.viewport_rect
@@ -1289,6 +1382,9 @@ impl Editor {
                 // (A focused TextBox has them: game-processed, Enter included.)
                 let processed = self.gui.focus.is_some();
                 if let Some(s) = self.play.as_mut() {
+                    if !processed {
+                        s.game.hotbar_taps.extend(taps.iter().copied());
+                    }
                     s.game.key_taps.extend(taps.into_iter().map(|k| (k, processed)));
                 }
             }
@@ -1463,7 +1559,10 @@ impl Editor {
                 self.new_place();
                 self.show_start_page();
             }
-            PendingAction::Quit => std::process::exit(0),
+            PendingAction::Quit => {
+                crate::studio_settings::flush();
+                std::process::exit(0)
+            }
             PendingAction::Restart => self.restart(),
         }
     }
@@ -1622,7 +1721,11 @@ impl TabViewer for Viewer<'_> {
             Tab::Output => self.ed.output_ui(ui),
             Tab::AvatarSettings => self.ed.avatar_settings_ui(ui),
             Tab::TerrainEditor => self.ed.terrain_editor_ui(ui),
-            Tab::Script(r) => self.ed.script_tab_ui(ui, *r),
+            Tab::Script(r) => {
+                if !self.ed.document_tabs_reset {
+                    self.ed.script_tab_ui(ui, *r);
+                }
+            },
         }
     }
 
@@ -1707,11 +1810,20 @@ impl TabViewer for Viewer<'_> {
 }
 
 impl RustudioApp {
+    fn reset_document_tabs(&mut self) {
+        if std::mem::take(&mut self.ed.document_tabs_reset) {
+            crate::panels::close_document_tabs(&mut self.dock, &mut self.panels);
+            self.ed.ui.popped.clear();
+            self.ed.ui.viewport_group.clear();
+        }
+    }
+
     /// Draws each panel window (its own OS window: an immediate viewport),
     /// then does the frame's pop-out / dock-back moves and turns tabs
     /// dragged out of a dock into windows. `dock_rect`: the main dock's
     /// area (a popped tab's window opens over where it was).
     fn panel_windows(&mut self, ctx: &egui::Context, windows: &[(String, String)], dock_rect: egui::Rect) {
+        self.panels.remember_windows();
         let mut closed = Vec::new();
         for (i, w) in self.panels.popped.iter_mut().enumerate() {
             let id = w.viewport_id();
@@ -1788,6 +1900,7 @@ impl RustudioApp {
 
 impl eframe::App for RustudioApp {
     fn on_exit(&mut self) {
+        crate::studio_settings::flush();
         if let Some(s) = self.layout.as_mut() {
             s.save(&self.dock, &self.panels, &self.ed);
         }
@@ -1856,7 +1969,7 @@ impl eframe::App for RustudioApp {
         }
         self.watchdog.stage("asset polling", "Play tick: scripts/physics");
         if ed.play.is_some() {
-            let step = ed.fixed_dt.unwrap_or(dt);
+            let step = ed.fixed_dt.unwrap_or_else(|| frame_grid(dt));
             let _p = crate::bench::scope("play_tick");
             ed.play_tick(&ctx, step);
         }
@@ -1918,6 +2031,7 @@ impl eframe::App for RustudioApp {
             }
         }
 
+        self.reset_document_tabs();
         let ed = &mut self.ed;
         if (ctx.zoom_factor() - ed.ui.zoom).abs() > 1e-3 {
             ctx.set_zoom_factor(ed.ui.zoom);
@@ -1991,7 +2105,9 @@ impl eframe::App for RustudioApp {
                     .show_inside(ui, &mut Viewer { ed: &mut self.ed, window: None, windows: &windows });
             });
         drop(_dock_scope);
+        self.reset_document_tabs();
         self.panel_windows(&ctx, &windows, dock_rect);
+        self.reset_document_tabs();
         // Window > Explorer / Properties / Output / Avatar Settings toggles
         // (in a panel window too), new panels where Studio docks them
         // (src/panels.rs, never over the 3D view), and which panels are
@@ -2013,7 +2129,9 @@ impl eframe::App for RustudioApp {
                     w.focus = true;
                 }
                 (None, true) => {
-                    if crate::panels::placement(tab.key()).floats {
+                    if self.panels.restore_window(&self.dock, tab) {
+                        // Restored the hidden panel in its original OS window.
+                    } else if crate::panels::placement(tab.key()).floats {
                         self.panels.pop_out(tab, [420.0, 520.0], None);
                     } else {
                         crate::panels::place(&mut self.dock, tab, &self.panels.homes);
@@ -2048,13 +2166,17 @@ impl eframe::App for RustudioApp {
         let ed = &mut self.ed;
         ed.insert_popup_ui(&ctx);
         ed.about_ui(&ctx);
+        ed.studio_settings_ui(&ctx);
         ed.user_screenshot_tick(&ctx);
         crate::runtime::domains::assets_cloud::capture::frame_tick(&ctx, ed.viewport_rect);
         ed.confirm_ui(&ctx);
         ed.account_window(&ctx);
+        ed.character_builder_window(&ctx);
         ed.cloud_windows(&ctx);
         self.watchdog.stage("dock UI", "harness and screenshot readback");
         ed.harness_tick(&ctx);
+        #[cfg(unix)]
+        ed.control_tick(&ctx);
         ed.ui_shots_tick(&ctx);
         let work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         ed.last_work_ms = work_ms;
@@ -2441,6 +2563,19 @@ impl Editor {
         } else {
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::ZERO)
         };
+        // The game holds the mouse (MouseBehavior.LockCenter): a held cursor
+        // never travels, so clicks land where it is held and pointer moves
+        // are dropped. Moving it would read as a huge mouse
+        // delta and fling a first-person camera (only --rdrag's raw motion
+        // turns it then).
+        let locked = self.lock_center_held();
+        // Where the real pointer is now: a held cursor's clicks happen there.
+        for e in &raw.events {
+            if let egui::Event::PointerMoved(p) = e {
+                self.harness.pointer = Some(*p);
+            }
+        }
+        let held_at = self.harness.pointer.unwrap_or(vp.center());
         let mut i = 0;
         while i < self.harness.actions.len() {
             if self.harness.actions[i].0 > t {
@@ -2455,8 +2590,10 @@ impl Editor {
             match a {
                 HarnessAction::Luau(..) => {}
                 HarnessAction::Click(x, y) => {
-                    let p = vp.min + egui::vec2(x, y);
-                    raw.events.push(egui::Event::PointerMoved(p));
+                    let p = if locked { held_at } else { vp.min + egui::vec2(x, y) };
+                    if !locked {
+                        raw.events.push(egui::Event::PointerMoved(p));
+                    }
                     for pressed in [true, false] {
                         raw.events.push(egui::Event::PointerButton {
                             pos: p,
@@ -2499,20 +2636,27 @@ impl Editor {
                 HarnessAction::Text(text) => raw.events.push(egui::Event::Text(text)),
                 HarnessAction::Shift(on) => self.harness.shift = on,
                 HarnessAction::RightButton(pressed) => {
-                    raw.events.push(egui::Event::PointerMoved(vp.center()));
+                    let p = if locked { held_at } else { vp.center() };
+                    if !locked {
+                        raw.events.push(egui::Event::PointerMoved(p));
+                    }
                     raw.events.push(egui::Event::PointerButton {
-                        pos: vp.center(),
+                        pos: p,
                         button: egui::PointerButton::Secondary,
                         pressed,
                         modifiers: egui::Modifiers::NONE,
                     });
                 }
                 HarnessAction::PointerAt(x, y) => {
-                    raw.events.push(egui::Event::PointerMoved(vp.min + egui::vec2(x, y)));
+                    if !locked {
+                        raw.events.push(egui::Event::PointerMoved(vp.min + egui::vec2(x, y)));
+                    }
                 }
                 HarnessAction::LeftButton(x, y, pressed) => {
-                    let p = vp.min + egui::vec2(x, y);
-                    raw.events.push(egui::Event::PointerMoved(p));
+                    let p = if locked { held_at } else { vp.min + egui::vec2(x, y) };
+                    if !locked {
+                        raw.events.push(egui::Event::PointerMoved(p));
+                    }
                     raw.events.push(egui::Event::PointerButton {
                         pos: p,
                         button: egui::PointerButton::Primary,
@@ -2524,6 +2668,11 @@ impl Editor {
                     raw.events.push(egui::Event::MouseMoved(egui::vec2(dx, dy)));
                 }
                 HarnessAction::UiAction(name) => self.harness.ui_due.push(name),
+            }
+        }
+        for e in &raw.events {
+            if let egui::Event::PointerMoved(p) = e {
+                self.harness.pointer = Some(*p);
             }
         }
     }
@@ -2664,4 +2813,44 @@ pub fn build_demo_parts(doc: &mut Document) -> Ref {
             );
         }
         last
+}
+
+/// The whole pixels the 3D view covers in a screenshot of the window: its
+/// rectangle in points scaled by `ppp`, rounded inward, where an edge within
+/// a hundredth of a pixel of a whole one counts as on it. With fractional
+/// scaling (1.25) an edge at 143.2 points is pixel row 179 but comes out
+/// 178.99997 in f32: truncating took row 178, the editor's frame (shots were
+/// a pixel low), and plain inward rounding lost a row at the other edge.
+/// `(x0, y0, w, h)`, clipped to `size`.
+pub fn view_pixels(r: egui::Rect, ppp: f32, size: [usize; 2]) -> (usize, usize, usize, usize) {
+    const EPS: f32 = 0.01;
+    let start = |v: f32, n: usize| (((v * ppp) - EPS).ceil().max(0.0) as usize).min(n);
+    let end = |v: f32, n: usize| (((v * ppp) + EPS).floor().max(0.0) as usize).min(n);
+    let (x0, y0) = (start(r.min.x, size[0]), start(r.min.y, size[1]));
+    let (x1, y1) = (end(r.max.x, size[0]), end(r.max.y, size[1]));
+    (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
+}
+
+/// RUSTUDIO_FRAME_GRID=HZ (tests only): a frame's time snapped to whole
+/// periods of a HZ display, the remainder carried, as a vsynced monitor
+/// hands frames out. Headless runs pace frames with a timer that drifts
+/// against the 240 Hz world clock; the drift changes on which tick a frame
+/// starts (and with it where the Humanoid's 2-tick solves fall) at random
+/// from run to run. Without the variable: `dt` as it is.
+fn frame_grid(dt: f32) -> f32 {
+    use std::sync::{Mutex, OnceLock};
+    static HZ: OnceLock<Option<f32>> = OnceLock::new();
+    static OWED: Mutex<f32> = Mutex::new(0.0);
+    let Some(hz) = *HZ.get_or_init(|| std::env::var("RUSTUDIO_FRAME_GRID").ok().and_then(|v| v.parse::<f32>().ok()).filter(|h| *h > 0.0))
+    else {
+        return dt;
+    };
+    let mut owed = OWED.lock().unwrap();
+    *owed += dt;
+    let n = (*owed * hz).round().max(1.0);
+    // (a frame shorter than a period still gets one: a headless pacer runs
+    // such frames to catch up, a display never does. No more than a quarter
+    // period of that is held against the frames that follow.)
+    *owed = (*owed - n / hz).max(-0.25 / hz);
+    n / hz
 }

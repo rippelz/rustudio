@@ -376,7 +376,8 @@ local t=load(seq);t:Play(0,1,0);t.TimePosition=.25;task.wait(.05)
 near(motor.Transform.RightVector.X,.90160203);t:Stop(0);task.wait(.05)
 local c=workspace:FindFirstChild('CurveFixture')
 local t=load(c);near(t.Length,1);t:Play(0,1,0);t.TimePosition=.25;task.wait(.05)
-near(motor.Transform.X,2.875);near(motor.Transform.Y,7);near(motor.Transform.RightVector.X,math.cos(.5))
+-- Studio 0.744: the Animator lerps 1/30 s samples (2.875 is the curve value)
+near(motor.Transform.X,2.8744444);near(motor.Transform.Y,7);near(motor.Transform.RightVector.X,math.cos(.5))
 near(motor.Transform.RightVector.Y,math.sin(.5)*math.cos(1))
 t:Stop(0);task.wait(.05)
 local hits={};t:GetMarkerReachedSignal('Events'):Connect(function(v) table.insert(hits,v) end)
@@ -393,6 +394,126 @@ t.DidLoop:Connect(function() table.insert(ev,'LOOP') end)
 t:Play(0,1,-1);t.TimePosition=case[1];task.wait(case[2]);t:Stop(0);task.wait(.05)
 assert(table.concat(ev,',')==case[3],table.concat(ev,','))
 end
+print('animation-semantics-pass')
+"#);
+    }
+
+    /// A CurveAnimation saved with the version-1 curve wire, as Laser Tag's
+    /// 2024 blaster clips are (Equip / Reload): Root/Limb Position.X keys
+    /// 0 @ 0 s (cubic) and 3 @ 0.1 s (cubic, unflagged stored left tangent
+    /// 30) and 3 @ 0.5 s; a Sound marker "Out" at 0.1 s; an empty
+    /// NamedKeyframeEvent curve. Not looped.
+    fn laser_tag_v1_clip(d: &mut Document, ws: rbx_dom_weak::types::Ref) {
+        fn le(b: &mut Vec<u8>, v: &[u32]) {
+            for x in v {
+                b.extend(x.to_le_bytes());
+            }
+        }
+        let clip = d.dom.insert(
+            ws,
+            InstanceBuilder::new("CurveAnimation").with_name("V1Clip").with_property("Loop", false),
+        );
+        let root = d.dom.insert(clip, InstanceBuilder::new("Folder").with_name("Root"));
+        let limb = d.dom.insert(root, InstanceBuilder::new("Folder").with_name("Limb"));
+        let pos = d.dom.insert(limb, InstanceBuilder::new("Vector3Curve").with_name("Position"));
+        let mut b = Vec::new();
+        le(&mut b, &[1, 3]);
+        for (v, left) in [(0f32, 0f32), (3., 30.), (3., 0.)] {
+            b.extend(2u16.to_le_bytes());
+            b.extend(v.to_le_bytes());
+            b.extend(left.to_le_bytes());
+            b.extend(0f32.to_le_bytes());
+        }
+        le(&mut b, &[1, 3, 0, 240, 1200]);
+        d.dom.insert(
+            pos,
+            InstanceBuilder::new("FloatCurve")
+                .with_name("X")
+                .with_property("ValuesAndTimes", rbx_dom_weak::types::BinaryString::from(b)),
+        );
+        let mut m = Vec::new();
+        le(&mut m, &[1, 1]);
+        m.extend(b"Out\0");
+        le(&mut m, &[1, 1, 240]);
+        d.dom.insert(
+            clip,
+            InstanceBuilder::new("MarkerCurve")
+                .with_name("Sound")
+                .with_property("ValuesAndTimes", rbx_dom_weak::types::BinaryString::from(m)),
+        );
+        let mut e = Vec::new();
+        le(&mut e, &[1, 0, 1, 0]);
+        d.dom.insert(
+            clip,
+            InstanceBuilder::new("MarkerCurve")
+                .with_name("NamedKeyframeEvent")
+                .with_property("ValuesAndTimes", rbx_dom_weak::types::BinaryString::from(e)),
+        );
+    }
+
+    /// The Laser Tag blaster rules measured in Studio 0.744 through Studio
+    /// (checks/laser-tag-parity/anim/findings.md).
+    #[test]
+    fn laser_tag_blaster_animation_semantics() {
+        run(r#"
+local model = Instance.new('Model',workspace)
+local animator = Instance.new('Animator',Instance.new('AnimationController',model))
+local root=Instance.new('Part',model);root.Name='Root'
+local limb=Instance.new('Part',model);limb.Name='Limb'
+local motor=Instance.new('Motor6D',root);motor.Part0=root;motor.Part1=limb
+local function near(a,b,e) assert(math.abs(a-b)<(e or .0005),tostring(a)..' ~= '..tostring(b)) end
+local function load(clip)
+ local a=Instance.new('Animation')
+ a.AnimationId=__rs_lua_methods.RegisterAnimationClip(nil,clip)
+ return animator:LoadAnimation(a)
+end
+-- version-1 curve wire: keys, unflagged stored tangents used, markers
+local clip=workspace.V1Clip
+local fc=clip.Root.Limb.Position:FindFirstChild('X')
+local keys=fc:GetKeys()
+assert(#keys==3 and keys[2].LeftTangent==nil,'v1 keys '..#keys)
+-- Hermite on 0..0.1 with key 2's stored left tangent 30 at u=.5: 1.5 - .125*.1*30
+near(fc:GetValueAtTime(.05),1.125)
+assert(#clip.Sound:GetMarkers()==1 and clip.Sound:GetMarkers()[1].Value=='Out')
+local t=load(clip)
+near(t.Length,.5)
+-- the Animator samples curves every 1/30 s and lerps between the samples
+t:Play(0,1,0);t.TimePosition=.05;task.wait()
+near(motor.Transform.X,(fc:GetValueAtTime(1/30)+fc:GetValueAtTime(2/30))/2)
+assert(math.abs(motor.Transform.X-fc:GetValueAtTime(.05))>.03)
+local ok,err=pcall(function() return t:GetTimeOfKeyframe('End') end)
+assert(not ok and string.find(err,'Invalid operation for this animation format.',1,true),tostring(err))
+t:Stop(0);task.wait()
+-- markers, the clip's implicit "End" keyframe, then Stopped, then DidLoop
+local ev={}
+t:GetMarkerReachedSignal('Sound'):Connect(function(v) table.insert(ev,'M'..v) end)
+t.KeyframeReached:Connect(function(n) table.insert(ev,'K'..n) end)
+t.Stopped:Connect(function() table.insert(ev,'Stopped') end)
+t.DidLoop:Connect(function() table.insert(ev,'DidLoop') end)
+t:Play(0);task.wait(.7)
+assert(table.concat(ev,',')=='MOut,KEnd,Stopped,DidLoop',table.concat(ev,','))
+-- a KeyframeSequence keeps GetTimeOfKeyframe's own message
+local seq=Instance.new('KeyframeSequence');seq.Loop=true
+for i=0,1 do
+ local k=Instance.new('Keyframe',seq);k.Time=i
+ local p=Instance.new('Pose',k);p.Name='Root'
+ local q=Instance.new('Pose',p);q.Name='Limb';q.CFrame=CFrame.new(10,0,0)
+end
+local k=load(seq)
+ok,err=pcall(function() return k:GetTimeOfKeyframe('Nope') end)
+assert(not ok and string.find(err,'Could not find a keyframe by that name!',1,true),tostring(err))
+-- Play restarts a playing track (a blaster's Shoot:Play(0) every shot)
+k:Play(0);task.wait(.3);assert(k.TimePosition>.2)
+k:Play(0);assert(k.TimePosition==0,tostring(k.TimePosition))
+-- Stop(0): gone at once, WeightCurrent kept; the next Play() snaps in
+task.wait(.05);k:Stop(0);task.wait(.05)
+assert(#animator:GetPlayingAnimationTracks()==0 and k.WeightCurrent==1,tostring(k.WeightCurrent))
+k:Play();task.wait();near(k.WeightCurrent,1)
+k:Stop(0);task.wait()
+-- a non-looped track at its end with Speed 0 has ended and fades out
+k.Looped=false;k:Play(0,1,0);k.TimePosition=k.Length;task.wait()
+assert(not k.IsPlaying);task.wait(.1);assert(k.WeightCurrent<.8,tostring(k.WeightCurrent))
+task.wait(.3);assert(#animator:GetPlayingAnimationTracks()==0)
 print('animation-semantics-pass')
 "#);
     }
@@ -481,6 +602,7 @@ print('animation-semantics-pass')
                 .with_name("Z")
                 .with_property("ValuesAndTimes", wire(1, [0., 2.], [0., 0.])),
         );
+        laser_tag_v1_clip(&mut d, ws);
         let parent = d
             .find_child(d.dom.root_ref(), "ServerScriptService")
             .unwrap();

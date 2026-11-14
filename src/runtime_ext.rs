@@ -440,6 +440,8 @@ pub const LUA_METHODS: &[(&str, &str)] = &[
     ("IsUserFeatureEnabled", "UserSettings"),
     ("GetService", "UserSettings"),
     ("FindService", "UserSettings"),
+    ("GetService", "GlobalSettings"),
+    ("FindService", "GlobalSettings"),
     ("GetSharedTable", "SharedTableRegistry"),
     ("SetSharedTable", "SharedTableRegistry"),
     ("GetProductInfo", "MarketplaceService"),
@@ -936,6 +938,11 @@ struct QPart {
     /// query_shapes::BOX / BALL / CYLINDER / WEDGE / CORNER_WEDGE: rays,
     /// sweeps and GetPartsInPart test the true shape.
     shape: u8,
+    /// Studio's stored collision pieces (physics_mesh registry id, 0 none):
+    /// rays and sweeps test these instead of the mesh or the box.
+    cvx: u32,
+    /// InitialSize, the space the pieces are stored in.
+    initial: Vec3,
 }
 
 /// CollectionService's tag → instances, kept up to date from the change
@@ -1277,12 +1284,33 @@ fn qpart(d: &Document, r: Ref) -> Option<QPart> {
     }
     let xf = crate::scene::xform_of(d, r)?;
     let size = crate::scene::vec3_of(d.prop(r, "Size")).unwrap_or(Vec3::ONE);
-    let xf = geometry_box(d, r, &class, xf, size);
     let collide = !matches!(d.prop(r, "CanCollide"), Some(Variant::Bool(false)));
     let query = !matches!(d.prop(r, "CanQuery"), Some(Variant::Bool(false)));
+    let mesh_class = class == "MeshPart" || doc::is_a(&class, "PartOperation");
+    // Studio's own collision pieces (PhysicalConfigData), which also say the
+    // CollisionFidelity: the file has no such property for these classes.
+    let geo = if mesh_class {
+        crate::physics_mesh::of_part_id(d, r)
+    } else {
+        None
+    };
+    let fidelity = if mesh_class {
+        crate::physics_mesh::fidelity(d, r)
+    } else {
+        None
+    };
+    let cvx = match &geo {
+        Some((crate::physics_mesh::Geometry::Pieces(_), id)) if fidelity != Some(crate::physics_mesh::FIDELITY_BOX) => *id,
+        _ => 0,
+    };
+    let initial = crate::scene::vec3_of(d.prop(r, "InitialSize"))
+        .or_else(|| crate::scene::vec3_of(d.prop(r, "MeshSize")))
+        .filter(|v| v.max_element() > 0.0)
+        .unwrap_or(size);
+    // The pieces sit around the part's CFrame; otherwise the drawn mesh's box.
+    let xf = if cvx != 0 { xf } else { geometry_box(d, r, &class, xf, size) };
     // CollisionFidelity: Default 0, Hull 1, Box 2, PreciseConvexDecomposition 3.
-    let mesh = (class == "MeshPart" || doc::is_a(&class, "PartOperation"))
-        && crate::scene::enum_u32(d.prop(r, "CollisionFidelity")) != Some(2);
+    let mesh = mesh_class && cvx == 0 && fidelity != Some(crate::physics_mesh::FIDELITY_BOX);
     let shape = crate::query_shapes::kind_of(d, r, &class);
     Some(QPart {
         r,
@@ -1292,6 +1320,8 @@ fn qpart(d: &Document, r: Ref) -> Option<QPart> {
         query,
         mesh,
         shape,
+        cvx,
+        initial,
     })
 }
 
@@ -1558,6 +1588,59 @@ fn cast_swept(
     grow: Vec3,
     probe: Option<(u8, Vec3, glam::Mat3)>,
 ) -> mlua::Result<Option<(Ref, Vec3, Vec3, f32)>> {
+    let hit = cast_swept_once(lua, origin, dir, filter, grow, probe)?;
+    match hit {
+        Some(h) if !queryable(lua, h.0)? => {
+            // The cache held a part that is destroyed or out of the
+            // Workspace: rebuilt from the tree, then cast again (a query
+            // never returns one, as in Studio).
+            stale_query_part(lua, h.0, "cast");
+            let again = cast_swept_once(lua, origin, dir, filter, grow, probe)?;
+            Ok(match again {
+                Some(h) if !queryable(lua, h.0)? => None,
+                other => other,
+            })
+        }
+        other => Ok(other),
+    }
+}
+
+/// Whether `r` may come back from a world query: in the tree, under the
+/// Workspace (Terrain included).
+fn queryable(lua: &Lua, r: Ref) -> mlua::Result<bool> {
+    let w = world(lua)?;
+    let d = w.d();
+    Ok(d.workspace().is_some_and(|ws| d.dom.get_by_ref(r).is_some() && d.is_ancestor(ws, r)))
+}
+
+/// A query met a cached part that is no longer queryable (the change
+/// journal missed its removal): the cache is rebuilt on the next query, and
+/// the first few are reported with what is known of the part.
+fn stale_query_part(lua: &Lua, r: Ref, query: &str) {
+    if let Some(mut c) = lua.app_data_mut::<QueryCache>() {
+        c.doc_id = 0;
+    }
+    static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        let what = world(lua)
+            .ok()
+            .map(|w| match w.d().dom.get_by_ref(r) {
+                Some(i) => format!("{} {:?} (not under Workspace: {})", i.class, i.name, w.full_name(r)),
+                None => "destroyed".to_string(),
+            })
+            .unwrap_or_default();
+        eprintln!("[query] {query}: stale part {r:?} in the query cache, {what}; rebuilt");
+    }
+}
+
+fn cast_swept_once(
+    lua: &Lua,
+    origin: Vec3,
+    dir: Vec3,
+    filter: &Filter,
+    grow: Vec3,
+    probe: Option<(u8, Vec3, glam::Mat3)>,
+) -> mlua::Result<Option<(Ref, Vec3, Vec3, f32)>> {
     let swept = grow != Vec3::ZERO;
     let len = dir.length();
     if len < 1e-6 {
@@ -1572,15 +1655,55 @@ fn cast_swept(
     type Best = Option<(f32, QPart, Option<Vec3>, Option<Vec3>)>;
     let mut best: Best = None;
     let test = |p: &QPart, d: &Document, best: &mut Best| {
-        if !p.query || (filter.respect_collide && !p.collide) {
+        // CanQuery only counts once CanCollide is off: Studio still hits a
+        // CanCollide part whose CanQuery is false (Laser Tag's containment
+        // walls and spawn forcefields).
+        if (!p.query && !p.collide) || (filter.respect_collide && !p.collide) {
             return;
         }
         // Boxes: entered from outside (a ray starting inside a part doesn't
         // hit it). MeshParts: their mesh's triangles, when the mesh is here.
         let mut normal: Option<Vec3> = None;
         let mut touch: Option<Vec3> = None;
-        let t = if swept {
-            let Some(t) = ray.enter_obb(&p.xf, p.size + grow * 2.0) else {
+        let t = if p.cvx != 0 {
+            // Studio's collision pieces: the grown box only narrows down (a
+            // probe may start inside the box yet outside every piece).
+            if ray.hit_obb(&p.xf, p.size + grow * 2.0).is_none_or(|t| best.is_some_and(|(bt, ..)| t >= bt)) {
+                return;
+            }
+            let scale = crate::physics_mesh::scale(p.initial, p.size);
+            if swept {
+                let Some((kind, size, rot)) = probe else { return };
+                let Some(shapes) = crate::physics_mesh::shapes(p.cvx, scale, p.size) else { return };
+                let start = crate::math::Xform { pos: ray.origin, rot };
+                let Some((t, at, n)) =
+                    crate::query_shapes::sweep_pieces(
+                        &start,
+                        size,
+                        kind,
+                        ray.dir,
+                        len,
+                        &p.xf,
+                        &shapes,
+                    )
+                else {
+                    return;
+                };
+                normal = Some(n);
+                touch = Some(at);
+                t
+            } else {
+                let Some(pieces) = crate::physics_mesh::pieces(p.cvx) else { return };
+                let Some((t, n)) = crate::physics_mesh::ray(&pieces, &p.xf, scale, ray.origin, ray.dir, len) else {
+                    return;
+                };
+                normal = Some(n);
+                t
+            }
+        } else if swept {
+            // Exact shapes below: only a box the probe starts inside is out
+            // (sweep_part then reports the start overlap).
+            let Some(t) = (if probe.is_some() { ray.hit_obb(&p.xf, p.size + grow * 2.0) } else { ray.enter_obb(&p.xf, p.size + grow * 2.0) }) else {
                 return;
             };
             match probe {
@@ -1651,9 +1774,15 @@ fn cast_swept(
                 }
             }
         } else {
+            // A ray that only touches an edge or corner (no length inside)
+            // misses the box, as in Studio (a diagonal ray through a wall's
+            // corner edge passes it).
             let Some(t) = ray.enter_obb(&p.xf, p.size) else {
                 return;
             };
+            if ray_box_chord(&ray, &p.xf, p.size) <= 1e-4 {
+                return;
+            }
             t
         };
         if t < 0.0 || t > len || best.is_some_and(|(bt, ..)| t >= bt) {
@@ -1738,18 +1867,29 @@ fn cast_swept(
         if let Some(n) = shape_normal {
             return (p.r, touch.unwrap_or(point), n, t);
         }
-        // Normal of the box face that was hit (of the grown box for a sweep).
-        let local = p.xf.rot.transpose() * (point - p.xf.pos);
-        let rel = local / ((p.size + grow * 2.0) * 0.5).max(Vec3::splat(1e-4));
-        let a = rel.abs();
-        let n = if a.x >= a.y && a.x >= a.z {
-            Vec3::X * rel.x.signum()
-        } else if a.y >= a.z {
-            Vec3::Y * rel.y.signum()
-        } else {
-            Vec3::Z * rel.z.signum()
-        };
-        let n = p.xf.rot * n;
+        // Normal of the box face the ray enters through (of the grown box for
+        // a sweep): the slab entered last; through an edge or corner, the
+        // faces entered there together, summed (Studio: a ray into a corner
+        // gets (-1, -1, 1) / √3). A face along the ray isn't entered (from
+        // x = -150 along +Z into a wall whose side is at x = -150: its front
+        // face, (0, 0, -1)).
+        let inv = p.xf.rot.transpose();
+        let (lo, ld) = (inv * (ray.origin - p.xf.pos), inv * ray.dir);
+        let half = ((p.size + grow * 2.0) * 0.5).max(Vec3::splat(1e-4));
+        let mut slabs = [f32::NEG_INFINITY; 3];
+        for k in 0..3 {
+            if ld[k].abs() >= 1e-8 {
+                slabs[k] = ((-half[k] - lo[k]) / ld[k]).min((half[k] - lo[k]) / ld[k]);
+            }
+        }
+        let enter = slabs[0].max(slabs[1]).max(slabs[2]);
+        let mut n = Vec3::ZERO;
+        for k in 0..3 {
+            if slabs[k].is_finite() && (enter - slabs[k]) * ld[k].abs() <= 1e-4 {
+                n[k] = -ld[k].signum();
+            }
+        }
+        let n = p.xf.rot * if n == Vec3::ZERO { -ld } else { n }.normalize_or_zero();
         // A sweep reports where the shape touches the part: back from the
         // centre by the shape's extent along the normal.
         let touch = if swept {
@@ -1759,6 +1899,26 @@ fn cast_swept(
         };
         (p.r, touch, n, t)
     }))
+}
+
+/// How long a ray stays inside a box (0 when it misses or only touches it).
+fn ray_box_chord(ray: &crate::math::Ray, xf: &Xform, size: Vec3) -> f32 {
+    let inv = xf.rot.transpose();
+    let (o, d) = (inv * (ray.origin - xf.pos), inv * ray.dir);
+    let h = size * 0.5;
+    let (mut a, mut b) = (f32::NEG_INFINITY, f32::INFINITY);
+    for k in 0..3 {
+        if d[k].abs() < 1e-8 {
+            if o[k] < -h[k] || o[k] > h[k] {
+                return 0.0;
+            }
+        } else {
+            let (t1, t2) = ((-h[k] - o[k]) / d[k], (h[k] - o[k]) / d[k]);
+            a = a.max(t1.min(t2));
+            b = b.min(t1.max(t2));
+        }
+    }
+    (b - a).max(0.0)
 }
 
 /// Parts a query has to look at: with an include list just the parts in it.
@@ -1829,6 +1989,34 @@ fn overlap(
     filter: &Filter,
     max: usize,
 ) -> mlua::Result<Vec<Ref>> {
+    let out = overlap_once(lua, lo, hi, sphere, filter, max)?;
+    let mut stale = None;
+    for r in &out {
+        if !queryable(lua, *r)? {
+            stale = Some(*r);
+            break;
+        }
+    }
+    let Some(r) = stale else { return Ok(out) };
+    stale_query_part(lua, r, "overlap");
+    let out = overlap_once(lua, lo, hi, sphere, filter, max)?;
+    let mut keep = Vec::with_capacity(out.len());
+    for r in out {
+        if queryable(lua, r)? {
+            keep.push(r);
+        }
+    }
+    Ok(keep)
+}
+
+fn overlap_once(
+    lua: &Lua,
+    lo: Vec3,
+    hi: Vec3,
+    sphere: Option<(Vec3, f32)>,
+    filter: &Filter,
+    max: usize,
+) -> mlua::Result<Vec<Ref>> {
     query_parts(lua)?;
     let parts = match near_parts(lua, lo, hi)? {
         Some(list) => std::rc::Rc::new(list),
@@ -1838,7 +2026,7 @@ fn overlap(
     let d = w.d();
     let mut out = Vec::new();
     for p in parts.iter() {
-        if !p.query {
+        if !p.query && !p.collide {
             continue;
         }
         let (plo, phi) = part_aabb(p);
@@ -2436,6 +2624,8 @@ fn model_bounds(lua: &Lua, r: Ref) -> mlua::Result<(Vec3, Vec3)> {
             query: true,
             mesh: false,
             shape: 0,
+            cvx: 0,
+            initial: Vec3::ONE,
         });
         lo = lo.min(a);
         hi = hi.max(b);
@@ -2731,7 +2921,7 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
         // frame was 2.5 ms in Place E (6 800 listened, 2 250 of
         // them hidden GUI objects, each a walk up to its ScreenGui).
         let layout_props = LAYOUT_PROPS.get_or_init(|| {
-            ["Size", "Position", "AnchorPoint", "IgnoreGuiInset", "CanvasSize"].map(rbx_dom_weak::ustr)
+            ["Size", "Position", "AnchorPoint", "IgnoreGuiInset", "ScreenInsets", "CanvasSize"].map(rbx_dom_weak::ustr)
         });
         let mut check: Vec<Ref> = Vec::new();
         match w.dm().marks_for(doc::Reader::Layout) {
@@ -2818,7 +3008,7 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
-static LAYOUT_PROPS: std::sync::OnceLock<[rbx_dom_weak::Ustr; 5]> = std::sync::OnceLock::new();
+static LAYOUT_PROPS: std::sync::OnceLock<[rbx_dom_weak::Ustr; 6]> = std::sync::OnceLock::new();
 
 fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
     let d = w.d();
@@ -2835,7 +3025,7 @@ fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
         // ignores it), a SurfaceGui its CanvasSize.
         let inset = mech::GUI_TOP_INSET;
         return match i.class.as_str() {
-            "ScreenGui" if matches!(d.prop(r, "IgnoreGuiInset"), Some(Variant::Bool(true))) => {
+            "ScreenGui" if matches!(crate::scene::enum_u32(d.prop(r, "ScreenInsets")), Some(0 | 1)) => {
                 ([0.0, -inset], screen)
             }
             "ScreenGui" => ([0.0, 0.0], [screen[0], screen[1] - inset]),
@@ -2846,7 +3036,24 @@ fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
             _ => ([0.0, 0.0], screen),
         };
     }
-    let (ppos, psize) = gui_rect(w, i.parent(), depth + 1);
+    let (mut ppos, mut psize) = gui_rect(w, i.parent(), depth + 1);
+    // Children sit inside the parent's UIPadding (a ScreenGui's too).
+    let pad = d.dom.get_by_ref(i.parent()).and_then(|p| {
+        p.children().iter().copied().find(|c| d.class_of(*c).is_some_and(|k| k == "UIPadding"))
+    });
+    if let Some(pad) = pad {
+        let u = |name: &str| match d.prop(pad, name) {
+            Some(Variant::UDim(u)) => [u.scale, u.offset as f32],
+            _ => [0.0, 0.0],
+        };
+        let (l, rr, t, b) = (u("PaddingLeft"), u("PaddingRight"), u("PaddingTop"), u("PaddingBottom"));
+        let (left, top) = (l[0] * psize[0] + l[1], t[0] * psize[1] + t[1]);
+        ppos = [ppos[0] + left, ppos[1] + top];
+        psize = [
+            psize[0] - left - rr[0] * psize[0] - rr[1],
+            psize[1] - top - b[0] * psize[1] - b[1],
+        ];
+    }
     let udim2 = |name: &str| match d.prop(r, name) {
         Some(Variant::UDim2(u)) => [u.x.scale, u.x.offset as f32, u.y.scale, u.y.offset as f32],
         _ => [0.0; 4],
@@ -3951,6 +4158,8 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 query: true,
                 mesh: false,
                 shape: 0,
+                cvx: 0,
+                initial: Vec3::ONE,
             });
             let mut filter = match arg(args, 2) {
                 Value::Nil => Filter::none(),
@@ -4000,18 +4209,24 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0),
         )),
-        "GetRealPhysicsFPS" => one(Value::Number(mech::PHYSICS_HZ as f64)),
+        "GetRealPhysicsFPS" => one(Value::Number(crate::physics::step_rate().0 as f64)),
         "MoveTo" => {
             let target = vec3_arg(args, 1, "MoveTo")?;
             world(lua)?.requests.move_to.push((this, target));
             none()
         }
+        // Studio 0.744 (Studio, client script): the tool is in the character
+        // as EquipTool returns and back in the Backpack as UnequipTools
+        // returns; Equipped / Unequipped fire after. The play session does
+        // the rest (grip, server copy, events) from the request.
         "EquipTool" => {
             let tool = opt_inst(&arg(args, 1)).ok_or_else(|| rt_err("EquipTool: Tool expected"))?;
+            equip_now(lua, this, Some(tool))?;
             world(lua)?.requests.equip.push((this, Some(tool)));
             none()
         }
         "UnequipTools" => {
+            equip_now(lua, this, None)?;
             world(lua)?.requests.equip.push((this, None));
             none()
         }
@@ -4481,8 +4696,13 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                             i.properties.insert(ustr(k), col(v));
                         }
                         let sc = look.scales;
-                        for (k, v) in [("HeightScale", sc.height), ("WidthScale", sc.width), ("DepthScale", sc.depth), ("HeadScale", sc.head)] {
+                        for (k, v) in [("HeightScale", sc.height), ("WidthScale", sc.width), ("DepthScale", sc.depth), ("HeadScale", sc.head),
+                            ("BodyTypeScale", sc.body_type), ("ProportionScale", sc.proportion)] {
                             i.properties.insert(ustr(k), Variant::Float32(v));
+                        }
+                        // Worn animation packages (IdleAnimation … MoodAnimation).
+                        for (kind, id, _) in &look.animations {
+                            i.properties.insert(ustr(kind), Variant::Int64(*id as i64));
                         }
                     }
                     w.avatar_descs.insert(r);
@@ -4536,6 +4756,16 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                         width: scale("WidthScale"),
                         depth: scale("DepthScale"),
                         head: scale("HeadScale"),
+                        body_type: match desc.and_then(|r| d.prop(r, "BodyTypeScale")) {
+                            Some(Variant::Float32(v)) => v,
+                            Some(Variant::Float64(v)) => v as f32,
+                            _ => crate::rig::Scales::default().body_type,
+                        },
+                        proportion: match desc.and_then(|r| d.prop(r, "ProportionScale")) {
+                            Some(Variant::Float32(v)) => v,
+                            Some(Variant::Float64(v)) => v as f32,
+                            _ => crate::rig::Scales::default().proportion,
+                        },
                     },
                 )
             };
@@ -4654,6 +4884,185 @@ mod tests {
             _ => crate::terrain::Voxels::empty(),
         };
         (w.output.into_iter().map(|(_, t)| t).collect(), v)
+    }
+
+    /// Queries never return a removed part (Laser Tag: castRays indexed
+    /// `result.Instance.Parent` and hit "an Instance that no longer exists"):
+    /// removed in the same frame by every route, and even a removal the
+    /// change journal never saw (freed or moved out of the Workspace behind
+    /// its back) is not returned by rays, sweeps or overlap queries.
+    #[test]
+    fn queries_never_return_removed_parts() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        for (r, _) in d.dom.get_by_ref(ws).unwrap().children().to_vec().into_iter().zip(0..) {
+            if d.class_of(r).is_some_and(|c| c != "Camera") {
+                d.dom.destroy(r);
+            }
+        }
+        let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        let first = r#"
+local function f(r) return r and r.Instance:GetFullName() or "nil" end
+local function wall(name, x)
+    local m = Instance.new("Model") m.Name = name
+    local p = Instance.new("Part") p.Name = "P" p.Anchored = true p.Size = Vector3.new(4, 4, 1)
+    p.CFrame = CFrame.new(x, 0, -5) p.Parent = m
+    m.Parent = workspace
+    return m, p
+end
+local function cast(x)
+    return f(workspace:Raycast(Vector3.new(x, 0, 0), Vector3.new(0, 0, -20))),
+        f(workspace:Spherecast(Vector3.new(x, 0, 0), 0.4, Vector3.new(0, 0, -20))),
+        f(workspace:Blockcast(CFrame.new(x, 0, 0), Vector3.one, Vector3.new(0, 0, -20))),
+        #workspace:GetPartBoundsInRadius(Vector3.new(x, 0, -5), 1)
+end
+-- Every removal route, cast in the same frame.
+local routes = {
+    destroy = function(m, p) m:Destroy() end,
+    parentNil = function(m, p) m.Parent = nil end,
+    partNil = function(m, p) p.Parent = nil end,
+    clear = function(m, p) m:ClearAllChildren() end,
+    away = function(m, p) m.Parent = game:GetService("ReplicatedStorage") end,
+}
+local x = 0
+for name, remove in routes do
+    x += 10
+    local m, p = wall(name, x)
+    print("before", name, cast(x))
+    remove(m, p)
+    print("after", name, cast(x))
+end
+-- Two walls the journal won't hear about (the test removes them in Rust).
+local _, g = wall("Ghost", 100)
+local _, a = wall("Away", 110)
+print("cached", cast(100), cast(110))
+"#;
+        let second = r#"
+local function f(r) return r and r.Instance:GetFullName() or "nil" end
+print("ghost", f(workspace:Raycast(Vector3.new(100, 0, 0), Vector3.new(0, 0, -20))),
+    f(workspace:Spherecast(Vector3.new(100, 0, 0), 0.4, Vector3.new(0, 0, -20))),
+    #workspace:GetPartBoundsInRadius(Vector3.new(100, 0, -5), 1))
+print("away", f(workspace:Raycast(Vector3.new(110, 0, 0), Vector3.new(0, 0, -20))),
+    #workspace:GetPartBoundsInRadius(Vector3.new(110, 0, -5), 1))
+"#;
+        let s1 = d.dom.insert(sss, InstanceBuilder::new("Script").with_name("A").with_property("Source", first.to_string()));
+        let s2 = d.dom.insert(sss, InstanceBuilder::new("Script").with_name("B").with_property("Source", second.to_string()));
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.run_script(s1);
+        rt.step(1.0 / 60.0);
+        let found = {
+            // Behind the journal's back: no mark_tree.
+            let mut w = rt.world_mut().unwrap();
+            let doc = w.dm();
+            let ws = doc.workspace().unwrap();
+            let rs = doc.find_child(doc.dom.root_ref(), "ReplicatedStorage").unwrap();
+            let named = |n: &str| {
+                doc.dom.get_by_ref(ws)?.children().iter().copied().find(|c| doc.dom.get_by_ref(*c).is_some_and(|i| i.name == n))
+            };
+            match (named("Ghost"), named("Away")) {
+                (Some(ghost), Some(away)) => {
+                    doc.dom.destroy(ghost);
+                    doc.dom.transfer_within(away, rs);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !found {
+            panic!("{:?}", rt.leave().output);
+        }
+        rt.run_script(s2);
+        rt.step(1.0 / 60.0);
+        let out: Vec<String> = rt.leave().output.into_iter().map(|(_, t)| t.split("  —").next().unwrap_or("").trim().to_string()).collect();
+        let text = out.join("\n");
+        for name in ["destroy", "parentNil", "partNil", "clear", "away"] {
+            let full = format!("Workspace.{name}.P");
+            assert!(out.iter().any(|l| *l == format!("before {name} {full} {full} {full} 1")), "{name}: {text}");
+            assert!(out.iter().any(|l| *l == format!("after {name} nil nil nil 0")), "{name}: {text}");
+        }
+        assert!(out.iter().any(|l| l.starts_with("cached Workspace.Ghost.P")), "{text}");
+        assert!(out.iter().any(|l| *l == "ghost nil nil 0"), "{text}");
+        assert!(out.iter().any(|l| *l == "away nil 0"), "{text}");
+    }
+
+    /// Laser Tag's blaster parity (checks/laser-tag-parity/raycast): a
+    /// CanCollide part is queried whatever its CanQuery (the spawn-door
+    /// forcefields, the invisible containment walls); a MeshPart is queried
+    /// by its stored collision pieces (PhysicalConfigData) — rays at the
+    /// pieces, sweeps at the pieces pulled in 0.05 — and a Box one by its box.
+    #[test]
+    fn queries_canquery_rule_and_collision_pieces() {
+        use rbx_dom_weak::types::{CFrame, Matrix3, SharedString, Vector3 as V3};
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let at = |x: f32| CFrame::new(V3::new(x, 0.0, 0.0), Matrix3::identity());
+        let part = |name: &str, x: f32, cc: bool, cq: bool| {
+            InstanceBuilder::new("Part")
+                .with_name(name)
+                .with_property("CFrame", at(x))
+                .with_property("Size", V3::new(2.0, 2.0, 2.0))
+                .with_property("Anchored", true)
+                .with_property("CanCollide", cc)
+                .with_property("CanQuery", cq)
+        };
+        d.dom.insert(ws, part("CollideNoQuery", 0.0, true, false));
+        d.dom.insert(ws, part("Ghost", 10.0, false, false));
+        let mesh = |name: &str, x: f32, blob: Vec<u8>| {
+            InstanceBuilder::new("MeshPart")
+                .with_name(name)
+                .with_property("CFrame", at(x))
+                .with_property("Size", V3::new(4.0, 2.0, 2.0))
+                .with_property("InitialSize", V3::new(2.0, 2.0, 2.0))
+                .with_property("Anchored", true)
+                .with_property("PhysicalConfigData", SharedString::new(blob))
+        };
+        d.dom.insert(ws, mesh("Hull", 20.0, crate::physics_mesh::tests::cube_blob()));
+        d.dom.insert(ws, mesh("BoxFidelity", 30.0, b"CSGPHS\0\0\0\0BLOCK".to_vec()));
+        let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        let src = r#"
+local function f(r) return r and string.format("%s %.3f %.2f,%.2f,%.2f", r.Instance.Name, r.Distance, r.Normal.X, r.Normal.Y, r.Normal.Z) or "nil" end
+for _, x in {0, 10, 20, 30} do
+    print("ray", x, f(workspace:Raycast(Vector3.new(x, 10, 0), Vector3.new(0, -20, 0))))
+    print("sphere", x, f(workspace:Spherecast(Vector3.new(x, 10, 0), 0.5, Vector3.new(0, -20, 0))))
+end
+-- Into the hull's side: its 4-stud width (scaled from InitialSize 2): x = 22,
+-- the sweep meets x = 22 - 0.05.
+print("side", f(workspace:Raycast(Vector3.new(25, 0, 0), Vector3.new(-20, 0, 0))))
+print("sideS", f(workspace:Spherecast(Vector3.new(26, 0, 0), 0.5, Vector3.new(-20, 0, 0))))
+-- From inside the hull: the whole part is skipped.
+print("inside", f(workspace:Raycast(Vector3.new(20, 0, 0), Vector3.new(0, 20, 0))))
+-- Touching only an edge of a box misses it; a ray into a corner gets the faces summed.
+print("edge", f(workspace:Raycast(Vector3.new(3, 0, -1), Vector3.new(-1, 0, 1) * 10)))
+print("corner", f(workspace:Raycast(Vector3.new(-3, 3, 3), Vector3.new(1, -1, -1) * 10)))
+"#;
+        let s = d.dom.insert(sss, InstanceBuilder::new("Script").with_name("T").with_property("Source", src.to_string()));
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        rt.step(1.0 / 60.0);
+        let out: Vec<String> = rt.leave().output.into_iter().map(|(_, t)| t).collect();
+        let text = out.join("\n");
+        for want in [
+            "ray 0 CollideNoQuery 9.000 0.00,1.00,0.00",
+            "sphere 0 CollideNoQuery 8.500",
+            // Through the CanCollide = CanQuery = false part to the baseplate.
+            "ray 10 Baseplate 10.000",
+            "sphere 10 Baseplate 9.500",
+            "ray 20 Hull 9.000 0.00,1.00,0.00",
+            "sphere 20 Hull 8.550",
+            "ray 30 BoxFidelity 9.000",
+            "sphere 30 BoxFidelity 8.500",
+            "side Hull 3.000 1.00,0.00,0.00",
+            "sideS Hull 3.550 1.00,0.00,0.00",
+            "inside nil",
+            "edge nil",
+            "corner CollideNoQuery 3.464 -0.58,0.58,0.58",
+        ] {
+            assert!(out.iter().any(|l| l.starts_with(want)), "{want} not in\n{text}");
+        }
     }
 
     /// Round 25: CopyRegion / PasteRegion, ReadVoxelChannels /
@@ -4968,4 +5377,49 @@ end
             println!("{t}");
         }
     }
+}
+
+/// Humanoid:EquipTool / UnequipTools in this DataModel at once: tools held
+/// by the humanoid's character go to its player's Backpack (or where the
+/// new tool came from), then `tool`, if any, into the character.
+fn equip_now(lua: &Lua, humanoid: Ref, tool: Option<Ref>) -> mlua::Result<()> {
+    let (model, held, backpack) = {
+        let w = world(lua)?;
+        let d = w.d();
+        let Some(model) = d.dom.get_by_ref(humanoid).map(|h| h.parent()).filter(|m| m.is_some()) else {
+            return Ok(());
+        };
+        if let Some(t) = tool {
+            let ok = d.dom.get_by_ref(t).is_some_and(|i| crate::doc::is_a(&i.class, "BackpackItem"));
+            if !ok || d.dom.get_by_ref(t).map(|i| i.parent()) == Some(model) {
+                return Ok(());
+            }
+        }
+        let held: Vec<Ref> = d
+            .dom
+            .get_by_ref(model)
+            .map(|m| m.children().to_vec())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| d.dom.get_by_ref(*c).is_some_and(|i| crate::doc::is_a(&i.class, "Tool")))
+            .collect();
+        // The player whose Character this is, and its Backpack.
+        let players = d.dom.root().children().iter().copied().find(|c| d.dom.get_by_ref(*c).is_some_and(|i| i.class == "Players"));
+        let player = players.and_then(|ps| {
+            d.dom.get_by_ref(ps)?.children().iter().copied().find(|p| matches!(d.prop(*p, "Character"), Some(Variant::Ref(m)) if m == model))
+        });
+        let backpack = player
+            .and_then(|p| d.dom.get_by_ref(p)?.children().iter().copied().find(|c| d.dom.get_by_ref(*c).is_some_and(|i| i.class == "Backpack")))
+            .or_else(|| tool.and_then(|t| d.dom.get_by_ref(t).map(|i| i.parent())).filter(|p| p.is_some()));
+        (model, held, backpack)
+    };
+    if let Some(bp) = backpack {
+        for t in held {
+            set_parent(lua, t, bp)?;
+        }
+    }
+    if let Some(t) = tool {
+        set_parent(lua, t, model)?;
+    }
+    Ok(())
 }

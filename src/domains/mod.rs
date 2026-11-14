@@ -176,6 +176,12 @@ const ANY_KEY: &[(&str, &str)] = &[
     // ugs() / stats_prop
     ("services", "UserGameSettings"),
     ("services", "Stats"),
+    // settings()' items: studio_settings' store answers the dialog's members
+    ("services", "Studio"),
+    ("services", "DebugSettings"),
+    ("services", "NetworkSettings"),
+    ("services", "PhysicsSettings"),
+    ("services", "RenderSettings"),
     // __rs_pc_get
     ("players_chat", "TextChatMessage"),
     // loaded / imported metadata
@@ -239,6 +245,12 @@ const NEWINDEX_ANY: &[(&str, &str)] = &[
     ("data", "Config*"),
     // ugs(); LightingChanged on any Lighting write
     ("services", "UserGameSettings"),
+    // settings()' items: studio_settings' store answers the dialog's members
+    ("services", "Studio"),
+    ("services", "DebugSettings"),
+    ("services", "NetworkSettings"),
+    ("services", "PhysicsSettings"),
+    ("services", "RenderSettings"),
     ("services", "Lighting"),
     // __rs_pc_set
     ("players_chat", "TextChatMessage"),

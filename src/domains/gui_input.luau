@@ -1662,12 +1662,12 @@ local function binding_value(a, b)
     elseif t == Enum.InputActionType.Direction2D then
         local v = Vector2.new((h(b.Right) and 1 or 0) - (h(b.Left) and 1 or 0), (h(b.Up) and 1 or 0) - (h(b.Down) and 1 or 0))
         if b.ClampMagnitudeToOne and v.Magnitude > 1 then v = v.Unit end
-        return v * b.Vector2Scale
+        return v * b.Vector2Scale * s
     elseif t == Enum.InputActionType.Direction3D then
         local v = Vector3.new((h(b.Right) and 1 or 0) - (h(b.Left) and 1 or 0), (h(b.Up) and 1 or 0) - (h(b.Down) and 1 or 0),
             (h(b.Backward) and 1 or 0) - (h(b.Forward) and 1 or 0))
         if b.ClampMagnitudeToOne and v.Magnitude > 1 then v = v.Unit end
-        return v * b.Vector3Scale
+        return v * b.Vector3Scale * s
     end
     return nil
 end
@@ -1678,6 +1678,9 @@ local function binding_uses(b, key)
     end
     return false
 end
+-- This frame's analog input per action (mouse motion, wheel): added to
+-- what its held keys give.
+local analog = setmetatable({}, { __mode = "k" })
 -- Runs the input action system for one key / button; true when a Sink
 -- context took it.
 local function actions_input(key, down)
@@ -1705,13 +1708,70 @@ local function actions_input(key, down)
                 end
                 if uses then
                     took = true
-                    if value ~= nil then set_state(a, value) end
+                    if value ~= nil then
+                        if analog[a] ~= nil and a.Type ~= Enum.InputActionType.Bool then value += analog[a] end
+                        set_state(a, value)
+                    end
                 end
             end
         end
         if took and ctx.Sink then return true end
     end
     return false
+end
+-- What an action's held keys give (every non-scriptable binding summed).
+local function keys_value(a)
+    local value = zero_of(a.Type)
+    if a.Type == Enum.InputActionType.Bool or a.Type == Enum.InputActionType.ViewportPosition then return value end
+    for _, b in a:GetChildren() do
+        if b:IsA("InputBinding") and b.Type ~= Enum.InputBindingType.Scriptable then
+            local v = binding_value(a, b)
+            if v ~= nil then value += v end
+        end
+    end
+    return value
+end
+-- The analog key codes (measured in Studio 0.747 with a real mouse,
+-- checks/humanoid-physics/feel/traces/studio-ias.log): a binding on
+-- MouseDelta gives its action, for the frame the mouse moved in, the raw
+-- motion in pixels × Scale × Vector2Scale ÷ that frame's dt (a rate: the
+-- PlayerModule multiplies by dt again), and only while the mouse is locked
+-- (the motion UserInputService:GetMouseDelta reports); MouseWheel gives
+-- 0.5 a notch × Scale ÷ dt; the next frame the action is back at what its
+-- keys hold. MousePosition gives a ViewportPosition action the pointer.
+local frame_dt = 1 / 60
+local function analog_input(kind, x, y)
+    local key = Enum.KeyCode[kind]
+    for c in tracked.InputContext do
+        if c.Enabled and c:IsDescendantOf(game) then
+            for _, a in c:GetChildren() do
+                if a:IsA("InputAction") and a.Enabled then
+                    for _, b in a:GetChildren() do
+                        if b:IsA("InputBinding") and b.Type ~= Enum.InputBindingType.Scriptable and b.KeyCode == key then
+                            local t = a.Type
+                            if kind == "MousePosition" then
+                                if t == Enum.InputActionType.ViewportPosition then set_state(a, Vector2.new(x, y)) end
+                            elseif t == Enum.InputActionType.Direction2D then
+                                analog[a] = (analog[a] or Vector2.zero) + Vector2.new(x, y) * b.Vector2Scale * b.Scale / frame_dt
+                                set_state(a, keys_value(a) + analog[a])
+                            elseif t == Enum.InputActionType.Direction1D then
+                                analog[a] = (analog[a] or 0) + x * b.Scale / frame_dt
+                                set_state(a, keys_value(a) + analog[a])
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+-- A new frame of input: last frame's analog input is over.
+local function analog_frame(dt)
+    if type(dt) == "number" and dt > 0 then frame_dt = dt end
+    for a in analog do
+        analog[a] = nil
+        if a.Parent ~= nil then set_state(a, keys_value(a)) end
+    end
 end
 local mouse_keys = { MouseButton1 = "MouseLeftButton", MouseButton2 = "MouseRightButton", MouseButton3 = "MouseMiddleButton" }
 
@@ -1720,7 +1780,7 @@ local mouse_keys = { MouseButton1 = "MouseLeftButton", MouseButton2 = "MouseRigh
 -- WheelForward / WheelBackward and Idle; UserInputService.JumpRequest.
 local mouse_moved = false
 local prompt_key
-local function on_input(state, uit, key, x, y, z, gpe)
+local function on_input(state, uit, key, x, y, z, gpe, dx, dy)
     local mouse = G.mouse()
     if uit == "Keyboard" then
         local kc = Enum.KeyCode[key]
@@ -1748,8 +1808,14 @@ local function on_input(state, uit, key, x, y, z, gpe)
     elseif uit == "MouseMovement" then
         mouse_moved = true
         if mouse then fire(mouse, "Move") end
+        if not gpe then
+            analog_input("MousePosition", x, y)
+            if (dx or 0) ~= 0 or (dy or 0) ~= 0 then analog_input("MouseDelta", dx, dy) end
+        end
     elseif uit == "MouseWheel" then
         if mouse then fire(mouse, (z or 0) > 0 and "WheelForward" or "WheelBackward") end
+        -- (z is already the engine's 0.5 a notch: mech WHEEL_INPUT_PER_NOTCH.)
+        if not gpe and (z or 0) ~= 0 then analog_input("MouseWheel", z, 0) end
     elseif uit:find("^Gamepad") then
         local kc = Enum.KeyCode[key]
         if kc and not gpe and (state == "Begin" or state == "End") then actions_input(kc, state == "Begin") end
@@ -1760,10 +1826,16 @@ do
     local inner = __rs_input_event
     if inner then
         __rs_input_event = function(state, uit, key, x, y, z, dx, dy, gpe)
-            local ok, err = pcall(on_input, state, uit, key, x, y, z, gpe)
+            local ok, err = pcall(on_input, state, uit, key, x, y, z, gpe, dx, dy)
             if not ok then log("error", "gui_input: " .. tostring(err)) end
             return inner(state, uit, key, x, y, z, dx, dy, gpe)
         end
+    end
+    local frame_end = __rs_input_frame_end
+    __rs_input_frame_end = function(dt)
+        local ok, err = pcall(analog_frame, dt)
+        if not ok then log("error", "gui_input: " .. tostring(err)) end
+        if frame_end then return frame_end(dt) end
     end
 end
 local function step_mouse()

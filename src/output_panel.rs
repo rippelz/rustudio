@@ -29,6 +29,20 @@ pub const SERVER_BAR: Color32 = Color32::from_rgb(0, 204, 103);
 pub const CLIENT_BAR: Color32 = Color32::from_rgb(52, 154, 213);
 const LINE_H: f32 = 15.0;
 
+/// Studio Settings > Output > Output Font: its size (10 pt = 13 px, with
+/// LINE_H rows), and the row height that goes with it.
+fn mono_px() -> f32 {
+    crate::studio_settings::font_px("Studio", "Output Font")
+}
+
+fn line_h() -> f32 {
+    (LINE_H * mono_px() / 13.0).round()
+}
+
+fn mono_font() -> FontId {
+    FontId::monospace(mono_px())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Print,
@@ -271,8 +285,8 @@ fn wanted(st: &OutputState, s: &Shown, l: &LogLine) -> bool {
 /// The line as one LayoutJob in Studio's colours (bold for warnings / errors).
 pub fn line_job(st: &OutputState, l: &LogLine, s: &Shown) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
-    let mono = FontId::monospace(13.0);
-    let plain = |c: Color32| egui::TextFormat { font_id: mono.clone(), color: c, line_height: Some(LINE_H), ..Default::default() };
+    let mono = mono_font();
+    let plain = |c: Color32| egui::TextFormat { font_id: mono.clone(), color: c, line_height: Some(line_h()), ..Default::default() };
     if st.show_timestamp {
         job.append(&format!("{}  ", l.at), 0.0, plain(PRINT));
     }
@@ -284,7 +298,7 @@ pub fn line_job(st: &OutputState, l: &LogLine, s: &Shown) -> egui::text::LayoutJ
     if matches!(s.kind, Kind::Warn | Kind::Error) {
         // (Studio draws them bold; egui's monospace has no bold face, so a
         // heavier look comes from the "bold" family when it is installed)
-        fmt.font_id = FontId::new(13.0, egui::FontFamily::Name("mono-bold".into()));
+        fmt.font_id = FontId::new(mono_px(), egui::FontFamily::Name("mono-bold".into()));
     }
     job.append(s.message, 0.0, fmt);
     if st.show_source {
@@ -368,12 +382,12 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
         .collect();
     let text_of = |st: &OutputState, i: usize| line_job(st, &log[i], &parse(&log[i])).text;
     // A message can span lines (stack traces, banners): each takes
-    // LINE_H per line; `tops` are the running offsets.
+    // line_h() per line; `tops` are the running offsets.
     let mut tops = Vec::with_capacity(shown.len() + 1);
     let mut y = 0.0;
     for &i in &shown {
         tops.push(y);
-        y += LINE_H * (log[i].text.matches('\n').count() + 1) as f32;
+        y += line_h() * (log[i].text.matches('\n').count() + 1) as f32;
     }
     tops.push(y);
     let id = egui::Id::new("output_text");
@@ -390,7 +404,7 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
             let resp = ui.interact(view, id, Sense::click_and_drag());
             let first = tops.partition_point(|&t| t <= viewport.min.y).saturating_sub(1);
             let last = tops.partition_point(|&t| t < viewport.max.y).min(shown.len());
-            let space = ui.fonts_mut(|f| f.glyph_width(&FontId::monospace(13.0), ' '));
+            let space = ui.fonts_mut(|f| f.glyph_width(&mono_font(), ' '));
             // Each drawn message: log index, its top, where its text starts,
             // its layout, and a slot for the selection painted under it.
             let mut rows = Vec::new();
@@ -401,7 +415,7 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                 let galley = ui.fonts_mut(|f| f.layout_job(line_job(st, l, &s)));
                 let top = content.min.y + tops[k];
                 // One monospace space wide, then one more space.
-                let bar = egui::Rect::from_min_size(egui::pos2(content.min.x, top), Vec2::new(space, LINE_H));
+                let bar = egui::Rect::from_min_size(egui::pos2(content.min.x, top), Vec2::new(space, line_h()));
                 let bar_color = match s.context {
                     Context::Server => Some(SERVER_BAR),
                     Context::Client => Some(CLIENT_BAR),
@@ -484,7 +498,7 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                     0.0
                 };
                 if dy != 0.0 {
-                    ui.scroll_with_delta(Vec2::new(0.0, dy.clamp(-LINE_H * 2.0, LINE_H * 2.0)));
+                    ui.scroll_with_delta(Vec2::new(0.0, dy.clamp(-line_h() * 2.0, line_h() * 2.0)));
                     ui.ctx().request_repaint();
                 }
             }
@@ -517,9 +531,9 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                         let (sa, sb) = (a.max(start), b.min(start + len));
                         let runs_on = b > start + len && (start + len < n || *i < hi.0);
                         if sa <= sb && (sa < sb || runs_on) {
-                            let y = top + LINE_H * k as f32;
+                            let y = top + line_h() * k as f32;
                             let end = x(sb) + if runs_on { *space } else { 0.0 };
-                            let r = egui::Rect::from_min_max(egui::pos2(x(sa), y), egui::pos2(end, y + LINE_H));
+                            let r = egui::Rect::from_min_max(egui::pos2(x(sa), y), egui::pos2(end, y + line_h()));
                             shapes.push(egui::Shape::rect_filled(r, 0.0, fill));
                         }
                         start += len + 1;
@@ -647,10 +661,10 @@ mod tests {
         }
         /// Screen point of char `c` on shown line `row` (monospace).
         fn at(&self, row: usize, c: usize) -> egui::Pos2 {
-            let w = self.ctx.fonts_mut(|f| f.glyph_width(&FontId::monospace(13.0), 'x'));
+            let w = self.ctx.fonts_mut(|f| f.glyph_width(&mono_font(), 'x'));
             // Bar, gap, space, gap, then the text.
             let gap = self.ctx.global_style().spacing.item_spacing.x;
-            egui::pos2(2.0 * w + 2.0 * gap + w * (c as f32 + 0.3), LINE_H * (row as f32 + 0.5))
+            egui::pos2(2.0 * w + 2.0 * gap + w * (c as f32 + 0.3), line_h() * (row as f32 + 0.5))
         }
         fn btn(&mut self, p: egui::Pos2, down: bool) {
             self.frame(vec![egui::Event::PointerButton {

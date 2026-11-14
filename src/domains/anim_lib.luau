@@ -28,6 +28,11 @@ local function is_inst(v, class) return typeof(v) == "Instance" and (class == ni
 -- f32 value, f32 left, f32 right}, then u32 1, u32 n, n × i32 time in
 -- 1/2400 s. The keys live in that property, so they save, replicate and
 -- play (library.luau's CurveAnimation playback reads the same bytes).
+-- Older clips carry u32 1 in place of the leading 2, laid out the same
+-- (Laser Tag's 2024 blaster animations); Studio 0.744 reads both. GetKeys
+-- shows only the flagged tangents, but evaluation uses the stored ones
+-- (measured: Shoot's Body.Rotation.X at 0.02 s needs key 2's unflagged
+-- left tangent), kept here as ls / rs.
 local function curve_data(curve)
     local ok, data = pcall(function() return curve.ValuesAndTimes end)
     return if ok then data else nil
@@ -36,7 +41,8 @@ local function fc_read(curve)
     local data = curve_data(curve)
     if type(data) ~= "string" or #data < 16 then return {} end
     local b = buffer.fromstring(data)
-    if buffer.readu32(b, 0) ~= 2 then return {} end
+    local version = buffer.readu32(b, 0)
+    if version ~= 1 and version ~= 2 then return {} end
     local n = buffer.readu32(b, 4)
     local times = 8 + n * 14
     if times + 8 + n * 4 > #data or buffer.readu32(b, times) ~= 1 or buffer.readu32(b, times + 4) ~= n then
@@ -47,7 +53,8 @@ local function fc_read(curve)
         local off = 8 + i * 14
         local word = buffer.readu16(b, off)
         local flags = bit32.rshift(word, 8)
-        local k = { t = buffer.readi32(b, times + 8 + i * 4) / 2400, v = buffer.readf32(b, off + 2), mode = bit32.band(word, 0xff) }
+        local k = { t = buffer.readi32(b, times + 8 + i * 4) / 2400, v = buffer.readf32(b, off + 2), mode = bit32.band(word, 0xff),
+            ls = buffer.readf32(b, off + 6), rs = buffer.readf32(b, off + 10) }
         if bit32.band(flags, 1) ~= 0 then k.lt = buffer.readf32(b, off + 6) end
         if bit32.band(flags, 2) ~= 0 then k.rt = buffer.readf32(b, off + 10) end
         keys[i + 1] = k
@@ -64,8 +71,8 @@ local function fc_write(curve, keys)
         local flags = (if k.lt then 1 else 0) + (if k.rt then 2 else 0)
         buffer.writeu16(b, off, k.mode + flags * 256)
         buffer.writef32(b, off + 2, k.v)
-        buffer.writef32(b, off + 6, k.lt or 0)
-        buffer.writef32(b, off + 10, k.rt or 0)
+        buffer.writef32(b, off + 6, k.lt or k.ls or 0)
+        buffer.writef32(b, off + 10, k.rt or k.rs or 0)
     end
     local times = 8 + n * 14
     buffer.writeu32(b, times, 1)
@@ -95,8 +102,8 @@ local function fc_value(keys, t)
             local u, dt = seg_alpha(a, b, t)
             if a.mode == 1 then return a.v + (b.v - a.v) * u end
             local u2, u3 = u * u, u * u * u
-            return (2*u3 - 3*u2 + 1) * a.v + (u3 - 2*u2 + u) * dt * (a.rt or 0)
-                + (-2*u3 + 3*u2) * b.v + (u3 - u2) * dt * (b.lt or 0)
+            return (2*u3 - 3*u2 + 1) * a.v + (u3 - 2*u2 + u) * dt * (a.rt or a.rs or 0)
+                + (-2*u3 + 3*u2) * b.v + (u3 - u2) * dt * (b.lt or b.ls or 0)
         end
     end
     return keys[n].v
@@ -337,13 +344,14 @@ function VC.RemoveKeyAtIndex(self, start, count)
 end
 function VC.SetKeys() return 0 end
 
--- MarkerCurve.ValuesAndTimes: u32 2, u32 n, n NUL-terminated strings,
--- u32 1, u32 n, n × i32 time in 1/2400 s.
+-- MarkerCurve.ValuesAndTimes: u32 2 (1 in older clips), u32 n, n
+-- NUL-terminated strings, u32 1, u32 n, n × i32 time in 1/2400 s.
 local function mc_read(curve)
     local data = curve_data(curve)
     if type(data) ~= "string" or #data < 16 then return {} end
     local b = buffer.fromstring(data)
-    if buffer.readu32(b, 0) ~= 2 then return {} end
+    local version = buffer.readu32(b, 0)
+    if version ~= 1 and version ~= 2 then return {} end
     local n = buffer.readu32(b, 4)
     if n > #data then return {} end
     local values, offset = {}, 9
@@ -794,8 +802,15 @@ function HUM.PlayEmoteAsync(self, name)
     local anim
     local id = tonumber(ids[1])
     if id then
-        local ok, model = pcall(function() return game:GetService("InsertService"):LoadAsset(id) end)
-        if ok and model then anim = model:FindFirstChildWhichIsA("Animation", true) end
+        -- The engine loads the emote itself (any emote the player owns, not
+        -- just ones InsertService:LoadAsset may insert): the avatar loader.
+        local ok, model = pcall(function()
+            if __rs_avatar_load then return __rs_avatar_load(id) end
+            return game:GetService("InsertService"):LoadAsset(id)
+        end)
+        if ok and model then
+            anim = model:IsA("Animation") and model or model:FindFirstChildWhichIsA("Animation", true)
+        end
     end
     return bf:Invoke(anim) == true
 end

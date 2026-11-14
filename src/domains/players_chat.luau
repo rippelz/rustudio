@@ -799,11 +799,34 @@ end
 -- The local player typed a line in the chat bar: SendAsync on the target
 -- channel (TextChatService chat), as the default chat does.
 function __rs_pc_chat_input(text)
+	local word = text:match("^(%S+)")
+	-- "/e name" (TextChatService's RBXEmoteCommand; legacy chat's emote
+	-- hook) plays an emote and isn't sent.
+	if word and (word:lower() == "/e" or word:lower() == "/emote") then
+		local cmd = tcs_enabled() and svc.TextChatService:FindFirstChild("RBXEmoteCommand", true)
+		if not cmd or cmd.Enabled then
+			local name = text:match("^%S+%s+(.-)%s*$") or ""
+			local lp = svc.Players.LocalPlayer
+			local hum = lp and lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+			if hum and name ~= "" then
+				task.spawn(function()
+					-- The player's own emote, else one of Animate's (wave, dance …).
+					if not pcall(hum.PlayEmote, hum, name) then
+						local animate = lp.Character:FindFirstChild("Animate")
+						local bf = animate and animate:FindFirstChild("PlayEmote")
+						if bf and bf:IsA("BindableFunction") then
+							bf:Invoke(name:lower())
+						end
+					end
+				end)
+			end
+			return true
+		end
+	end
 	if not tcs_enabled() then return false end
 	local bar = svc.TextChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
 	local ch = bar and bar.TargetTextChannel
 	if ch == nil then return false end
-	local word = text:match("^(%S+)")
 	if word and (word:lower() == "/clear" or word:lower() == "/cls") then
 		__rs_pc_clear_view()
 	end

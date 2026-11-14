@@ -411,6 +411,11 @@ impl Editor {
         };
         let name = inst.name.clone();
         let class = inst.class.to_string();
+        let shape = self.doc.prop(r, "Shape").and_then(|v| match v {
+            rbx_types::Variant::Enum(e) => Some(e.to_u32()),
+            rbx_types::Variant::EnumItem(e) => Some(e.value),
+            _ => None,
+        });
         let parent = inst.parent();
         let has_children = !inst.children().is_empty();
         let selected = self.doc.selection.contains(&r);
@@ -465,7 +470,9 @@ impl Editor {
             crate::ti::paint(&painter, tri_rect, glyph, theme::TEXT_DIM);
         }
         let icon_rect = Rect::from_center_size(Pos2::new(x0 + 22.0, rect.center().y), Vec2::splat(16.0));
-        icons::paint_class_icon(&painter, icon_rect, &class);
+        if !icons::paint_part_icon(&painter, icon_rect, &class, shape) {
+            icons::paint_class_icon(&painter, icon_rect, &class);
+        }
         let text_pos = Pos2::new(x0 + 34.0, rect.center().y);
         // The "+" just right of the name while the row is hovered (Studio's quick insert).
         let label = if name.is_empty() { format!("({class})") } else { name.clone() };
@@ -487,11 +494,18 @@ impl Editor {
             let edit_rect = Rect::from_min_max(Pos2::new(text_pos.x, rect.min.y + 1.0), Pos2::new(rect.max.x - 4.0, rect.max.y - 1.0));
             let mut text = self.explorer.renaming.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
             let edit = ui.put(edit_rect, egui::TextEdit::singleline(&mut text).margin(Vec2::new(2.0, 0.0)));
-            edit.request_focus();
+            // A press anywhere else (the 3D view included, which egui's focus
+            // never sees) ends the rename and keeps the new name, as in Studio.
+            let clicked_out = ui.input(|i| {
+                i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !edit_rect.contains(p))
+            });
+            if !clicked_out {
+                edit.request_focus();
+            }
             let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
             if esc {
                 self.explorer.renaming = None;
-            } else if enter || edit.lost_focus() {
+            } else if enter || edit.lost_focus() || clicked_out {
                 actions.push(RowAction::Rename(r, text));
             } else {
                 self.explorer.renaming = Some((r, text));

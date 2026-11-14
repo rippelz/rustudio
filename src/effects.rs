@@ -33,7 +33,7 @@ use crate::world_gui::{FxFrame, FxLook, FxParticle, FxVertex};
 #[path = "effects_constraints.rs"]
 mod constraints;
 
-const CLASSES: [&str; 6] = ["ParticleEmitter", "Beam", "Trail", "RopeConstraint", "RodConstraint", "SpringConstraint"];
+const CLASSES: [&str; 7] = ["ParticleEmitter", "Sparkles", "Beam", "Trail", "RopeConstraint", "RodConstraint", "SpringConstraint"];
 
 // ------------------------------------------------------------ script calls
 
@@ -484,6 +484,21 @@ enum Host {
     None,
 }
 
+/// Invisible emitter volumes remain selectable in the editor. Only traverse
+/// attachments: arbitrary descendants in a model are not hosted by this part.
+pub(crate) fn is_emitter_host(d: &Document, part: Ref) -> bool {
+    fn contains(d: &Document, r: Ref) -> bool {
+        d.dom.get_by_ref(r).is_some_and(|i| i.children().iter().any(|&child| {
+            match d.class_of(child).as_deref() {
+                Some("ParticleEmitter") => true,
+                Some("Attachment" | "Bone") => contains(d, child),
+                _ => false,
+            }
+        }))
+    }
+    contains(d, part)
+}
+
 fn host_of(d: &Document, r: Ref) -> Host {
     let Some(p) = d.dom.get_by_ref(r).map(|i| i.parent()) else {
         return Host::None;
@@ -694,6 +709,39 @@ fn emitter_cfg(d: &Document, r: Ref) -> EmitterCfg {
         zoffset: num(d, r, "ZOffset", 0.0),
         look: look(d, r),
     }
+}
+
+/// Legacy Sparkles: a fixed emitter tinted SparkleColor (accessories such
+/// as Spring Fairy 150381051 still wear one in their Handle). Glowing
+/// sparkle stars flung a few studs out in every direction, fading as they
+/// slow; only Enabled, SparkleColor and TimeScale are its own.
+fn sparkles_cfg(d: &Document, r: Ref) -> EmitterCfg {
+    let mut c = emitter_cfg(d, r);
+    let color = match d.prop(r, "SparkleColor").or_else(|| d.prop(r, "Color")) {
+        Some(Variant::Color3(k)) => Vec3::new(k.r, k.g, k.b),
+        Some(Variant::Color3uint8(k)) => Vec3::new(k.r as f32, k.g as f32, k.b as f32) / 255.0,
+        _ => Vec3::new(144.0, 25.0, 255.0) / 255.0,
+    };
+    c.color = CSeq(vec![(0.0, color)]);
+    c.rate = 20.0;
+    c.life = (0.8, 1.4);
+    c.speed = (2.5, 5.0);
+    c.spread = Vec2::new(180.0, 180.0);
+    c.dir = 1;
+    c.shape = 0;
+    c.drag = 1.5;
+    c.accel = Vec3::ZERO;
+    c.size = Seq(vec![(0.0, 0.2, 0.0), (0.25, 0.9, 0.25), (1.0, 0.15, 0.0)]);
+    c.transparency = Seq(vec![(0.0, 0.0, 0.0), (0.6, 0.1, 0.0), (1.0, 1.0, 0.0)]);
+    c.squash = Seq(vec![(0.0, 0.0, 0.0)]);
+    c.rotation = (0.0, 360.0);
+    c.rot_speed = (-90.0, 90.0);
+    c.texture = Some("rbxasset://textures/particles/sparkles_main.dds".into());
+    c.grid = (1, 1);
+    c.locked = false;
+    c.inherit = 0.0;
+    c.look = Look { influence: 0.0, brightness: 1.5, emission: 1.0, alpha: c.look.alpha };
+    c
 }
 
 #[derive(Clone)]
@@ -1034,7 +1082,11 @@ impl EmitterState {
             } else {
                 (xf.pos + xf.rot * p, xf.rot * (dir * speed) + host_vel * c.inherit)
             };
-            let life = rng.in_range(c.life).max(0.0);
+            // Studio accepts larger Lifetime properties but expires rendered
+            // particles after 20 s (Creator Hub particle-emitters; the
+            // hidden Studio burst also expires well before its stored 100 s).
+            // Keep the stored property.
+            let life = rng.in_range(c.life).clamp(0.0, 20.0);
             if life <= 0.0 {
                 continue;
             }
@@ -1970,6 +2022,7 @@ impl Effects {
             let cfg = self.cfg.entry(r).or_insert_with(|| {
                 match d.class_of(r).as_deref() {
                     Some("ParticleEmitter") => Cfg::Emitter(Box::new(emitter_cfg(d, r))),
+                    Some("Sparkles") => Cfg::Emitter(Box::new(sparkles_cfg(d, r))),
                     Some("Beam") => Cfg::Beam(Box::new(beam_cfg(d, r))),
                     Some("RopeConstraint" | "RodConstraint" | "SpringConstraint") => Cfg::Constraint(r),
                     _ => Cfg::Trail(Box::new(trail_cfg(d, r))),
@@ -2101,6 +2154,10 @@ impl Effects {
             }
         }
         crate::bench::add("fx_particles", 0.0, n_particles as u64);
+        if std::env::var_os("RUSTUDIO_FX_TRACE").is_some() && (now / 5.0).floor() != ((now - dt as f64) / 5.0).floor() {
+            eprintln!("[fx] sim_seconds={now:.2} live={n_particles} submitted={} sim_ms={:.3}", mech::FX_PARTICLES_MAX - budget, t_sim * 1e3);
+        }
+
         drop(_pd);
         let _push = crate::bench::scope("fx_push");
         // Far to near, so nearer effects blend over farther ones.
@@ -2473,6 +2530,24 @@ mod tests {
         assert!((st.particles[0].vel.x - 5.0).abs() < 1e-3, "{:?}", st.particles[0].vel);
     }
 
+    #[test]
+    fn village_field_respects_rendered_lifetime_limit() {
+        let mut c = emitter_test_cfg();
+        c.rate = 200.0;
+        c.life = (80.0, 100.0);
+        c.speed = (0.0, 0.0);
+        let mut st = EmitterState::default();
+        let r = Ref::new();
+        let xf = Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY };
+        for _ in 0..1200 {
+            st.step(&c, r, &xf, Vec3::new(149.0, 1.0, 89.0), 0.1, 0, None, Vec3::ZERO);
+        }
+        assert!((3_960..=4_000).contains(&st.particles.len()), "{}", st.particles.len());
+        assert!(st.particles.iter().all(|p| p.life == 20.0 && p.age < 20.0));
+        assert!(st.particles.iter().all(|p| p.pos.x.abs() <= 74.5 && p.pos.y.abs() <= 0.5 && p.pos.z.abs() <= 44.5));
+        assert!(mech::FX_PARTICLES_MAX >= st.particles.len() * 4);
+    }
+
     fn emitter_test_cfg() -> EmitterCfg {
         EmitterCfg {
             host: Host::None,
@@ -2516,6 +2591,23 @@ mod texture_tests {
     use super::*;
     use rbx_dom_weak::types::{Content, ContentId};
     use rbx_dom_weak::InstanceBuilder;
+
+    #[test]
+    fn invisible_emitter_hosts_include_attachments_only() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let part = d.dom.insert(ws, InstanceBuilder::new("Part")
+            .with_property("Transparency", 1.0f32).with_property("CanCollide", false));
+        assert!(!is_emitter_host(&d, part));
+        let a = d.dom.insert(part, InstanceBuilder::new("Attachment"));
+        d.dom.insert(a, InstanceBuilder::new("ParticleEmitter"));
+        assert!(is_emitter_host(&d, part));
+        let other = d.dom.insert(ws, InstanceBuilder::new("Part"));
+        let nested = d.dom.insert(other, InstanceBuilder::new("Part"));
+        d.dom.insert(nested, InstanceBuilder::new("ParticleEmitter"));
+        assert!(!is_emitter_host(&d, other));
+        assert!(is_emitter_host(&d, nested));
+    }
 
     /// Place A's Vfx.emitter: Instance.new("ParticleEmitter"), then Texture = id.
     /// TextureContent's class default (the sparkle) must not win over it.

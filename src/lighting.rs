@@ -796,7 +796,10 @@ impl LightCache {
             };
             // Soft fills the camera's voxel volume, including lights behind
             // the frustum; Realistic evaluates the visible light spheres.
-            if !soft && !planes(centre, range) {
+            // A SurfaceLight lights from its whole rectangle (shader.wgsl
+            // light_point), so its sphere covers the face's half diagonal.
+            let reach = range + (half[0] * half[0] + half[1] * half[1]).sqrt();
+            if !soft && !planes(centre, reach) {
                 continue;
             }
             let dist = (centre - cam.pos).length();

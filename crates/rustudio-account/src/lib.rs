@@ -13,6 +13,7 @@
 pub mod api;
 pub mod assets_cloud;
 pub mod avatar;
+pub mod characters;
 pub mod cloud;
 pub mod config;
 pub mod data;

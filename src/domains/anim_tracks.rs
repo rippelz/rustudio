@@ -19,6 +19,15 @@
 //!   fadeTime was. Stop() fades over 0.1 s by default. Ended fires when the
 //!   weight reaches 0; the Animator lets the track go a step later.
 //! - Transform = position (weighted) · slerp(identity, rotation, used weight).
+//!
+//! Measured in Studio 0.744 (Laser Tag blaster probes,
+//! checks/laser-tag-parity/anim): Play() restarts at TimePosition 0 even
+//! while the track plays (a blaster's Shoot:Play(0) every shot), fading from
+//! the weight it has; a non-looped track at its end with Speed 0 has ended
+//! too; Stop(0) on a playing track lets it go at once but WeightCurrent keeps
+//! its value (the next Play fades from there, so a re-equipped Idle:Play()
+//! snaps in); a curve clip's NamedKeyframeEvent markers are KeyframeReached
+//! names; at a non-looped end the order is keyframes, Stopped, DidLoop.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -55,6 +64,10 @@ pub struct Seq {
     length: f64,
     looped: bool,
     priority: Value,
+    /// A CurveAnimation (GetTimeOfKeyframe refuses it, as Studio does).
+    curve: bool,
+    /// The clip's authoring rig (its AnimationRigData), for retargeting.
+    rig: Option<Rc<super::anim_retarget::Rig>>,
 }
 
 struct Track {
@@ -80,6 +93,8 @@ struct Track {
     looped_set: bool,
     priority: Value,
     priority_set: bool,
+    /// Stop(0) let it go: not stepped, WeightCurrent kept (Studio).
+    cut: bool,
 }
 
 #[derive(Default)]
@@ -91,6 +106,11 @@ pub struct Tracks {
     /// rig → (Part1 name, joint): the joints a rig's tracks animate, found
     /// when it starts animating and kept while it does.
     animated: Vec<(Ref, Vec<(String, Ref)>)>,
+    /// rig → the rig Studio builds from it for retargeting (None: not an R15
+    /// Humanoid rig), kept while it animates.
+    char_rigs: HashMap<Ref, Option<Rc<super::anim_retarget::Rig>>>,
+    /// (clip, rig) → its retargeter.
+    retargeters: HashMap<(usize, Ref), Rc<super::anim_retarget::Retargeter>>,
     steps: u64,
 }
 
@@ -110,7 +130,7 @@ fn xform_of(v: &Value) -> Option<Xform> {
     }
 }
 
-fn convert(t: &Table) -> mlua::Result<Seq> {
+fn convert(lua: &Lua, t: &Table) -> mlua::Result<Seq> {
     let mut joints = Vec::new();
     let jt: Table = t.get("joints")?;
     for pair in jt.pairs::<String, Table>() {
@@ -144,12 +164,21 @@ fn convert(t: &Table) -> mlua::Result<Seq> {
         }
         frames.push(Frame { t: f.get("t")?, name: f.get::<Option<String>>("name")?.unwrap_or_default(), markers });
     }
+    let rig = match opt_inst(&t.get::<Value>("rig")?) {
+        Some(r) => {
+            let w = world(lua)?;
+            super::anim_retarget::clip_rig(w.d(), r).map(Rc::new)
+        }
+        None => None,
+    };
     Ok(Seq {
+        rig,
         joints,
         frames,
         length: t.get::<Option<f64>>("length")?.unwrap_or(0.0),
         looped: t.get::<Option<bool>>("loop")?.unwrap_or(false),
         priority: t.get("priority")?,
+        curve: t.get::<Option<bool>>("curve")?.unwrap_or(false),
     })
 }
 
@@ -162,7 +191,7 @@ fn load(lua: &Lua, id: &str) -> mlua::Result<(Option<Rc<Seq>>, bool)> {
     let f: Function = lua.globals().get("__rs_anim_load")?;
     let (seq, still): (Value, bool) = f.call(id)?;
     let Value::Table(t) = seq else { return Ok((None, still)) };
-    let s = Rc::new(convert(&t)?);
+    let s = Rc::new(convert(lua, &t)?);
     tracks(lua).seqs.insert(id.to_string(), s.clone());
     Ok((Some(s), false))
 }
@@ -378,6 +407,19 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<bool> {
         if !st.active {
             return Ok(false);
         }
+        if st.cut {
+            // Stop(0): gone this step, TimePosition / WeightCurrent as they were.
+            let now = !st.ended;
+            drop(t);
+            if now {
+                if let Some(st) = tracks(lua).all.get_mut(&r) {
+                    st.ended = true;
+                    st.release = true;
+                }
+                fire(lua, r, "Ended", vec![])?;
+            }
+            return Ok(false);
+        }
         let length = st.seq.as_ref().map(|s| s.length).unwrap_or(0.0);
         let mut crossed: Vec<usize> = Vec::new();
         let mut loops = 0usize;
@@ -426,7 +468,8 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<bool> {
             } else {
                 st.time = after.clamp(0.0, length);
                 events(before.min(st.time), before.max(st.time), st.speed < 0.0, st.first_step, &mut crossed);
-                if st.playing && (after >= length && st.speed > 0.0 || after <= 0.0 && st.speed < 0.0) {
+                // Speed 0 at the end counts as reaching it (Studio).
+                if st.playing && (after >= length && st.speed >= 0.0 || after <= 0.0 && st.speed < 0.0) {
                     st.playing = false;
                     fade_track(st, 0.0, END_FADE);
                     stopped = true;
@@ -453,14 +496,12 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<bool> {
         }
         (crossed, loops, stopped, ended_now)
     };
-    if stopped {
-        fire(lua, r, "Stopped", vec![])?;
-    }
-    if !crossed.is_empty() || loops > 0 {
+    if !crossed.is_empty() || loops > 0 || stopped {
         let seq = tracks(lua).all.get(&r).and_then(|s| s.seq.clone());
         if let Some(seq) = seq {
-            // Studio: markers, then named keyframes, then DidLoop; a wrap's
-            // terminal and initial keys share the batch.
+            // Studio: markers, then named keyframes, then (a non-looped
+            // track's end) Stopped, then DidLoop; a wrap's terminal and
+            // initial keys share the batch.
             for &i in &crossed {
                 for (name, value) in &seq.frames[i].markers {
                     fire(lua, r, &format!("MarkerReached:{name}"), vec![Value::String(lua.create_string(value)?)])?;
@@ -471,6 +512,9 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<bool> {
                 if f.name != "Keyframe" {
                     fire(lua, r, "KeyframeReached", vec![Value::String(lua.create_string(&f.name)?)])?;
                 }
+            }
+            if stopped {
+                fire(lua, r, "Stopped", vec![])?;
             }
             for _ in 0..loops {
                 fire(lua, r, "DidLoop", vec![])?;
@@ -494,6 +538,68 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<bool> {
     let rig = st.rig;
     drop(t);
     Ok(world(lua)?.d().dom.get_by_ref(rig).is_some_and(|i| i.parent().is_some()))
+}
+
+/// Workspace.Retargeting on (Studio's Workspace check Studio): Enabled,
+/// or Default while DFFlagWorkspaceAnimatorRetargetingEnabledDefault (on in
+/// Studio 0.744); Disabled is off. A script's write lives in the stub
+/// store, a place's saved value in the document.
+fn retargeting_enabled(lua: &Lua) -> mlua::Result<bool> {
+    let ws = { world(lua)?.d().workspace() };
+    let Some(ws) = ws else { return Ok(false) };
+    let mut mode: Option<u32> = None;
+    if let Ok(store) = lua.named_registry_value::<Table>("rs_stub_store") {
+        if let Ok(Some(t)) = store.get::<Option<Table>>(format!("{ws:?}")) {
+            if let Value::UserData(u) = t.get::<Value>("Retargeting")? {
+                if let Ok(e) = u.borrow::<LEnumItem>() {
+                    mode = Some(e.value);
+                }
+            }
+        }
+    }
+    let mode = match mode {
+        Some(m) => m,
+        None => crate::scene::enum_u32(world(lua)?.d().prop(ws, "Retargeting")).unwrap_or(0),
+    };
+    Ok(mode == 2 || mode == 0)
+}
+
+/// The retargeter for a clip on a rig: the clip carries an AnimationRigData
+/// and the rig is an R15 Humanoid character (Studio's factory Studio
+/// makes an R15ToR15Retargeter then; see anim_retarget.rs).
+fn retargeter_for(lua: &Lua, seq: &Rc<Seq>, rig: Ref) -> mlua::Result<Option<Rc<super::anim_retarget::Retargeter>>> {
+    let Some(src) = seq.rig.clone() else { return Ok(None) };
+    let key = (Rc::as_ptr(seq) as usize, rig);
+    if let Some(r) = tracks(lua).retargeters.get(&key) {
+        return Ok(Some(r.clone()));
+    }
+    let known = tracks(lua).char_rigs.get(&rig).cloned();
+    let tgt = match known {
+        Some(t) => t,
+        None => {
+            let t = {
+                let w = world(lua)?;
+                let d = w.d();
+                let humanoid = d.dom.get_by_ref(rig).and_then(|m| {
+                    m.children().iter().copied().find(|c| d.class_of(*c).is_some_and(|k| k == "Humanoid"))
+                });
+                let r15 = humanoid.is_some_and(|h| crate::scene::enum_u32(d.prop(h, "RigType")) == Some(1));
+                let root = d.dom.get_by_ref(rig).and_then(|m| {
+                    m.children().iter().copied().find(|c| d.dom.get_by_ref(*c).is_some_and(|i| i.name == "HumanoidRootPart"))
+                });
+                match (r15, root) {
+                    (true, Some(root)) => Some(Rc::new(super::anim_retarget::build_character_rig(d, rig, root))),
+                    _ => None,
+                }
+            };
+            tracks(lua).char_rigs.insert(rig, t.clone());
+            t
+        }
+    };
+    let Some(tgt) = tgt else { return Ok(None) };
+    let r = Rc::new(super::anim_retarget::initialize(&src, &tgt));
+    tracks(lua).retargeters.insert(key, r.clone());
+    Ok(Some(r))
 }
 
 fn joints_of(lua: &Lua, rig: Ref) -> mlua::Result<Vec<(String, Ref)>> {
@@ -593,7 +699,7 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
                 j
             }
         };
-        // Each track's (seq, weight, rank, time).
+        // Each track's (seq, weight, rank, time, retargeter).
         let posing: Vec<(Rc<Seq>, f64, i64, f64)> = {
             let t = tracks(lua);
             list.iter()
@@ -601,12 +707,23 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
                 .filter_map(|s| s.seq.clone().map(|q| (q, s.weight, rank(&s.priority), s.time)))
                 .collect()
         };
+        let retarget = retargeting_enabled(lua)?;
+        let mut posing_rt = Vec::with_capacity(posing.len());
+        for (seq, w, rk, time) in posing {
+            let rt = if retarget { retargeter_for(lua, &seq, *rig)? } else { None };
+            posing_rt.push((seq, w, rk, time, rt));
+        }
         for (name, motor) in &joints {
             // This joint's poses by priority level, highest first.
             let mut levels: Vec<(i64, Vec<(Xform, f64)>)> = Vec::new();
-            for (seq, w, rk, time) in &posing {
+            for (seq, w, rk, time, rt) in &posing_rt {
                 let Some((_, j)) = seq.joints.iter().find(|(n, _)| n == name) else { continue };
                 let Some(cf) = sample(lua, j, *time)? else { continue };
+                // Retargeted onto this rig's proportions (anim_retarget.rs).
+                let cf = match rt {
+                    Some(r) => r.apply(super::anim_retarget::label_of_part(name), cf),
+                    None => cf,
+                };
                 match levels.iter_mut().find(|l| l.0 == *rk) {
                     Some(l) => l.1.push((cf, *w)),
                     None => levels.push((*rk, vec![(cf, *w)])),
@@ -664,6 +781,10 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
         let (keep, gone): (Vec<_>, Vec<_>) =
             std::mem::take(&mut t.animated).into_iter().partition(|e| by_rig.iter().any(|b| b.0 == e.0));
         t.animated = keep;
+        for (r, _) in &gone {
+            t.char_rigs.remove(r);
+            t.retargeters.retain(|k, _| k.1 != *r);
+        }
         gone
     };
     for (_, joints) in gone {
@@ -758,6 +879,7 @@ fn new_track(lua: &Lua, (me, anim, owner, rig, id): (Value, Value, Value, Value,
         time: 0.0,
         looped_set: false,
         priority_set: false,
+        cut: false,
     };
     let mut t = tracks(lua);
     t.all.insert(r, st);
@@ -775,9 +897,9 @@ fn play(lua: &Lua, (me, fade, weight, speed): (Value, Option<f64>, Option<f64>, 
     };
     let count = t.all.values().filter(|s| s.active && s.owner == owner).count();
     let st = t.all.get_mut(&r).expect("track");
-    if !st.playing {
-        st.time = 0.0;
-    }
+    // Studio restarts a playing track too.
+    st.time = 0.0;
+    st.cut = false;
     st.playing = true;
     st.ended = false;
     st.release = false;
@@ -812,7 +934,15 @@ fn stop(lua: &Lua, (me, fade): (Value, Option<f64>)) -> mlua::Result<()> {
         match t.all.get_mut(&r) {
             Some(st) if st.playing => {
                 st.playing = false;
-                fade_track(st, 0.0, fade.unwrap_or(0.1));
+                let fade = fade.unwrap_or(0.1);
+                if fade <= 0.0 {
+                    // Let go at once; WeightCurrent keeps its value (Studio).
+                    st.cut = true;
+                    st.target = 0.0;
+                    st.fade = 0.0;
+                } else {
+                    fade_track(st, 0.0, fade);
+                }
                 true
             }
             _ => false,
@@ -908,10 +1038,15 @@ fn playing(lua: &Lua, owner: Value) -> mlua::Result<Table> {
     Ok(out)
 }
 
-fn keyframe_time(lua: &Lua, (me, name): (Value, String)) -> mlua::Result<Option<f64>> {
-    let Some(r) = me_ref(&me) else { return Ok(None) };
+/// A keyframe's time; `false` for a CurveAnimation, which Studio refuses.
+fn keyframe_time(lua: &Lua, (me, name): (Value, String)) -> mlua::Result<Value> {
+    let Some(r) = me_ref(&me) else { return Ok(Value::Nil) };
     let t = tracks(lua);
-    Ok(t.all.get(&r).and_then(|s| s.seq.as_ref()).and_then(|q| q.frames.iter().find(|f| f.name == name).map(|f| f.t)))
+    let Some(q) = t.all.get(&r).and_then(|s| s.seq.as_ref()) else { return Ok(Value::Nil) };
+    if q.curve {
+        return Ok(Value::Boolean(false));
+    }
+    Ok(q.frames.iter().find(|f| f.name == name).map(|f| Value::Number(f.t)).unwrap_or(Value::Nil))
 }
 
 /// Animator:GetTrackByAnimationId: an active track of this Animator.

@@ -1,6 +1,11 @@
 //! rustudio: a native Linux editor for Roblox place and model files.
 
+mod grass_stream;
+mod env_probe;
 mod account_ui;
+mod char_builder;
+mod game_avatar;
+mod emote_wheel;
 mod ribbon_quick;
 mod cmeta;
 mod studio_content;
@@ -26,6 +31,8 @@ mod bin_dump;
 mod camera;
 mod collision;
 mod collision_groups;
+#[cfg(unix)]
+mod control;
 mod coverage;
 mod crash;
 mod default_scripts;
@@ -36,6 +43,7 @@ mod explorer;
 mod file_dialog;
 mod hypr;
 mod game_settings;
+mod studio_settings;
 mod fbx;
 mod api;
 mod api_stubs;
@@ -68,6 +76,8 @@ mod mesh;
 mod truss;
 mod mesh_bvh;
 mod physics;
+mod humanoid;
+mod physics_mesh;
 mod play;
 mod project;
 mod project_config;
@@ -77,6 +87,7 @@ mod project_sync;
 mod project_values;
 mod properties;
 mod render;
+mod clouds;
 mod sun_shadow;
 mod replicate;
 mod anim_replicate;
@@ -105,7 +116,9 @@ mod studio_ribbon;
 mod studio_panels;
 mod start_page;
 mod ui_shots;
+mod grass_temporal;
 mod viewport;
+mod viewport_menu;
 mod water;
 mod wrap;
 
@@ -744,6 +757,7 @@ fn main() -> eframe::Result<()> {
         shot_after,
         log_out,
         actions,
+        pointer: None,
         started: std::time::Instant::now(),
         screenshot,
         selftest: selftest.map(selftest::SelfTest::new),
@@ -783,6 +797,8 @@ fn main() -> eframe::Result<()> {
         None if harness.selftest.is_some() => [1265.0, 867.0],
         None => [1600.0, 900.0],
     };
+    // Studio Settings: the user's for plain runs (src/studio_settings.rs).
+    studio_settings::init(layout_store::enabled(&harness));
     // The saved window (src/layout_store.rs), for plain interactive runs.
     let saved_layout = layout_store::enabled(&harness).then(layout_store::load).flatten();
     let icon = egui::IconData {
@@ -799,6 +815,12 @@ fn main() -> eframe::Result<()> {
     if let Some(l) = &saved_layout {
         viewport = l.window_builder(viewport);
     }
+    // Driven for comparison captures (src/control.rs): open without taking
+    // focus and stay below other windows, so it never covers the person's
+    // work (X11 keeps drawing covered windows, and shots read the frame back).
+    if std::env::var_os("RUSTUDIO_CONTROL").is_some() {
+        viewport = viewport.with_active(false).with_window_level(egui::WindowLevel::AlwaysOnBottom);
+    }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport,
@@ -809,12 +831,16 @@ fn main() -> eframe::Result<()> {
                 setup.device_descriptor = std::sync::Arc::new(move |adapter| {
                     let mut d = descriptor(adapter);
                     d.required_limits.max_sampled_textures_per_shader_stage = 24;
+                    // Storage writes to R8 targets need the adapter-specific format features.
+                    d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
                     d
                 });
                 egui_wgpu::WgpuSetup::CreateNew(setup)
             },
             surface: egui_wgpu::SurfaceConfig {
-                present_mode: if bench_mode {
+                // No vsync when measuring or driven for captures: a shot waits
+                // for a few frames after each camera move.
+                present_mode: if bench_mode || std::env::var_os("RUSTUDIO_CONTROL").is_some() {
                     egui_wgpu::wgpu::PresentMode::AutoNoVsync
                 } else {
                     egui_wgpu::wgpu::PresentMode::AutoVsync

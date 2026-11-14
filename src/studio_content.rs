@@ -79,6 +79,7 @@ fn post(err: bool, t: String) {
 /// On a normal launch with no Studio content anywhere, download it in the
 /// background and report to Output.
 pub fn spawn_background_install_if_missing() {
+    fetch_classic_oof_once();
     if std::env::var_os("RUSTUDIO_NO_STUDIO_FETCH").is_some()
         || crate::default_scripts::studio_dir().is_some()
     {
@@ -133,6 +134,41 @@ fn content_length(agent: &ureq::Agent, url: &str) -> Result<u64, String> {
 
 /// Download and unpack everything. Returns the Studio version installed.
 /// `progress` gets one line per step.
+/// Studio 0.533 (June 2022), the last build whose sounds package has the
+/// classic death sound `uuhhh.mp3` ("Oof"); later Studios play a replacement.
+const CLASSIC_OOF_PKG: &str = "version-58ed123c874e44c1-content-sounds.zip";
+
+/// Where rustudio keeps the classic Oof it fetched from Roblox's CDN (its own
+/// data folder: never inside a Studio install, never in the repo).
+pub fn classic_oof() -> PathBuf {
+    crate::paths::data().join("rustudio/classic-sounds/uuhhh.mp3")
+}
+
+/// Fetch the classic Oof in the background, once, unless it is already here.
+pub fn fetch_classic_oof_once() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if cfg!(test)
+        || std::env::var_os("RUSTUDIO_NO_STUDIO_FETCH").is_some()
+        || classic_oof().is_file()
+        || STARTED.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("classic-oof".into()).spawn(|| {
+        let dest = classic_oof();
+        let got = fetch_one(&agent(), &format!("{CDN}/{CLASSIC_OOF_PKG}"), "uuhhh.mp3").and_then(|data| {
+            let dir = dest.parent().ok_or("bad data dir")?;
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            let tmp = dir.join(".uuhhh.mp3.part");
+            std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())
+        });
+        if let Err(e) = got {
+            post(true, format!("Couldn't fetch the classic death sound (Studio plays its replacement meanwhile): {e}"));
+        }
+    });
+}
+
 pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
     let agent = agent();
     let v: serde_json::Value = serde_json::from_slice(&get(&agent, VERSION_URL, None)?)

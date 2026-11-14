@@ -1,4 +1,4 @@
-//! The rustudio logo (original artwork); every other icon is a Tabler glyph (src/ti.rs).
+//! Rustudio logo, bundled primitive artwork, and Tabler class glyphs.
 
 use egui::{Painter, Rect, Sense, Vec2};
 
@@ -44,6 +44,7 @@ pub fn logo_rgba(size: u32) -> Vec<u8> {
 /// Small icon for a class in the Explorer and dialogs: its own Tabler glyph
 /// in its family's colour (src/class_icons.rs).
 pub fn paint_class_icon(p: &Painter, r: Rect, class: &str) {
+    if paint_part_icon(p, r, class, None) { return; }
     let (name, color) = crate::class_icons::icon_for(class);
     crate::ti::paint(p, r.expand(1.0), name, color);
 }
@@ -51,4 +52,32 @@ pub fn paint_class_icon(p: &Painter, r: Rect, class: &str) {
 pub fn class_icon(ui: &mut egui::Ui, class: &str, size: f32) {
     let (r, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     paint_class_icon(ui.painter(), r, class);
+}
+
+/// Shape-dependent Part artwork, also used for dedicated primitive classes.
+pub fn paint_part_icon(p: &Painter, r: Rect, class: &str, shape: Option<u32>) -> bool {
+    let Some((name, bytes)) = part_artwork(class, shape) else { return false; };
+    let id = egui::Id::new(("primitive-icon", name));
+    let texture = p.ctx().data_mut(|data| data.get_temp::<egui::TextureHandle>(id))
+        .unwrap_or_else(|| {
+            let rgba = image::load_from_memory(bytes).expect("embedded primitive icon").to_rgba8();
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [rgba.width() as usize, rgba.height() as usize], rgba.as_raw());
+            let texture = p.ctx().load_texture(name, image, egui::TextureOptions::LINEAR);
+            p.ctx().data_mut(|data| data.insert_temp(id, texture.clone()));
+            texture
+        });
+    p.image(texture.id(), r, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+    true
+}
+
+fn part_artwork(class: &str, shape: Option<u32>) -> Option<(&'static str, &'static [u8])> {
+    Some(match (class, shape) {
+        ("WedgePart", _) | ("Part", Some(3)) => ("Wedge", include_bytes!("../assets/icons/parts/WedgePart.png")),
+        ("CornerWedgePart", _) | ("Part", Some(4)) => ("CornerWedge", include_bytes!("../assets/icons/parts/CornerWedgePart.png")),
+        ("TrussPart", _) => ("Truss", include_bytes!("../assets/icons/parts/TrussPart.png")),
+        ("Part", Some(0)) => ("Sphere", include_bytes!("../assets/icons/parts/Sphere.png")),
+        ("Part", Some(2)) => ("Cylinder", include_bytes!("../assets/icons/parts/Cylinder.png")),
+        _ => return None,
+    })
 }

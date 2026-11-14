@@ -42,6 +42,7 @@ mod ui3;
 mod terrain_ed;
 mod sound;
 mod gc;
+mod studio_settings;
 
 struct Step {
     step: &'static str,
@@ -130,8 +131,21 @@ fn key(k: Key, pressed: bool, m: Modifiers) -> Event {
     }
 }
 
+/// A self-test is driving this process. The app takes the test out of its
+/// `Harness` while the test ticks (so the test can borrow the editor), and
+/// what the test starts then (a Play) must still see a test run, not a run a
+/// person drives: Clear Output On Start emptied the Output at each Play, and
+/// every step that read its script's lines from where the Output ended
+/// before Play found none (game-api, sound, gc, …: "no SNDTEST line").
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn running() -> bool {
+    RUNNING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl SelfTest {
     pub fn new(out: PathBuf) -> Self {
+        RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
         // The asset check fills a throwaway cache, never the real one; the
         // content folder is our own generated files; sounds stay silent.
         std::env::set_var(
@@ -252,6 +266,15 @@ impl SelfTest {
             let (cases, bad) = ed.regression_drag_parity();
             std::fs::write(&self.out, json!({"test": "drag_parity", "passed": bad.is_empty(), "cases": cases, "failures": bad}).to_string()).unwrap();
             return true;
+        }
+        if let Ok(phase) = std::env::var("RUSTUDIO_STUDIO_SETTINGS_REGRESSION") {
+            return match self.studio_settings_regression(ed, &phase) {
+                Some(result) => {
+                    std::fs::write(&self.out, result.to_string()).unwrap();
+                    true
+                }
+                None => false,
+            };
         }
         if std::env::var_os("RUSTUDIO_DUPLICATE_DRAG_REGRESSION").is_some() {
             if self.frame < 3 { return false; }

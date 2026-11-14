@@ -54,7 +54,25 @@ pub struct PartDrag {
     last: Option<(Rect, Pos2)>,
     /// Shift held: grid snapping is off while dragging (shouldGridSnap).
     pub shift: bool,
+    /// Alt held: Align Dragged Objects is off while dragging
+    /// (FreeformDragger._shouldAlignDraggedObjects).
+    pub alt: bool,
     pub moved: bool,
+    /// Physical mode (DraggerMovementMode.Physical): the camera-plane drag.
+    physical: Option<PhysDrag>,
+}
+
+/// FreeformDragger._updatePhysical: the grab point and the translation last
+/// applied (PartMover.moveToWithIk with the collision mode).
+#[derive(Clone, Debug)]
+struct PhysDrag {
+    grab: Vec3,
+    /// Every part that moves: the selection and what is rigidly joined to it
+    /// (the mechanism IKMoveTo carries), with where it started.
+    parts: Vec<(Ref, Xform, Vec3, MeshKind, Variant)>,
+    /// Anchored: Studio's IK dragger can't move the assembly at all.
+    stuck: bool,
+    last: Vec3,
 }
 
 /// Half the extent of a box (rotation `xf.rot`, `size`) along unit `n`.
@@ -295,6 +313,155 @@ fn round_rotation(m: Mat3) -> Mat3 {
     Mat3::from_cols(r(m.x_axis), r(m.y_axis), r(m.z_axis))
 }
 
+/// DragHelper.getSurfaceSnapForPartTreatedAsBox (Use Bounding Boxes): the
+/// surface frame of `s` as its box (ExtentsCFrame / ExtentsSize). The face
+/// is the box axis most aligned with the hit normal; the hit is projected
+/// onto it; the origin is the face corner in the hit's quadrant and Z runs
+/// along the nearer of the two edges there. Returns (projected hit, frame).
+pub(crate) fn surface_matrix_box(s: &Solid, hit: Vec3, n: Vec3) -> (Vec3, Xform) {
+    let axes = [s.xf.rot.col(0), s.xf.rot.col(1), s.xf.rot.col(2)];
+    let half = s.size * 0.5;
+    let (mut i, mut sign, mut best) = (0usize, 1.0f32, f32::NEG_INFINITY);
+    for (k, a) in axes.iter().enumerate() {
+        let d = a.dot(n);
+        if d.abs() > best {
+            best = d.abs();
+            i = k;
+            sign = if d >= 0.0 { 1.0 } else { -1.0 };
+        }
+    }
+    let normal = axes[i] * sign;
+    let centre = s.xf.pos + normal * half[i];
+    let (j, k) = ((i + 1) % 3, (i + 2) % 3);
+    let (u, v, hu, hv) = (axes[j], axes[k], half[j], half[k]);
+    let d = hit - centre;
+    let (a, b) = (d.dot(u), d.dot(v));
+    let projected = centre + u * a + v * b;
+    let (ca, cb) = (a.clamp(-hu, hu), b.clamp(-hv, hv));
+    let corner = centre + u * if ca >= 0.0 { hu } else { -hu } + v * if cb >= 0.0 { hv } else { -hv };
+    let edge = if hu - ca.abs() <= hv - cb.abs() { v } else { u };
+    let x = normal.cross(edge).normalize_or_zero();
+    (projected, Xform { pos: corner, rot: Mat3::from_cols(x, normal, x.cross(normal)) })
+}
+
+/// DragHelper.getSizeInSurface: the target part's extent along the surface
+/// frame's X and Z (the box's projected size; Y is 0).
+pub(crate) fn size_in_surface(s: &Solid, m: &Xform) -> glam::Vec2 {
+    let r = m.rot.transpose() * s.xf.rot;
+    let row = |i: usize| (0..3).map(|c| (s.size[c] * r.col(c)[i]).abs()).sum::<f32>();
+    glam::Vec2::new(row(0), row(2))
+}
+
+/// Utility.snapRotationToPrimaryDirection (Align Dragged Objects): turns a
+/// rotation to the nearest one whose axes lie on ±X / ±Y / ±Z. The axis
+/// with the largest component snaps first, then the next; the third
+/// follows from their cross product.
+pub(crate) fn snap_rotation_to_primary(m: Mat3) -> Mat3 {
+    fn largest(v: Vec3) -> f32 {
+        v.x.abs().max(v.y.abs()).max(v.z.abs())
+    }
+    fn snap(v: Vec3) -> Vec3 {
+        let mut best = (v, f32::NEG_INFINITY);
+        for a in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z] {
+            let d = v.dot(a);
+            if best.1 < d {
+                best = (a, d);
+            }
+        }
+        best.0
+    }
+    fn safe_cross(a: Vec3, b: Vec3) -> Vec3 {
+        let mut c = a.cross(b);
+        if c.length() < 1e-6 {
+            c = a.cross(if a.x.abs() < 0.99 { Vec3::X } else { Vec3::Y });
+        }
+        c.normalize()
+    }
+    let (mut r, mut u, b) = (m.col(0), m.col(1), m.col(2));
+    let (lr, lu, lb) = (largest(r), largest(u), largest(b));
+    if lu < lr && lb < lr {
+        r = snap(r);
+        if lb < lu {
+            u = snap(u);
+        } else {
+            u = safe_cross(snap(b), r);
+        }
+    } else if lb < lu {
+        u = snap(u);
+        if lb < lr {
+            r = snap(r);
+        } else {
+            r = safe_cross(u, snap(b));
+        }
+    } else {
+        let bb = snap(b);
+        if lu < lr {
+            r = snap(r);
+            u = safe_cross(bb, r);
+        } else {
+            u = snap(u);
+            r = safe_cross(u, bb);
+        }
+    }
+    Mat3::from_cols(r, u, r.cross(u))
+}
+
+/// The surface a drag rests on: the hit (projected onto the box face with
+/// Use Bounding Boxes), its frame, and the target part's size in that frame
+/// (None over empty space: getSurfaceMatrixForSurfaceExtension).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Surf {
+    pub hit: Vec3,
+    pub m: Xform,
+    pub tsize: Option<glam::Vec2>,
+}
+
+/// The settings a free drag's target depends on (DraggerContext:
+/// shouldGridSnap / shouldAlignDraggedObjects / shouldPartSnap).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DragOpts {
+    pub grid: Option<f32>,
+    /// Align Dragged Objects (and Alt not held).
+    pub align: bool,
+    /// Snap to Parts: the camera (position, forward, vertical FOV in degrees)
+    /// that sets the soft-snap distance.
+    pub soft: Option<(Vec3, Vec3, f32)>,
+}
+
+/// DragHelper.softSnapIntervals: of the selection's two edges and centre
+/// (`c` ± `hs`) and the target's (`t` ± `ht`), the closest pair: (offset, line).
+fn soft_snap_interval(c: f32, hs: f32, t: f32, ht: f32) -> (f32, f32) {
+    let mut best = (f32::INFINITY, 0.0);
+    for i in [-1.0f32, 0.0, 1.0] {
+        let a = c + i * hs;
+        for j in [-1.0f32, 0.0, 1.0] {
+            let b = t + j * ht;
+            let d = a - b;
+            if d.abs() < best.0.abs() {
+                best = (d, b);
+            }
+        }
+    }
+    best
+}
+
+/// DragHelper.chooseBetterSnap: the grid or the soft snap, whichever moves
+/// less (the grid on a tie within 0.01).
+fn better_snap(grid: Option<f32>, soft: Option<f32>) -> f32 {
+    match (grid, soft) {
+        (Some(g), Some(s)) => {
+            if (g.abs() - s.abs()).abs() < 0.01 || g.abs() < s.abs() {
+                g
+            } else {
+                s
+            }
+        }
+        (Some(g), None) => g,
+        (None, Some(s)) => s,
+        (None, None) => 0.0,
+    }
+}
+
 /// The state of one freeform drag (FreeformDragger + DragHelper), free of
 /// the editor so tests can run it on Studio's numbers.
 #[derive(Clone, Debug)]
@@ -306,26 +473,40 @@ pub(crate) struct FreeDrag {
     pub tilt: Mat3,
     /// The last surface frame (`lastTargetMat`).
     pub last_target: Option<Xform>,
+    /// Use Bounding Boxes: target parts are treated as their boxes.
+    pub use_bbox: bool,
 }
 
 impl FreeDrag {
     /// `click` is where the press hit the clicked part, `clicked` that part's
-    /// surface frame there (rounded on it when grid snap is on).
-    pub fn begin(bbox: DragBox, click: Vec3, clicked: Option<Xform>, grid: Option<f32>) -> FreeDrag {
+    /// surface frame there (rounded on it when grid snap is on). With Use
+    /// Bounding Boxes the grab point is the click put on the box face
+    /// (dispatchWorldClick.buildFreeformDragInfo).
+    pub fn begin(bbox: DragBox, click: Vec3, clicked: Option<Xform>, grid: Option<f32>, use_bbox: bool) -> FreeDrag {
         let mut grab = click;
-        if let (Some(m), Some(g)) = (clicked, grid) {
+        if let Some(m) = clicked {
             let l = m.rot.transpose() * (click - m.pos);
-            grab = m.apply(Vec3::new(round_grid(l.x, g), l.y, round_grid(l.z, g)));
+            let (mut x, mut z) = (l.x, l.z);
+            if let Some(g) = grid {
+                x = round_grid(x, g);
+                z = round_grid(z, g);
+            }
+            if use_bbox {
+                grab = m.apply(Vec3::new(x, 0.0, z));
+            } else if grid.is_some() {
+                grab = m.apply(Vec3::new(x, l.y, z));
+            }
         }
         let dragged = bbox.basis.rot.transpose() * (grab - bbox.basis.pos);
-        FreeDrag { bbox, dragged, tilt: Mat3::IDENTITY, last_target: None }
+        FreeDrag { bbox, dragged, tilt: Mat3::IDENTITY, last_target: None, use_bbox }
     }
 
     /// The surface under `ray`: the nearest hit (point, normal, solid), else
     /// the last surface's plane extended. None: nothing to drag onto.
-    pub fn surface(&self, ray: &Ray, hit: Option<(Vec3, Vec3, Solid)>) -> Option<(Vec3, Xform)> {
+    pub fn surface(&self, ray: &Ray, hit: Option<(Vec3, Vec3, Solid)>) -> Option<Surf> {
         if let Some((p, n, s)) = hit {
-            return Some((p, surface_matrix(&s.geometry(), p, n)));
+            let (hit, m) = if self.use_bbox { surface_matrix_box(&s, p, n) } else { (p, surface_matrix(&s.geometry(), p, n)) };
+            return Some(Surf { hit, m, tsize: Some(size_in_surface(&s, &m)) });
         }
         let m = self.last_target?;
         let up = m.rot.col(1);
@@ -334,39 +515,63 @@ impl FreeDrag {
             return None;
         }
         let t = (m.pos - ray.origin).dot(up) / dn;
-        (t.is_finite() && t > 0.0).then(|| (ray.at(t), m))
+        (t.is_finite() && t > 0.0).then(|| Surf { hit: ray.at(t), m, tsize: None })
+    }
+
+    /// The selection's rotation relative to surface `m` (getDragTargetNew's
+    /// R7): Align Dragged Objects snaps it to the surface's axes.
+    fn relative_rotation(&self, m: &Xform, align: bool) -> Mat3 {
+        let r = m.rot.transpose() * self.bbox.basis.rot;
+        if align { snap_rotation_to_primary(r) } else { r }
     }
 
     /// DragHelper.getDragTargetNew: the transform that carries the selection
     /// from where it started to rest on the surface under the mouse
     /// (`mainCFrame * basis⁻¹`).
-    pub fn target(&mut self, surface: (Vec3, Xform), grid: Option<f32>) -> Xform {
-        let (hit, m) = surface;
+    pub fn target(&mut self, surface: Surf, opts: DragOpts) -> Xform {
+        let Surf { hit, m, tsize } = surface;
         self.last_target = Some(m);
         let b = self.bbox.basis;
-        let mt = m.rot.transpose();
-        let rt = mt * b.rot * self.tilt;
+        let r7 = self.relative_rotation(&m, opts.align);
+        let rt = r7 * self.tilt;
         let size = rt.col(0).abs() * self.bbox.size.x
             + rt.col(1).abs() * self.bbox.size.y
             + rt.col(2).abs() * self.bbox.size.z;
-        let l = mt * (hit - m.pos);
-        let (mut x, mut z) = (l.x, l.z);
-        if let Some(g) = grid {
-            x = round_grid(x, g);
-            z = round_grid(z, g);
+        let l = m.rot.transpose() * (hit - m.pos);
+        // computeDragSnapping: grid and soft snap offsets on X / Z.
+        let grid_d = |v: f32| opts.grid.map(|g| round_grid(v, g) - v);
+        let (mut sx, mut sz) = (None, None);
+        if let (Some((cpos, cfwd, fov)), Some(ts)) = (opts.soft, tsize) {
+            let centre = l + rt * (self.bbox.offset - self.dragged);
+            let thr = 0.02 * fov.to_radians().sin() * (hit - cpos).dot(cfwd) * crate::studio_settings::studio("DraggerSoftSnapMarginFactor", crate::mech::SOFT_SNAP_MARGIN as f64) as f32;
+            let sgn = |v: f32| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 };
+            let (dx, _) = soft_snap_interval(centre.x, size.x * 0.5, sgn(l.x) * 0.5 * ts.x, ts.x * 0.5);
+            if dx.abs() < thr {
+                sx = Some(-dx);
+            }
+            let (dz, _) = soft_snap_interval(centre.z, size.z * 0.5, sgn(l.z) * 0.5 * ts.y, ts.y * 0.5);
+            if dz.abs() < thr {
+                sz = Some(-dz);
+            }
         }
+        let x = l.x + better_snap(grid_d(l.x), sx);
+        let z = l.z + better_snap(grid_d(l.z), sz);
         let base = m.pos + m.rot.col(0) * x + m.rot.col(2) * z;
         let lift = 0.5 * size.y - (rt * (self.bbox.offset - self.dragged)).y;
-        let rot = round_rotation_if_exact(b.rot * self.tilt);
+        let rot = round_rotation_if_exact(m.rot * rt);
         let pos = base + m.rot.col(1) * lift - rot * self.dragged;
         let trot = rot * b.rot.transpose();
         Xform { pos: pos - trot * b.pos, rot: trot }
     }
 
-    /// DragHelper.updateTiltRotateNew: a quarter turn about the basis axis
+    /// DragHelper.updateTiltRotateNew: a quarter turn about the axis of the
+    /// selection's frame on surface `m` (aligned with Align Dragged Objects)
     /// nearest `axis` (R: the surface normal; T: the camera's right).
-    pub fn turn(&mut self, axis: Vec3) {
-        let rot = self.bbox.basis.rot;
+    pub fn turn(&mut self, axis: Vec3, m: Option<Xform>, align: bool) {
+        let rot = match m {
+            Some(m) => m.rot * self.relative_rotation(&m, align),
+            None => self.bbox.basis.rot,
+        };
         let mut best = (Vec3::Y, f32::NEG_INFINITY);
         for a in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z] {
             let d = (rot * a).dot(axis);
@@ -518,6 +723,16 @@ impl Editor {
         (self.snap_move && self.move_inc > 0.0).then_some(self.move_inc)
     }
 
+    /// The free drag's settings this frame: Shift turns grid and part
+    /// snapping off, Alt Align Dragged Objects.
+    fn drag_opts(&self, shift: bool, alt: bool) -> DragOpts {
+        DragOpts {
+            grid: if shift { None } else { self.drag_grid() },
+            align: self.align_dragged && !alt,
+            soft: (self.part_snap && !shift).then(|| (self.cam.pos, self.cam.forward(), self.cam.fov_deg)),
+        }
+    }
+
     /// The pivot a selectable object turns about (Model:GetPivot / the
     /// part's CFrame * PivotOffset).
     pub(crate) fn object_pivot(&self, r: Ref) -> Option<Xform> {
@@ -581,8 +796,13 @@ impl Editor {
             .filter_map(|(r, xf)| self.scene.get(*r).map(|sp| (*xf, sp.size)))
             .collect();
         let bbox = DragBox::new(basis, &boxes, objects.len());
-        let face = surface_matrix(&clicked.geometry(), click, n);
-        let free = FreeDrag::begin(bbox, click, Some(face), self.drag_grid());
+        let face = if self.use_bounding_boxes {
+            surface_matrix_box(&clicked, click, n).1
+        } else {
+            surface_matrix(&clicked.geometry(), click, n)
+        };
+        let free = FreeDrag::begin(bbox, click, Some(face), self.drag_grid(), self.use_bounding_boxes);
+        let physical = self.physical_drag.then(|| self.phys_drag_begin(&parts, free.bbox.basis.apply(free.dragged)));
         let originals = parts.iter().filter_map(|(r, _)| Some((*r, self.doc.prop(*r, "CFrame")?))).collect();
         let carried = parts.iter().map(|(r, _)| *r).collect();
         self.part_drag = Some(PartDrag {
@@ -596,7 +816,9 @@ impl Editor {
             carried,
             last: None,
             shift: false,
+            alt: false,
             moved: false,
+            physical,
         });
         true
     }
@@ -607,8 +829,15 @@ impl Editor {
             return;
         };
         let ray = self.cam.ray(rect, p);
+        if d.physical.is_some() {
+            self.update_phys_drag(&ray);
+            if let Some(d) = self.part_drag.as_mut() {
+                d.last = Some((rect, p));
+            }
+            return;
+        }
         let hit = self.drag_hit(&ray, &d.carried);
-        let grid = if d.shift { None } else { self.drag_grid() };
+        let opts = self.drag_opts(d.shift, d.alt);
         let mut free = d.free.clone();
         let Some(surface) = free.surface(&ray, hit) else {
             if let Some(d) = self.part_drag.as_mut() {
@@ -616,7 +845,7 @@ impl Editor {
             }
             return;
         };
-        let t = free.target(surface, grid);
+        let t = free.target(surface, opts);
         let moves: Vec<(Ref, Xform)> = d
             .parts
             .iter()
@@ -643,17 +872,20 @@ impl Editor {
     /// re-run from the last pointer position.
     pub fn rotate_part_drag(&mut self, tilt: bool) {
         let Some(d) = self.part_drag.as_ref() else { return };
+        // Physical drags don't turn (FreeformDragger.rotate returns when
+        // constraints are solved).
+        if d.physical.is_some() {
+            return;
+        }
         let Some((rect, p)) = d.last else { return };
         let ray = self.cam.ray(rect, p);
-        let axis = if tilt {
-            Some(self.cam.right())
-        } else {
-            let hit = self.drag_hit(&ray, &d.carried);
-            d.free.surface(&ray, hit).map(|(_, m)| m.rot.col(1))
-        };
+        let hit = self.drag_hit(&ray, &d.carried);
+        let m = d.free.surface(&ray, hit).map(|s| s.m);
+        let axis = if tilt { Some(self.cam.right()) } else { m.map(|m| m.rot.col(1)) };
         let Some(axis) = axis else { return };
+        let align = self.drag_opts(d.shift, d.alt).align;
         if let Some(d) = self.part_drag.as_mut() {
-            d.free.turn(axis);
+            d.free.turn(axis, m, align);
             d.moved = true;
         }
         self.update_part_drag(rect, p);
@@ -714,8 +946,20 @@ impl Editor {
             })
             .collect();
         changes.extend(pivot_changes(&self.doc, d.undo_pivots.as_ref().unwrap_or(&d.pivots)));
+        // A physical drag also moved what's joined to the selection; and it
+        // makes no surface joints (only _updateGeometric computes JointPairs).
+        if let Some(ph) = &d.physical {
+            for (r, _, _, _, old) in &ph.parts {
+                if d.parts.iter().any(|(p, _)| p == r) {
+                    continue;
+                }
+                if let Some(new) = self.doc.dom.get_by_ref(*r).and_then(|i| i.properties.get(&ustr("CFrame")).cloned()) {
+                    changes.push((*r, ustr("CFrame"), Some(old.clone()), new));
+                }
+            }
+        }
         let carried: Vec<Ref> = d.parts.iter().map(|(r, _)| *r).collect();
-        let joints = if self.join_surfaces { self.surface_joints(&carried) } else { Vec::new() };
+        let joints = if self.join_surfaces && d.physical.is_none() { self.surface_joints(&carried) } else { Vec::new() };
         self.doc.record_drag("Drag", changes, joints);
     }
 
@@ -756,6 +1000,143 @@ impl Editor {
             }
         }
         made
+    }
+}
+
+// ------------------------------------------------------------ physical
+
+/// Parts joined rigidly (JointInstances: Weld, Motor6D, Snap…, and enabled
+/// WeldConstraints) to any of `start`: the assembly Studio's IK dragger
+/// carries along.
+pub(crate) fn rigid_assembly(doc: &crate::doc::Document, start: &[Ref]) -> Vec<Ref> {
+    let mut links: std::collections::HashMap<Ref, Vec<Ref>> = std::collections::HashMap::new();
+    for i in doc.dom.descendants() {
+        if !(crate::doc::is_a(&i.class, "JointInstance") || i.class == "WeldConstraint") {
+            continue;
+        }
+        if matches!(i.properties.get(&ustr("Enabled")), Some(Variant::Bool(false))) {
+            continue;
+        }
+        let get = |k: &str| match i.properties.get(&ustr(k)) {
+            Some(Variant::Ref(r)) if r.is_some() => Some(*r),
+            _ => None,
+        };
+        if let (Some(a), Some(b)) = (get("Part0"), get("Part1")) {
+            links.entry(a).or_default().push(b);
+            links.entry(b).or_default().push(a);
+        }
+    }
+    let mut seen: Vec<Ref> = start.to_vec();
+    let mut i = 0;
+    while i < seen.len() {
+        for n in links.get(&seen[i]).into_iter().flatten() {
+            if !seen.contains(n) {
+                seen.push(*n);
+            }
+        }
+        i += 1;
+    }
+    seen
+}
+
+impl Editor {
+    /// Physical mode's drag start: the grab point and the assembly that
+    /// moves (an anchored assembly doesn't move: IKMoveTo can't solve it).
+    fn phys_drag_begin(&self, parts: &[(Ref, Xform)], grab: Vec3) -> PhysDrag {
+        let start: Vec<Ref> = parts.iter().map(|(r, _)| *r).collect();
+        let all = rigid_assembly(&self.doc, &start);
+        let parts: Vec<(Ref, Xform, Vec3, MeshKind, Variant)> = all
+            .iter()
+            .filter_map(|r| {
+                let sp = self.scene.get(*r)?;
+                Some((*r, sp.xf, sp.size, sp.draw.mesh, self.doc.prop(*r, "CFrame")?))
+            })
+            .collect();
+        let stuck = parts.iter().any(|(r, ..)| matches!(self.doc.prop(*r, "Anchored"), Some(Variant::Bool(true))));
+        PhysDrag { grab, parts, stuck, last: Vec3::ZERO }
+    }
+
+    /// Physical mode: whether the assembly moved by `delta` would overlap a
+    /// CanCollide part outside it (IKCollisionsMode.IncludeContactedMechanisms;
+    /// touching is allowed).
+    fn phys_overlaps(&self, ph: &PhysDrag, delta: Vec3) -> bool {
+        let skip: HashSet<Ref> = ph.parts.iter().map(|p| p.0).collect();
+        ph.parts.iter().any(|(_, xf, size, kind, _)| {
+            let a = Solid { xf: Xform { pos: xf.pos + delta, rot: xf.rot }, size: *size, kind: *kind };
+            let ra = size.length() * 0.5;
+            self.scene.parts.iter().zip(&self.scene.bounds).any(|(sp, bd)| {
+                !skip.contains(&sp.r)
+                    && (bd.truncate() - a.xf.pos).length() <= ra + bd.w
+                    && !matches!(self.doc.prop(sp.r, "CanCollide"), Some(Variant::Bool(false)))
+                    && solids_overlap(&a, &self.solid_of(sp), crate::mech::COLLISION_OVERLAP)
+            })
+        })
+    }
+
+    /// FreeformDragger._updatePhysical: DragHelper.getCameraPlaneDragTarget
+    /// (the mouse ray on the plane through the grab point facing the
+    /// camera) gives a translation; with Collisions the assembly stops
+    /// against other parts and slides along them, as the IK solve does.
+    fn update_phys_drag(&mut self, ray: &Ray) {
+        let Some(ph) = self.part_drag.as_ref().and_then(|d| d.physical.clone()) else { return };
+        if ph.stuck {
+            return;
+        }
+        let n = -self.cam.forward();
+        let dn = ray.dir.dot(n);
+        if dn.abs() < 1e-9 {
+            return;
+        }
+        let t = (ph.grab - ray.origin).dot(n) / dn;
+        if !(t >= 0.0) {
+            return;
+        }
+        let want = ray.at(t) - ph.grab;
+        let delta = if self.collisions {
+            // Each axis in turn (largest move first), swept in steps no
+            // longer than a quarter of the smallest part so nothing tunnels:
+            // a blocked axis stops at contact (bisected to
+            // COLLISION_EPS), free ones slide on.
+            let step_len = ph.parts.iter().map(|p| p.2.min_element()).fold(f32::INFINITY, f32::min).max(0.05) * 0.25;
+            let mut g = ph.last;
+            let step = want - ph.last;
+            let mut order = [0usize, 1, 2];
+            order.sort_by(|a, b| step[*b].abs().total_cmp(&step[*a].abs()));
+            for i in order {
+                let (from, to) = (g[i], want[i]);
+                let n = ((to - from).abs() / step_len).ceil().max(1.0) as usize;
+                let at = |v: f32| {
+                    let mut d = g;
+                    d[i] = v;
+                    d
+                };
+                let mut ok = from;
+                for k in 1..=n {
+                    let v = from + (to - from) * (k as f32 / n as f32);
+                    if self.phys_overlaps(&ph, at(v)) {
+                        ok = safe_amount(ok, v, crate::mech::COLLISION_EPS, |x| self.phys_overlaps(&ph, at(x)));
+                        break;
+                    }
+                    ok = v;
+                }
+                g[i] = ok;
+            }
+            g
+        } else {
+            want
+        };
+        for (r, xf, ..) in &ph.parts {
+            let moved = Xform { pos: xf.pos + delta, rot: xf.rot };
+            self.doc.set_prop_live(*r, ustr("CFrame"), Variant::CFrame(moved.to_cframe()));
+        }
+        let pivots = self.part_drag.as_ref().map(|d| d.pivots.clone()).unwrap_or_default();
+        apply_model_pivots(&mut self.doc, &pivots, Xform { pos: delta, rot: Mat3::IDENTITY });
+        if let Some(d) = self.part_drag.as_mut() {
+            if let Some(p) = d.physical.as_mut() {
+                p.last = delta;
+            }
+            d.moved |= delta.length() > 1e-4;
+        }
     }
 }
 
@@ -956,7 +1337,7 @@ mod tests {
     fn surface_snap_preserves_normal_coordinate() {
         let face = Xform { pos: Vec3::new(0.5, 3.0, 0.5), rot: Mat3::IDENTITY };
         let bbox = DragBox { basis: Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY }, offset: Vec3::ZERO, size: Vec3::ONE };
-        let d = FreeDrag::begin(bbox, Vec3::new(1.2, 3.0, 2.3), Some(face), Some(1.0));
+        let d = FreeDrag::begin(bbox, Vec3::new(1.2, 3.0, 2.3), Some(face), Some(1.0), false);
         assert_eq!(d.dragged, Vec3::new(1.5, 3.0, 2.5));
     }
     #[test]
@@ -1067,7 +1448,7 @@ pub(crate) fn apply_model_pivots(doc: &mut crate::doc::Document, pivots: &[Pivot
 /// RotateSelectionAction's matrix (Studio): 90° about world +Y.
 pub(crate) const ROTATE_MATRIX: Mat3 = Mat3::from_cols(Vec3::NEG_Z, Vec3::Y, Vec3::X);
 
-/// TiltSelectionAction's matrix (Studio → Studio): the camera's
+/// TiltSelectionAction's matrix (Studio): the camera's
 /// heading `atan2(back.x, back.z)` in quarters, `floor((θ + 2.25π)·4/2π) & 3`
 /// (quarter 0 is θ ∈ [−45°, 45°)), picks 90° about +X,
 /// −Z, −X or +Z: the world axis nearest the camera's right, turned forwards.
@@ -1507,18 +1888,20 @@ mod studio_parity_tests {
         let boxes: Vec<(Xform, Vec3)> = carried.iter().map(|(_, so)| (so.xf, so.size)).collect();
         let bbox = DragBox::new(basis, &boxes, objects);
         let face = surface_matrix(&clicked.geometry(), click, n);
-        let mut d = FreeDrag::begin(bbox, click, Some(face), grid);
+        let mut d = FreeDrag::begin(bbox, click, Some(face), grid, false);
         let rr = ray(release.0, release.1);
         for k in keys.chars() {
             let axis = if k == 't' {
                 cam().right()
             } else {
-                d.surface(&rr, nearest(&s, &rr, &sel)).unwrap().1.rot.col(1)
+                d.surface(&rr, nearest(&s, &rr, &sel)).unwrap().m.rot.col(1)
             };
-            d.turn(axis);
+            let m = d.surface(&rr, nearest(&s, &rr, &sel)).map(|s| s.m);
+            d.turn(axis, m, false);
         }
         let surface = d.surface(&rr, nearest(&s, &rr, &sel)).expect("release over a surface");
-        let t = d.target(surface, grid);
+        // (Measured with Align Dragged Objects and Snap to Parts off.)
+        let t = d.target(surface, DragOpts { grid, align: false, soft: None });
         let mut out: Vec<(&'static str, Xform)> = carried.iter().map(|(n, so)| (*n, t.mul(&so.xf))).collect();
         if name.starts_with("model") {
             // The Model's pivot moves with it (WorldPivot / PrimaryPart).
@@ -1625,5 +2008,140 @@ mod studio_parity_tests {
         let f = (Vec3::new(0.0, 2.0, 0.0) - Vec3::new(0.0, 20.0, 20.0)).normalize();
         // (f32 unprojection through the inverse view-projection)
         assert!((r.dir - f).length() < 1e-4, "{:?}", r.dir - f);
+    }
+}
+
+/// Dragger settings measured in a Studio (checks/dragger-modes/
+/// findings.md): 1506x842 viewport, Camera.CFrame = lookAt((0,20,20),
+/// (0,0,−5)) (Studio re-aimed the set camera at its Focus), FieldOfView 70, the 512x4x512 baseplate at (0,−2,0), the
+/// 2x4x6 Probe at (0,2,0); drags with a scripted mouse `drag` (press, release pixels
+/// as Camera:ViewportPointToRay takes them). Expected: Probe's
+/// CFrame:GetComponents().
+pub(crate) mod mode_cases {
+    use super::*;
+    use super::studio_cases::{ang, block, solid};
+
+    pub const W: f32 = 1506.0;
+    pub const H: f32 = 842.0;
+
+    /// The scene: named solids (Probe first after the baseplate).
+    pub fn scene(name: &str) -> Vec<(&'static str, Solid)> {
+        let mut s = vec![("Baseplate", block([0.0, -2.0, 0.0], [512.0, 4.0, 512.0]))];
+        let yaw = if name.starts_with("rot30") { ang(0.0, 30.0, 0.0) } else { Mat3::IDENTITY };
+        s.push(("Probe", solid([0.0, 2.0, 0.0], [2.0, 4.0, 6.0], yaw, MeshKind::Block)));
+        if name.starts_with("wedge") {
+            s.push(("Wedge", solid([8.0, 2.0, -4.0], [6.0, 4.0, 6.9282], ang(0.0, 180.0, 0.0), MeshKind::Wedge)));
+        }
+        if name.starts_with("target") {
+            s.push(("Target", block([9.0, 2.0, -8.0], [12.0, 4.0, 12.0])));
+        }
+        if name.starts_with("wall") {
+            s.push(("Wall", block([5.0, 4.0, 0.0], [2.0, 8.0, 8.0])));
+        }
+        s
+    }
+
+    /// (name, press, release, grid, align, use bounding boxes, snap to parts, expected Probe CFrame)
+    #[allow(clippy::type_complexity)]
+    pub const CASES: &[(&str, (f32, f32), (f32, f32), Option<f32>, bool, bool, bool, [f32; 12])] = &[
+        ("wedge_align", (753.0, 500.0), (914.0, 420.0), Some(1.0), true, false, false,
+            [8.0, 4.73205, -4.73205, 1.0, 0.0, 0.0, 0.0, 0.86603, -0.5, 0.0, 0.5, 0.86603]),
+        ("wedge_noalign", (753.0, 500.0), (914.0, 420.0), Some(1.0), false, false, false,
+            [8.0, 5.59808, -3.76795, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+        ("wedge_bbox", (753.0, 500.0), (914.0, 420.0), Some(1.0), true, true, false,
+            [8.0, 6.0, -6.5359, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+        ("target_partsnap_off", (753.0, 500.0), (1043.0, 357.0), None, true, false, false,
+            [14.24963, 6.0, -8.03405, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+        ("target_partsnap_on", (753.0, 500.0), (1043.0, 357.0), None, true, false, true,
+            [14.0, 6.0, -8.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+        // Collisions ticked: Studio's geometric free drag still overlaps the
+        // Target (FreeformDragger._updateGeometric never checks).
+        ("target_overlap", (753.0, 500.0), (810.0, 520.0), None, true, false, false,
+            [2.51709, 2.0, -1.00173, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+        ("rot30_align", (753.0, 500.0), (951.0, 500.0), Some(1.0), true, false, false,
+            [10.0, 2.0, -1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+    ];
+
+    /// Camera:ViewportPointToRay(px).Direction in that Studio for the pixels
+    /// used (the measured drags are reproduced from these rays; rustudio's
+    /// own Camera::ray at 1506x842 differs, so the self-test turns them
+    /// back into its view pixels with Camera::project).
+    pub fn studio_ray(px: f32, py: f32) -> Option<Vec3> {
+        let t: &[((f32, f32), [f32; 3])] = &[
+            ((753.0, 500.0), [0.000000, -0.721098, -0.692833]),
+            ((914.0, 420.0), [0.258662, -0.602180, -0.755297]),
+            ((1043.0, 357.0), [0.432452, -0.485572, -0.759740]),
+            ((810.0, 520.0), [0.093136, -0.740032, -0.666092]),
+            ((951.0, 500.0), [0.310382, -0.685484, -0.658616]),
+            ((700.0, 380.0), [-0.087607, -0.567931, -0.818401]),
+        ];
+        t.iter().find(|(p, _)| *p == (px, py)).map(|(_, d)| Vec3::from(*d))
+    }
+
+    pub fn camera() -> crate::camera::Camera {
+        let mut c = crate::camera::Camera::default();
+        c.pos = Vec3::new(0.0, 20.0, 20.0);
+        let f = (Vec3::new(0.0, 0.0, -5.0) - c.pos).normalize();
+        let r = f.cross(Vec3::Y).normalize();
+        c.set_rotation(Mat3::from_cols(r, r.cross(f), -f));
+        c.fov_deg = 70.0;
+        c
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+    use super::mode_cases::*;
+
+    /// Studio's own mouse ray for the pixel (the rays are what the drags
+    /// depend on; see `studio_ray`).
+    fn ray(px: f32, py: f32) -> Ray {
+        let d = studio_ray(px, py).expect("a measured pixel");
+        Ray { origin: camera().pos, dir: d.normalize() }
+    }
+    fn nearest(s: &[(&str, Solid)], ray: &Ray, skip: &str) -> Option<(Vec3, Vec3, Solid)> {
+        s.iter()
+            .filter(|(n, _)| *n != skip)
+            .filter_map(|(_, so)| so.raycast(ray).map(|(t, n)| (t, n, *so)))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(t, n, so)| (ray.at(t), n, so))
+    }
+
+    #[test]
+    fn studio_dragger_settings() {
+        let cam = camera();
+        let mut bad = Vec::new();
+        for (name, press, release, grid, align, bbox, snap, want) in CASES {
+            let s = scene(name);
+            let probe = s[1].1;
+            let pr = ray(press.0, press.1);
+            let (click, n, clicked) = nearest(&s, &pr, "").unwrap();
+            let face = if *bbox { surface_matrix_box(&clicked, click, n).1 } else { surface_matrix(&clicked.geometry(), click, n) };
+            let mut d = FreeDrag::begin(DragBox::new(probe.xf, &[(probe.xf, probe.size)], 1), click, Some(face), *grid, *bbox);
+            let rr = ray(release.0, release.1);
+            let surf = d.surface(&rr, nearest(&s, &rr, "Probe")).unwrap();
+            let opts = DragOpts { grid: *grid, align: *align, soft: snap.then(|| (cam.pos, cam.forward(), cam.fov_deg)) };
+            let xf = d.target(surf, opts).mul(&probe.xf);
+            let pos_err = (xf.pos - Vec3::new(want[0], want[1], want[2])).abs().max_element();
+            let mut rot_err = 0.0f32;
+            for i in 0..3 {
+                for j in 0..3 {
+                    rot_err = rot_err.max((xf.rot.col(j)[i] - want[3 + i * 3 + j]).abs());
+                }
+            }
+            if pos_err > 0.002 || rot_err > 2e-5 {
+                bad.push(format!("{name}: got {:?} rot {:?} (pos err {pos_err}, rot err {rot_err})", xf.pos, xf.rot));
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn snap_rotation_picks_nearest_axes() {
+        let m = snap_rotation_to_primary(studio_cases::ang(10.0, 30.0, -20.0));
+        assert!(m.abs_diff_eq(Mat3::IDENTITY, 1e-6), "{m:?}");
+        let m = snap_rotation_to_primary(studio_cases::ang(0.0, 80.0, 0.0));
+        assert!(m.abs_diff_eq(Mat3::from_rotation_y(std::f32::consts::FRAC_PI_2), 1e-6), "{m:?}");
     }
 }

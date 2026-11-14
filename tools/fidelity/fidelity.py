@@ -233,6 +233,11 @@ def studio_capture(mcp, place, out, times, cfg=None):
             if "Returned" in r:
                 break
             time.sleep(2)
+        # With several Studio launches running, a slot's port can end up on
+        # another launch's Studio: drive only the instance showing our copy.
+        title = re.search(r'"title": "([^"]*)"', mcp.call("instance_info", a))
+        if not title or os.path.basename(place) not in title.group(1).replace("\\\\", "/").replace("\\", "/"):
+            raise RuntimeError(f"slot {slot} is not our Studio (title {title.group(1) if title else None!r}); rerun this place")
         # Play (F5) through Studio's own action; playtest (toolbar clicks)
         # only when the action doesn't start it.
         info = mcp.call("invoke_action", dict(a, name="simulationPlayAction"))

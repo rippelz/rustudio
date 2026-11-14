@@ -460,6 +460,7 @@ impl Editor {
             ));
         }
         if let Some(v) = asked.volume {
+            let changed = v != (crate::audio::master_volume() * 10.0 + 0.5).floor() as u32;
             g.menu.volume = Some(v);
             let f = v as f32 / 10.0;
             g.menu.lua.push(format!(
@@ -468,6 +469,16 @@ impl Editor {
             match g.audio.as_mut() {
                 Some(a) => a.set_master(f),
                 None => crate::audio::set_master_global(f),
+            }
+            // GameSettings.lua: each ValueChanged plays VolumeChangeSound
+            // (rbxasset://sounds/uuhhh.mp3) from the start at Volume = level / 10.
+            if changed {
+                if let Some(b) = crate::assets::resolve("rbxasset://sounds/uuhhh.mp3", None)
+                    .and_then(|p| std::fs::read(p).ok())
+                {
+                    let a = g.audio.get_or_insert_with(crate::audio::Audio::new);
+                    let _ = a.play(u64::MAX, std::sync::Arc::new(b), f, 1.0, false, 0.0, Default::default());
+                }
             }
         }
         if let Some(on) = asked.inverted {

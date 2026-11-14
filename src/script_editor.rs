@@ -75,12 +75,6 @@ const GLOBALS: &[&str] = &[
     "unpack",
 ];
 
-const C_KEYWORD: Color32 = Color32::from_rgb(242, 166, 60);
-const C_GLOBAL: Color32 = Color32::from_rgb(110, 190, 225);
-const C_STRING: Color32 = Color32::from_rgb(152, 202, 118);
-const C_NUMBER: Color32 = Color32::from_rgb(214, 150, 222);
-const C_COMMENT: Color32 = Color32::from_rgb(118, 126, 140);
-const C_OP: Color32 = Color32::from_rgb(190, 196, 206);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tok {
@@ -189,15 +183,17 @@ fn line_range(src: &str, line: usize) -> Option<std::ops::Range<usize>> {
 pub fn highlight(src: &str, error_line: Option<usize>, font: FontId) -> LayoutJob {
     let mut job = LayoutJob::default();
     let err = error_line.and_then(|l| line_range(src, l));
+    // Studio Settings > Script Editor > Theme.
+    let sc = crate::studio_settings::script_colors();
     for (range, tok) in tokenize(src) {
         let color = match tok {
-            Tok::Plain => theme::TEXT,
-            Tok::Keyword => C_KEYWORD,
-            Tok::Global => C_GLOBAL,
-            Tok::Str => C_STRING,
-            Tok::Num => C_NUMBER,
-            Tok::Comment => C_COMMENT,
-            Tok::Op => C_OP,
+            Tok::Plain => sc.text,
+            Tok::Keyword => sc.keyword,
+            Tok::Global => sc.builtin,
+            Tok::Str => sc.string,
+            Tok::Num => sc.number,
+            Tok::Comment => sc.comment,
+            Tok::Op => sc.operator,
         };
         // Split the token where it crosses into / out of the error line.
         let mut cuts = vec![range.start, range.end];
@@ -317,8 +313,13 @@ impl Editor {
         });
         ui.separator();
 
-        let font = FontId::monospace(13.0);
+        // Studio Settings > Script Editor > Font (size), Background Color,
+        // Text Wrapping.
+        let font = FontId::monospace(crate::studio_settings::font_px("Studio", "Font"));
         let row_h = ui.fonts_mut(|f| f.row_height(&font));
+        let wrap = crate::studio_settings::flag("Studio", "Text Wrapping", false);
+        let bg = crate::studio_settings::script_colors().background;
+        ui.painter().rect_filled(ui.available_rect_before_wrap(), 0.0, bg);
         let error_line = buf.error.as_ref().map(|e| e.0);
         let mut changed = false;
         egui::ScrollArea::both()
@@ -358,9 +359,12 @@ impl Editor {
 
                     let mut layouter = |ui: &egui::Ui,
                                         text: &dyn egui::TextBuffer,
-                                        _wrap: f32|
+                                        wrap_w: f32|
                      -> Arc<egui::Galley> {
-                        let job = highlight(text.as_str(), error_line, font.clone());
+                        let mut job = highlight(text.as_str(), error_line, font.clone());
+                        if wrap {
+                            job.wrap.max_width = wrap_w;
+                        }
                         ui.fonts_mut(|f| f.layout_job(job))
                     };
                     let resp = ui.add(

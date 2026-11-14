@@ -131,6 +131,10 @@ pub struct GameState {
     /// Keys pressed since the last tick (a same-frame tap included), and
     /// whether a focused TextBox had the keys then (gameProcessedEvent).
     pub key_taps: Vec<(egui::Key, bool)>,
+    /// The same presses for the viewport's hotbar and chat keys: app.rs
+    /// strips unmodified key events from egui's input while playing, so
+    /// `key_pressed` never sees them there (only presses no TextBox took).
+    pub hotbar_taps: Vec<egui::Key>,
 }
 
 impl GameState {
@@ -714,6 +718,7 @@ impl Editor {
 
     pub(super) fn game_client_inputs(&mut self) {
         self.sync_view_size();
+        self.tell_client_equipped();
         let Some(p) = self.play.as_ref().and_then(|s| s.game.last_pointer) else {
             return;
         };
@@ -724,15 +729,6 @@ impl Editor {
             };
             Some((client?, pos))
         });
-        // Tell the client tool it was equipped once it has replicated.
-        let pending = self.play.as_ref().and_then(|s| {
-            s.game
-                .equipped
-                .as_ref()
-                .filter(|e| !e.client_told)
-                .map(|e| e.tool)
-        });
-        let client_tool = pending.and_then(|t| self.client_of(t));
         let Some(s) = self.play.as_mut() else { return };
         let Some(w) = s.client.as_mut().and_then(|c| c.world.as_mut()) else {
             return;
@@ -745,16 +741,35 @@ impl Editor {
             pos: hit.map(|h| h.1).unwrap_or(p.origin + p.dir * 1000.0),
             rot: crate::ltypes::look_at(p.origin, p.origin + p.dir, Vec3::Y).rot,
         });
-        let mouse = w.input.mouse;
-        if let Some(ct) = client_tool {
-            if let Some(e) = s.game.equipped.as_mut() {
-                e.client_told = true;
-            }
-            self.with_side(Side::Client, |rt, _, _| {
-                let m = mouse.map(|m| rt.inst(m)).unwrap_or(Value::Nil);
-                rt.fire(ct, "Equipped", vec![m]);
-            });
+    }
+
+    /// Tells the client tool it was equipped once it has replicated: with
+    /// or without a mouse over the view (a hotbar key with the pointer
+    /// elsewhere, or a LockCenter grab not yet begun, still equips).
+    fn tell_client_equipped(&mut self) {
+        let pending = self.play.as_ref().and_then(|s| {
+            s.game
+                .equipped
+                .as_ref()
+                .filter(|e| !e.client_told)
+                .map(|e| e.tool)
+        });
+        let Some(ct) = pending.and_then(|t| self.client_of(t)) else {
+            return;
+        };
+        let Some(s) = self.play.as_mut() else { return };
+        let mouse = s
+            .client
+            .as_ref()
+            .and_then(|c| c.world.as_ref())
+            .and_then(|w| w.input.mouse);
+        if let Some(e) = s.game.equipped.as_mut() {
+            e.client_told = true;
         }
+        self.with_side(Side::Client, |rt, _, _| {
+            let m = mouse.map(|m| rt.inst(m)).unwrap_or(Value::Nil);
+            rt.fire(ct, "Equipped", vec![m]);
+        });
     }
 
     /// Acts on what scripts on one side asked for this frame.
@@ -804,6 +819,12 @@ impl Editor {
                 if let Some(s) = self.play.as_mut() {
                     s.game.jump = true;
                 }
+            } else if side == Side::Server && self.play.as_ref().is_some_and(|s| s.npcs.has_humanoid(h)) {
+                // A Humanoid the controller drives (play_npc.rs) jumps by its
+                // state machine.
+                if let Some(s) = self.play.as_mut() {
+                    s.npcs.jump(h);
+                }
             } else if side == Side::Server {
                 if let Some(root) = self.npc_root(h) {
                     let power = f32_prop(&self.doc, h, "JumpPower", mech::JUMP_POWER);
@@ -828,7 +849,22 @@ impl Editor {
                 (_, t) => t,
             };
             match tool {
-                Some(t) => self.equip_tool(t),
+                Some(t) => {
+                    self.equip_tool(t);
+                    // A client script's EquipTool: its tool hears Equipped
+                    // now (Studio fires it right after the call), pointer or
+                    // not.
+                    if side == Side::Client {
+                        let ct = self.client_of(t);
+                        let told = self.play.as_mut().and_then(|s| s.game.equipped.as_mut()).filter(|e| e.tool == t);
+                        if let (Some(ct), Some(e)) = (ct, told) {
+                            if !e.client_told {
+                                e.client_told = true;
+                                self.with_side(Side::Client, |rt, _, _| rt.fire(ct, "Equipped", vec![Value::Nil]));
+                            }
+                        }
+                    }
+                }
                 None => self.unequip_tool(),
             }
         }
@@ -948,6 +984,18 @@ impl Editor {
         self.with_side(Side::Server, |rt, _, _| {
             rt.fire(tool, "Equipped", vec![Value::Nil])
         });
+    }
+
+    /// Forgets the equipped tool without putting it back in the Backpack
+    /// (its character is going, and the tool with it).
+    pub(super) fn drop_equipped(&mut self) {
+        let Some(e) = self.play.as_mut().and_then(|s| s.game.equipped.take()) else {
+            return;
+        };
+        let parts: Vec<Ref> = e.offsets.iter().map(|(r, _)| *r).collect();
+        if let Some(s) = self.play.as_mut() {
+            s.physics.skip.retain(|r| !parts.contains(r));
+        }
     }
 
     fn unequip_tool(&mut self) {
@@ -1391,6 +1439,14 @@ impl Editor {
             let reached = to.length() < mech::MOVE_TO_REACHED;
             let timed_out = now - since > mech::MOVE_TO_TIMEOUT_S as f64;
             let Some(s) = self.play.as_mut() else { break };
+            // A Humanoid the controller drives walks there itself
+            // (play_npc.rs reads the target); only the end is told here.
+            if s.npcs.has_humanoid(h) {
+                if reached || timed_out {
+                    finished.push((h, reached));
+                }
+                continue;
+            }
             let v = s
                 .physics
                 .velocities()
@@ -1718,21 +1774,28 @@ impl Editor {
         // Number keys pick hotbar slots; "/" opens chat.
         let mut slots = Vec::new();
         let mut open_chat = false;
+        let taps = self
+            .play
+            .as_mut()
+            .map(|s| std::mem::take(&mut s.game.hotbar_taps))
+            .unwrap_or_default();
         if !ctx.egui_wants_keyboard_input() {
             use egui::Key::*;
-            ctx.input(|i| {
-                for (n, k) in [Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9]
-                    .iter()
-                    .enumerate()
-                {
-                    if i.key_pressed(*k) {
-                        slots.push(n);
-                    }
+            for (n, k) in [Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9]
+                .iter()
+                .enumerate()
+            {
+                if taps.contains(k) {
+                    slots.push(n);
                 }
-                if i.key_pressed(Slash) {
-                    open_chat = true;
-                }
-            });
+            }
+            if taps.contains(&Slash) {
+                open_chat = true;
+            }
+            // "." opens the emote wheel (Roblox's Emotes menu key).
+            if taps.contains(&Period) {
+                crate::emote_wheel::toggle();
+            }
         }
         // StarterGui:SetCoreGuiEnabled(Chat, false) hides Roblox's chat (Place A's
         // menu does; Studio shows no chat there).
@@ -1812,56 +1875,26 @@ impl Editor {
             .as_ref()
             .and_then(|s| s.game.equipped.as_ref().map(|e| e.tool));
         if !slot_tools.is_empty() {
-            let w = 64.0;
-            let total = slot_tools.len() as f32 * (w + 6.0) - 6.0;
-            let mut x = rect.center().x - total / 2.0;
-            let y = rect.max.y - w - 14.0;
-            for (n, t) in slot_tools.iter().enumerate() {
-                let r = Rect::from_min_size(Pos2::new(x, y), egui::vec2(w, w));
-                let on = Some(*t) == equipped;
-                painter.rect_filled(
-                    r,
-                    2.0,
-                    Color32::from_rgba_unmultiplied(20, 22, 28, if on { 230 } else { 170 }),
-                );
-                painter.rect_stroke(
-                    r,
-                    2.0,
-                    Stroke::new(
-                        if on { 2.0 } else { 1.0 },
-                        if on {
-                            theme::ACCENT
-                        } else {
-                            Color32::from_gray(90)
-                        },
-                    ),
-                    egui::StrokeKind::Inside,
-                );
-                painter.text(
-                    r.min + egui::vec2(5.0, 3.0),
-                    egui::Align2::LEFT_TOP,
-                    format!("{}", n + 1),
-                    egui::FontId::proportional(11.0),
-                    Color32::from_gray(170),
-                );
-                let name = self
-                    .doc
-                    .dom
-                    .get_by_ref(*t)
-                    .map(|i| i.name.clone())
-                    .unwrap_or_default();
-                painter.text(
-                    r.center() + egui::vec2(0.0, 6.0),
-                    egui::Align2::CENTER_CENTER,
-                    name,
-                    egui::FontId::proportional(11.0),
-                    Color32::WHITE,
-                );
+            // (Slots hold server refs: viewing the client, the tool is in
+            // the other DataModel.) Drawn as Roblox's Backpack CoreScript
+            // does: gui.rs `draw_hotbar`.
+            let info: Vec<(String, String, bool)> = slot_tools
+                .iter()
+                .map(|t| {
+                    let d = if self.doc.exists(*t) { Some(&self.doc) } else { self.play_other_doc() };
+                    let name = d.and_then(|d| d.dom.get_by_ref(*t)).map(|i| i.name.clone()).unwrap_or_default();
+                    let texture = crate::scene::content_string(d.and_then(|d| d.prop(*t, "TextureId")))
+                        .unwrap_or_default();
+                    (name, texture, Some(*t) == equipped)
+                })
+                .collect();
+            let doc_dir = self.doc.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+            let rects = self.gui.draw_hotbar(&ctx, &painter, &mut self.assets, doc_dir.as_deref(), rect, &info);
+            for (n, r) in rects.into_iter().enumerate() {
                 let click = ui.interact(r, ui.id().with(("slot", n)), egui::Sense::click());
                 if click.clicked() {
                     slots.push(n);
                 }
-                x += w + 6.0;
             }
         }
 
@@ -1893,6 +1926,9 @@ impl Editor {
             draw_kicked(&painter, rect, &s);
         }
         self.game_menu(ui, rect);
+        if !menu {
+            self.emote_wheel(ui, rect, &mut slots);
+        }
         let mut sent: Option<String> = None;
         if let Some(s) = self.play.as_mut() {
             if open_chat {
@@ -2197,4 +2233,12 @@ fn draw_kicked(painter: &egui::Painter, rect: Rect, msg: &str) {
     painter.rect_filled(r, 8.0, Color32::from_rgb(35, 37, 39));
     painter.text(r.min + egui::vec2(20.0, 18.0), egui::Align2::LEFT_TOP, "Disconnected", egui::FontId::proportional(18.0), Color32::WHITE);
     painter.galley(r.min + egui::vec2(20.0, 50.0), g, Color32::WHITE);
+}
+
+impl GameState {
+    /// Where Humanoid:MoveTo is walking this (server) Humanoid, if it is
+    /// (play_npc.rs walks it there).
+    pub(crate) fn walk_target(&self, humanoid: Ref) -> Option<Vec3> {
+        self.walks.get(&humanoid).map(|w| w.target)
+    }
 }

@@ -1,4 +1,4 @@
-//! Rendered regression: unresized and stretched CSG beside a plain Slate Part.
+//! Rendered regression: authored UVs for unresized CSG, stud projection after resize.
 use super::{SelfTest, Step};
 use crate::{app::Editor, doc::Document};
 use glam::Vec3;
@@ -46,7 +46,14 @@ impl SelfTest {
             }
             let _ = image::save_buffer(self.out.with_extension("union-density.png"), px, *w,*h,image::ColorType::Rgba8);
         }
-        let passed = frequencies.len()==3 && frequencies.iter().all(|v| *v > 0.01 && (*v/frequencies[2]-1.0).abs()<0.45);
+        // Gradient/variance is a texture signature, not a monotonic measure
+        // of texel density. Require a distinct authored signature here.
+        // The fixture deliberately authors only one UV unit across eight
+        // studs. Studio preserves it for the unchanged union; resizing the
+        // second union regenerates stud UVs, matching the plain Part.
+        let passed = frequencies.len()==3
+            && frequencies[0] > 0.01 && (frequencies[0]/frequencies[2]-1.0).abs() > 0.1
+            && frequencies[1] > 0.01 && (frequencies[1]/frequencies[2]-1.0).abs()<0.45;
         self.steps.push(Step { step:"union-material-density", passed, detail:format!("normalized spatial gradient energy (union 8/8, union 12/4, Part): {frequencies:?}") });
         ed.show_grid = true;
         self.r4.phase = 252;

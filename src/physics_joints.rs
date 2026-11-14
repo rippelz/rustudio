@@ -370,6 +370,10 @@ impl Physics {
                 // A force over the step (cleared by the next apply_movers), so
                 // gravity and the spring integrate together.
                 let force = dir * f;
+                if std::env::var_os("RUSTUDIO_SPRING_DEBUG").is_some() {
+                    eprintln!("SPRING step={} len={len:.4} sep={sep:.4} f={f:.1} bodies {:?} {:?} m1={:?} v1={:?}", self.steps, e0.body.is_some(), e1.body.is_some(),
+                        e1.body.and_then(|b| self.world.bodies.get(b)).map(|b| b.mass()), e1.body.and_then(|b| self.world.bodies.get(b)).map(|b| b.linvel().y));
+                }
                 for (b, p, s) in [(e0.body, p0, 1.0), (e1.body, p1, -1.0)] {
                     if let Some(bh) = b {
                         if let Some(b) = self.world.bodies.get_mut(bh) {

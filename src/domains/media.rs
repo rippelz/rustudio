@@ -353,6 +353,8 @@ pub struct Media {
     fx: HashMap<Ref, dsp::Fx>,
     wind: HashMap<Ref, dsp::Wind>,
     analyzers: HashMap<Ref, AnalyzerState>,
+    /// (emitter, listener) → the L/R gains the last block ended on.
+    pans: HashMap<(Ref, Ref), (f32, f32)>,
     access: HashMap<Ref, Vec<i64>>,
     mixer_time: f64,
     carry: f64,
@@ -375,6 +377,7 @@ impl Default for Media {
             fx: HashMap::new(),
             wind: HashMap::new(),
             analyzers: HashMap::new(),
+            pans: HashMap::new(),
             access: HashMap::new(),
             mixer_time: 0.0,
             carry: 0.0,
@@ -1118,11 +1121,18 @@ fn connected_wires(lua: &Lua, this: Ref, args: &MultiValue) -> mlua::Result<Mult
 // ----------------------------------------------------------------- players
 
 fn ensure_player(lua: &Lua, r: Ref) -> mlua::Result<()> {
-    let has = media(lua)?.players.contains_key(&r);
-    if !has {
-        media(lua)?.players.insert(r, PlayerState::default());
-        // A player from a file or a Clone: its asset loads now.
-        asset_changed(lua, r)?;
+    let settled = media(lua)?.players.get(&r).map(|p| p.pcm.is_some() || p.loading.is_some() || p.failed);
+    match settled {
+        None => {
+            media(lua)?.players.insert(r, PlayerState::default());
+            // A player from a file or a Clone: its asset loads now (once in
+            // the DataModel).
+            asset_changed(lua, r)?;
+        }
+        // Registered outside the DataModel (a fresh Clone that was read
+        // before it was parented): it loads when it gets there.
+        Some(false) if in_dm(world(lua)?.d(), r) => asset_changed(lua, r)?,
+        Some(_) => {}
     }
     Ok(())
 }
@@ -1153,7 +1163,10 @@ fn asset_changed(lua: &Lua, r: Ref) -> mlua::Result<()> {
         store_prop(lua, r, "IsReady", Variant::Bool(false))?;
         store_prop(lua, r, "TimeLength", Variant::Float64(0.0))?;
     }
-    if id.trim().is_empty() {
+    // Studio loads an AudioPlayer's asset once it's in the DataModel: a
+    // Clone() not yet parented reads IsReady false, TimeLength 0 (Laser
+    // Tag's playSoundFromSource clones, measured 2026-11-12).
+    if id.trim().is_empty() || !in_dm(world(lua)?.d(), r) {
         return Ok(());
     }
     let got = start_load(&id);
@@ -1729,18 +1742,30 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     sound_loads(lua)?;
     misc::step(lua, dt)?;
 
-    // Render the graph for this frame.
-    let n = {
-        let mut m = media(lua)?;
-        let exact = dt * dsp::RATE as f64 + m.carry;
-        let n = exact.floor().max(0.0);
-        m.carry = exact - n;
-        (n as usize).min(dsp::RATE as usize / 4)
+    // Render the graph for this frame. The side that plays it (a client, or
+    // a session with no peer) runs on the device's clock like Studio's mixer
+    // thread (audio::graph_demand); otherwise by game time.
+    let device = {
+        let w = world(lua)?;
+        (w.side == Side::Client || !w.has_peer) && nodes.iter().any(|(_, c)| c == "AudioDeviceOutput")
+    };
+    let demand = if device { crate::audio::graph_demand() } else { None };
+    let (drop, n) = match demand {
+        Some((drop, keep)) => (drop, drop + keep),
+        None => {
+            let mut m = media(lua)?;
+            let exact = dt * dsp::RATE as f64 + m.carry;
+            let n = exact.floor().max(0.0);
+            m.carry = exact - n;
+            (0, (n as usize).min(dsp::RATE as usize / 4))
+        }
     };
     if n > 0 {
-        render(lua, &nodes, n)?;
+        render(lua, &nodes, n, drop, demand.is_some())?;
     }
-    advance_players(lua, dt)?;
+    // Players advance by exactly what was rendered, so TimePosition, Ended
+    // and the audio agree.
+    advance_players(lua, n as f64 / dsp::RATE as f64)?;
     Ok(())
 }
 
@@ -1842,7 +1867,10 @@ struct Ctx<'a> {
     frames: HashMap<Ref, Option<Xform>>,
 }
 
-fn render(lua: &Lua, nodes: &[(Ref, String)], n: usize) -> mlua::Result<()> {
+/// Renders `n` frames of the graph. With `device`, the AudioDeviceOutputs'
+/// sum (silence when nothing plays) goes to the device minus the first `drop`
+/// frames (time it already played as silence, see audio::graph_demand).
+fn render(lua: &Lua, nodes: &[(Ref, String)], n: usize, drop: usize, device: bool) -> mlua::Result<()> {
     let sinks: Vec<(Ref, String)> = nodes
         .iter()
         .filter(|(_, c)| matches!(c.as_str(), "AudioAnalyzer" | "AudioDeviceOutput"))
@@ -1862,6 +1890,12 @@ fn render(lua: &Lua, nodes: &[(Ref, String)], n: usize) -> mlua::Result<()> {
             inputs.entry((t, tn)).or_default().push((s, sn));
         }
     }
+    {
+        // Forget pans of emitters / listeners that are gone.
+        let w = world(lua)?;
+        let d = w.d();
+        media(lua)?.pans.retain(|(e, l), _| d.exists(*e) && d.exists(*l));
+    }
     let mut ctx = Ctx {
         lua,
         n,
@@ -1877,6 +1911,8 @@ fn render(lua: &Lua, nodes: &[(Ref, String)], n: usize) -> mlua::Result<()> {
         let local = w.side == Side::Client || !w.has_peer;
         (local, local_player(&w))
     };
+    // Every AudioDeviceOutput heard here, summed into one block.
+    let mut speakers: Option<Buf> = None;
     for (r, c) in sinks {
         let input = in_mix(&mut ctx, r, "Input")?;
         if c == "AudioAnalyzer" {
@@ -1913,14 +1949,27 @@ fn render(lua: &Lua, nodes: &[(Ref, String)], n: usize) -> mlua::Result<()> {
             let player = pref(world(lua)?.d(), r, "Player");
             if side_out && (player.is_none() || player == me) {
                 let st = dsp::convert(&b, 2);
-                let mut inter = Vec::with_capacity(n * 2);
-                for i in 0..n {
-                    inter.push(st[0][i]);
-                    inter.push(st[1][i]);
+                match &mut speakers {
+                    Some(sum) => {
+                        for (o, i) in sum.iter_mut().zip(&st) {
+                            for (a, b) in o.iter_mut().zip(i) {
+                                *a += b;
+                            }
+                        }
+                    }
+                    None => speakers = Some(st),
                 }
-                crate::audio::graph_output(&inter);
             }
         }
+    }
+    if side_out && (device || speakers.is_some()) {
+        let st = speakers.unwrap_or_else(|| dsp::silence(2, n));
+        let mut inter = Vec::with_capacity((n - drop.min(n)) * 2);
+        for i in drop.min(n)..n {
+            inter.push(st[0][i]);
+            inter.push(st[1][i]);
+        }
+        crate::audio::graph_output(&inter);
     }
     Ok(())
 }
@@ -2074,25 +2123,43 @@ fn frame_cached(ctx: &mut Ctx, r: Ref) -> mlua::Result<Option<Xform>> {
 }
 
 /// What a listener hears: every emitter's input, attenuated
-/// (GetAudibilityFor) and panned to stereo around the listener.
+/// (GetAudibilityFor) and panned to stereo around the listener. A change of
+/// gain or pan (the emitter or listener moved) glides across the block, as
+/// Studio's mixer settles a jump within one block instead of stepping
+/// (which clicks on every frame of a moving source).
 fn render_listener(ctx: &mut Ctx, li: Ref) -> mlua::Result<Option<Buf>> {
     let lua = ctx.lua;
     let Some(fl) = frame_cached(ctx, li)? else { return Ok(None) };
     let mut out: Option<Buf> = None;
     for em in ctx.emitters.clone() {
         let a = audibility(lua, em, li)?;
-        if a <= 0.0 {
+        let target = match frame_cached(ctx, em)? {
+            Some(fe) if a > 0.0 => {
+                let local = fl.inverse().apply(fe.pos);
+                let (pl, pr) = dsp::pan(local.x, local.length());
+                (a * pl, a * pr)
+            }
+            _ => (0.0, 0.0),
+        };
+        let from = media(lua)?.pans.get(&(em, li)).copied();
+        if target == (0.0, 0.0) && from.is_none_or(|f| f == (0.0, 0.0)) {
+            media(lua)?.pans.remove(&(em, li));
             continue;
         }
-        let Some(fe) = frame_cached(ctx, em)? else { continue };
-        let Some(x) = in_mix(ctx, em, "Input")? else { continue };
+        let Some(x) = in_mix(ctx, em, "Input")? else {
+            media(lua)?.pans.remove(&(em, li));
+            continue;
+        };
+        // A source that just started begins at its gain; one already heard glides.
+        let from = from.unwrap_or(target);
+        media(lua)?.pans.insert((em, li), target);
         let mono = dsp::convert(&x, 1);
-        let local = fl.inverse().apply(fe.pos);
-        let (pl, pr) = dsp::pan(local.x, local.length());
         let o = out.get_or_insert_with(|| dsp::silence(2, ctx.n));
+        let n = mono[0].len().max(1) as f32;
         for (i, s) in mono[0].iter().enumerate() {
-            o[0][i] += s * a * pl;
-            o[1][i] += s * a * pr;
+            let k = (i + 1) as f32 / n;
+            o[0][i] += s * (from.0 + (target.0 - from.0) * k);
+            o[1][i] += s * (from.1 + (target.1 - from.1) * k);
         }
     }
     Ok(out)
@@ -2165,5 +2232,88 @@ mod curve_tests {
             Some(Variant::BinaryString(b)) => assert_eq!(decode_curve(b.as_ref()).len(), 3),
             other => panic!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use crate::doc::Document;
+    use crate::runtime::{RunMode, Runtime, Side, World};
+
+    fn run(code: &str) -> Vec<String> {
+        run_for(code, 1)
+    }
+
+    fn run_for(code: &str, frames: usize) -> Vec<String> {
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Run);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.lua.load(code).set_name("=t").exec().unwrap();
+        for _ in 0..frames {
+            rt.step(1.0 / 60.0);
+        }
+        rt.leave().output.iter().map(|(_, t)| t.split("  —").next().unwrap_or("").to_string()).collect()
+    }
+
+    /// playSoundFromSource (Laser Tag): Clone a template, parent it to a bus,
+    /// wire it, Play, Ended:Once(Destroy). Studio: the unparented clone
+    /// isn't loaded (IsReady false, TimeLength 0), it loads and plays once
+    /// parented, Ended fires once at its length and the clone is destroyed.
+    #[test]
+    fn cloned_player_loads_when_parented_and_ends_once() {
+        let id = "rbxassetid://9900012026";
+        super::pcm_store(id, std::sync::Arc::new(crate::audio::Pcm { rate: 48000, chans: vec![vec![0.25; 4800]; 2] }));
+        let out = run_for(
+            r#"
+            local bus = Instance.new("AudioFader")
+            bus.Parent = workspace
+            local out = Instance.new("AudioDeviceOutput")
+            out.Parent = workspace
+            local w0 = Instance.new("Wire")
+            w0.SourceInstance, w0.TargetInstance, w0.Parent = bus, out, bus
+            local t = Instance.new("AudioPlayer")
+            t.Asset = "rbxassetid://9900012026"
+            t.Parent = workspace
+            print("template", t.IsReady, t.TimeLength)
+            local c = t:Clone()
+            print("clone", c.IsReady, c.TimeLength)
+            c.Parent = bus
+            local w = Instance.new("Wire")
+            w.SourceInstance, w.TargetInstance, w.Parent = c, bus, c
+            c:Play()
+            print("parented", c.IsReady, c.TimeLength, c.IsPlaying)
+            local n = 0
+            c.Ended:Connect(function()
+                n += 1
+                print("ended", n, c.IsPlaying)
+                c:Destroy()
+            end)
+        "#,
+            12,
+        );
+        for want in ["template true 0.1", "clone false 0", "parented true 0.1 true", "ended 1 false"] {
+            assert!(out.iter().any(|l| l == want), "{want:?} not in {out:?}");
+        }
+        assert!(!out.iter().any(|l| l.starts_with("ended 2")), "{out:?}");
+    }
+
+    /// Laser Tag's AudioPlayers load with the id in AudioContent (Studio
+    /// saves Asset there); `Asset` reads it back like Studio, and setting
+    /// either keeps the other in step (2026-11-12: Asset read "").
+    #[test]
+    fn audio_player_asset_and_audio_content_are_one_property() {
+        let out = run(r#"
+            local p = Instance.new("AudioPlayer")
+            p.AudioContent = Content.fromUri("rbxassetid://17682716783")
+            print("a", p.Asset)
+            p.Asset = "rbxassetid://17686647820"
+            print("b", p.AudioContent.Uri, p.Asset)
+            print("c", Instance.new("AudioPlayer").Asset == "")
+        "#);
+        assert!(out.iter().any(|l| l == "a rbxassetid://17682716783"), "{out:?}");
+        assert!(out.iter().any(|l| l == "b rbxassetid://17686647820 rbxassetid://17686647820"), "{out:?}");
+        assert!(out.iter().any(|l| l == "c true"), "{out:?}");
     }
 }

@@ -677,6 +677,20 @@ pub fn mip_levels() -> Vec<(usize, u32)> {
 mod tests {
     use super::*;
 
+    /// Part MaterialVariants share the terrain variant registry; their ids
+    /// must be told apart from table packs (which keep their random uvOffset)
+    /// and from ACR-tagged ids.
+    #[test]
+    fn variant_pack_ids_are_recognised() {
+        let id = register_terrain_variant(Pack { color: Some(9942998923), normal: Some(9942998998),
+            roughness: Some(9942998661), tiling: 1.0, ..Default::default() });
+        assert!(is_variant_pack(id));
+        for e in PRE_2022.iter().chain(Y2022.iter()).chain(Y2022_4K.iter()) {
+            assert!(!is_variant_pack(e.pack) && !is_variant_pack(e.detail));
+            assert!(!is_variant_pack(e.pack | ACR_BIT));
+        }
+    }
+
     #[test]
     fn terrain_height_mips_are_linear_and_use_red() {
         let image = crate::texture::Rgba {
@@ -792,14 +806,49 @@ fn variant_packs() -> &'static Mutex<HashMap<u64, Pack>> {
     PACKS.get_or_init(Default::default)
 }
 
+/// A pack id from `register_terrain_variant` (a MaterialVariant's maps).
+pub fn is_variant_pack(pack: u64) -> bool {
+    pack & (1u64 << 62) != 0 && pack & ACR_BIT == 0
+}
+
 /// Route authored terrain maps through the regular asynchronous pack loader.
 pub fn register_terrain_variant(pack: Pack) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     [pack.color, pack.normal, pack.roughness, pack.metalness, pack.height].hash(&mut h);
-    let id = (h.finish() & ((1u64 << 62) - 1)) | (1u64 << 62);
+    // Bit 62 marks a variant; the hash must stay below ACR_BIT (bit 61), or
+    // `build` takes the variant for a Studio KTX2 pack, the KTX2 lookup 404s
+    // and its fallback asks for the id without bit 61, which nothing
+    // registered (Laser Tag's Walkway / MossGrass / Moss drew flat white).
+    let id = (h.finish() & (ACR_BIT - 1)) | (1u64 << 62);
     variant_packs().lock().expect("variant packs").entry(id).or_insert(pack);
     id
+}
+
+/// A loaded pack's mean colour (sRGB unit RGB), averaged in linear light
+/// (γ 2.2) over its top level. Studio's decoration grass takes its blade
+/// base colour from the grass layer's mean albedo: the 2022 Grass colour map
+/// (9920551868) averages to (195.6, 195.1, 188.3) this way, against the
+/// table's avgAlbedo2022 (196, 196, 189) and the captured blade base
+/// (194, 196, 188) (checks/grass-parity/findings.txt). A MaterialVariant on
+/// Grass has no table entry, so its own ColorMap's mean is the base.
+pub fn mean_albedo(maps: &Maps) -> [f32; 3] {
+    static MEANS: OnceLock<Mutex<HashMap<u64, [f32; 3]>>> = OnceLock::new();
+    if let Some(m) = MEANS.get_or_init(Default::default).lock().expect("albedo means").get(&maps.pack) {
+        return *m;
+    }
+    let n = (LAYER_SIZE * LAYER_SIZE) as usize;
+    let lut: Vec<f64> = (0..256).map(|v| (v as f64 / 255.0).powf(2.2)).collect();
+    let mut sum = [0f64; 3];
+    for px in maps.albedo[..(n * 4).min(maps.albedo.len())].chunks_exact(4) {
+        for c in 0..3 {
+            sum[c] += lut[px[c] as usize];
+        }
+    }
+    let count = (maps.albedo.len() / 4).min(n).max(1) as f64;
+    let mean = sum.map(|s| (s / count).powf(1.0 / 2.2) as f32);
+    MEANS.get_or_init(Default::default).lock().expect("albedo means").insert(maps.pack, mean);
+    mean
 }
 
 // ------------------------------------------------- terrain packs as Studio has them
@@ -849,16 +898,34 @@ fn acr_bytes(pack: u64, rep: usize) -> Result<Vec<u8>, String> {
         "[{{\"assetId\":{pack},\"contentRepresentationPriorityList\":\"{list}\",\
          \"doNotFallbackToBaselineRepresentation\":\"true\",\"assetType\":\"TexturePack\",\"requestId\":\"0\"}}]"
     );
+    let location = |text: &str| -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(text).ok()?;
+        v.pointer("/0/location")?.as_str().map(str::to_string)
+    };
+    // Anonymous first (Studio's own packs are public); a MaterialVariant's
+    // pack is usually served only to signed-in accounts (401 anonymously),
+    // so then ask as the session does, in the open place's context.
     let mut r = agent
         .post("https://assetdelivery.roblox.com/v1/assets/batch")
         .header("Content-Type", "application/json")
         .send(body.as_str())
         .map_err(|e| format!("pack {pack} ktx2: {e}"))?;
-    let text = r.body_mut().read_to_string().map_err(|e| format!("pack {pack} ktx2: {e}"))?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| format!("pack {pack} ktx2: HTTP {}", r.status()))?;
-    let loc = v.pointer("/0/location").and_then(|l| l.as_str())
-        .ok_or_else(|| format!("pack {pack} ktx2: no location ({})", text.chars().take(120).collect::<String>()))?;
-    let mut r = agent.get(loc).header("Accept-Encoding", "gzip").call().map_err(|e| format!("pack {pack} ktx2: {e}"))?;
+    let mut text = r.body_mut().read_to_string().map_err(|e| format!("pack {pack} ktx2: {e}"))?;
+    let mut loc = location(&text);
+    if loc.is_none() && crate::assets::wait_for_session(std::time::Duration::from_secs(30)) {
+        let session = crate::assets::session_client()
+            .and_then(|c| Some(c.lock().ok()?.as_ref()?.session.downloader()));
+        if let Some(session) = session {
+            let place = rustudio_account::session::PLACE_CONTEXT.load(Ordering::Relaxed).to_string();
+            let extra: Vec<(&str, &str)> = if place != "0" { vec![("Roblox-Place-Id", place.as_str())] } else { Vec::new() };
+            match session.post_csrf_with("https://assetdelivery.roblox.com/v1/assets/batch", "application/json", body.as_bytes(), &extra) {
+                Ok((_, t)) => { loc = location(&t); text = t; }
+                Err(e) => text = e.to_string(),
+            }
+        }
+    }
+    let loc = loc.ok_or_else(|| format!("pack {pack} ktx2: no location ({})", text.chars().take(120).collect::<String>()))?;
+    let mut r = agent.get(&loc).header("Accept-Encoding", "gzip").call().map_err(|e| format!("pack {pack} ktx2: {e}"))?;
     let mut bytes = Vec::new();
     r.body_mut().with_config().limit(64 << 20).reader().read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     if bytes.starts_with(&[0x1f, 0x8b]) {

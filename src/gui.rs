@@ -166,6 +166,11 @@ pub struct Gui {
     /// EditableImage textures (runtime/editable.rs) by id without the
     /// generation: the generation shown (updated in place when it moves on).
     editable_gens: HashMap<String, u64>,
+    /// Smaller copies of each GUI image (halving, premultiplied box filter):
+    /// egui-wgpu makes no mipmaps, Roblox samples GUI images with them, so a
+    /// 256 px icon drawn at 48 px was point-sampled (Laser Tag's ammo and
+    /// hotbar icons). `mip` picks one by the drawn minification.
+    mips: HashMap<String, Vec<egui::TextureHandle>>,
     /// Font file → egui family name, once added to egui.
     fonts: HashMap<String, String>,
     fonts_failed: HashSet<String>,
@@ -814,9 +819,18 @@ fn font_of(d: &Document, r: Ref) -> (String, u32, bool) {
         .unwrap_or_else(|| legacy_font("SourceSans"))
 }
 
-/// The face file for a family/weight/style: the exact face if its file is
-/// here, else the nearest weight (same style first) that is.
-fn face_file(store: &mut AssetStore, family: &str, weight: u32, italic: bool) -> Option<String> {
+/// The face file for a family/weight/style: the nearest weight (same style
+/// first) whose file is here or is a cloud asset still to download (Laser
+/// Tag's Builder Mono, rbxassetid://16658246179, has only cloud faces: they
+/// were never fetched, so its timer drew in the default font). `failed`
+/// faces (download refused) are skipped for the nearest one here.
+fn face_file(
+    store: &mut AssetStore,
+    family: &str,
+    weight: u32,
+    italic: bool,
+    failed: &HashSet<String>,
+) -> Option<String> {
     static FAMILIES: std::sync::Mutex<Option<HashMap<String, Vec<(u32, bool, String)>>>> =
         std::sync::Mutex::new(None);
     let mut g = FAMILIES.lock().ok()?;
@@ -846,13 +860,13 @@ fn face_file(store: &mut AssetStore, family: &str, weight: u32, italic: bool) ->
         map.insert(family.to_string(), faces);
     }
     let available = |id: &str| -> bool {
-        if id.starts_with("rbxasset://") {
+        if failed.contains(id) {
+            false
+        } else if id.starts_with("rbxasset://") {
             crate::assets::resolve(id, None).is_some_and(|p| p.is_file())
         } else {
-            crate::assets::asset_ref(id).is_some_and(|a| {
-                crate::assets::local_asset_path(a.id).is_some()
-                    || crate::assets::cache_path(a).is_file()
-            })
+            // here, or fetched by `family` (Pending until it arrives)
+            crate::assets::asset_ref(id).is_some()
         }
     };
     let mut best: Option<(u32, &String)> = None;
@@ -921,7 +935,7 @@ impl Gui {
         let path = match self.faces.get(&key) {
             Some((p, at)) if p.is_some() || at.elapsed().as_secs_f32() < 1.0 => p.clone(),
             _ => {
-                let p = face_file(store, &font.0, font.1, font.2);
+                let p = face_file(store, &font.0, font.1, font.2, &self.fonts_failed);
                 self.faces.insert(key, (p.clone(), std::time::Instant::now()));
                 p
             }
@@ -950,6 +964,8 @@ impl Gui {
                 return FontFamily::Proportional;
             }
             Fetch::Unavailable(_) => {
+                // (the next lookup takes the nearest face that is here)
+                self.faces.retain(|_, (p, _)| p.as_deref() != Some(path.as_str()));
                 self.fonts_failed.insert(path);
                 return FontFamily::Proportional;
             }
@@ -982,6 +998,105 @@ impl Gui {
         // (the face is used from the next frame)
         self.no_cache = Some("font added");
         FontFamily::Proportional
+    }
+
+    /// An egui font for a legacy Font enum name at a Roblox TextSize (the
+    /// em mapping of gui_walk.rs `em_per_size`), for text the engine draws
+    /// itself (the Backpack hotbar).
+    fn core_font(
+        &mut self,
+        ctx: &egui::Context,
+        store: &mut AssetStore,
+        legacy: &str,
+        text_size: f32,
+    ) -> egui::FontId {
+        let family = self.family(ctx, store, &legacy_font(legacy));
+        let key = format!("{family:?}");
+        let k = match self.em_ratio.get(&key) {
+            Some(k) => *k,
+            None => {
+                let line = ctx.fonts_mut(|f| f.row_height(&egui::FontId::new(100.0, family.clone()))) / 100.0;
+                let k = crate::mech::GUI_FONT_EM_PER_TEXT_SIZE / line.max(0.5);
+                if matches!(family, FontFamily::Name(_)) {
+                    self.em_ratio.insert(key, k);
+                }
+                k
+            }
+        };
+        egui::FontId::new(text_size * k, family)
+    }
+
+    /// The Backpack hotbar as Roblox's CoreScript draws it (Studio 0.744
+    /// ExtraContent/scripts/CoreScripts/Modules/BackpackScript.lua): ICON_SIZE
+    /// 60 slots ICON_BUFFER 5 apart, centred in a 70 px bar on the bottom
+    /// edge; slot BACKGROUND_COLOR 31,31,31 at slotFadeLocked 0.5; the
+    /// TextureId image at 80 % (10 % in); the tool's name (SourceSans 14,
+    /// wrapped) only when TextureId is empty; the slot number (SourceSans 14
+    /// in a 15 % box at the top left); the equipped slot's four edge frames,
+    /// SLOT_EQUIP_THICKNESS 0.1 of the slot, SLOT_EQUIP_COLOR 90,142,233, over
+    /// the number. Slots are (name, TextureId, equipped); returns their rects.
+    pub(crate) fn draw_hotbar(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        store: &mut AssetStore,
+        doc_dir: Option<&std::path::Path>,
+        view: Rect,
+        slots: &[(String, String, bool)],
+    ) -> Vec<Rect> {
+        const ICON: f32 = 60.0;
+        const BUFFER: f32 = 5.0;
+        let n = slots.len() as f32;
+        let bar_w = BUFFER + n * (ICON + BUFFER);
+        let bar = Rect::from_min_size(
+            Pos2::new(view.center().x - bar_w / 2.0, view.max.y - (ICON + 2.0 * BUFFER)),
+            egui::vec2(bar_w, ICON + 2.0 * BUFFER),
+        );
+        let mut rects = Vec::with_capacity(slots.len());
+        for (i, (name, texture, equipped)) in slots.iter().enumerate() {
+            // slot:Readjust: centered - ICON/2 + (ICON+BUFFER) * (index - (total/2 + 0.5))
+            let factor = (i + 1) as f32 - (n / 2.0 + 0.5);
+            let x = bar.min.x + bar_w / 2.0 - ICON / 2.0 + (ICON + BUFFER) * factor;
+            let r = Rect::from_min_size(Pos2::new(x, bar.min.y + BUFFER), egui::vec2(ICON, ICON));
+            rects.push(r);
+            painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(31, 31, 31, 128));
+            let icon = (!texture.is_empty())
+                .then(|| self.texture(ctx, store, doc_dir, texture))
+                .flatten();
+            if let Some((tex, [tw, th])) = icon {
+                let minify = (tw as f32 / (ICON * 0.8)).min(th as f32 / (ICON * 0.8)) * ctx.pixels_per_point().recip();
+                painter.image(
+                    self.mip(texture, tex, minify),
+                    Rect::from_min_size(r.min + egui::vec2(ICON * 0.1, ICON * 0.1), egui::vec2(ICON * 0.8, ICON * 0.8)),
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            } else if texture.is_empty() {
+                let font = self.core_font(ctx, store, "SourceSans", 14.0);
+                let inner = r.shrink(1.0);
+                let galley = ctx.fonts_mut(|f| f.layout(name.clone(), font, Color32::WHITE, inner.width()));
+                let at = inner.center() - galley.size() / 2.0;
+                painter.galley(at, galley, Color32::WHITE);
+            }
+            if i < 9 {
+                let font = self.core_font(ctx, store, "SourceSans", 14.0);
+                let b = Rect::from_min_size(r.min, egui::vec2(ICON * 0.15, ICON * 0.15));
+                painter.text(b.center(), egui::Align2::CENTER_CENTER, format!("{}", i + 1), font, Color32::WHITE);
+            }
+            if *equipped {
+                let t = ICON * 0.1;
+                let c = Color32::from_rgb(90, 142, 233);
+                for e in [
+                    Rect::from_min_size(r.min, egui::vec2(t, ICON)),
+                    Rect::from_min_size(r.min + egui::vec2(t, 0.0), egui::vec2(ICON - 2.0 * t, t)),
+                    Rect::from_min_size(r.min + egui::vec2(ICON - t, 0.0), egui::vec2(t, ICON)),
+                    Rect::from_min_size(r.min + egui::vec2(t, ICON - t), egui::vec2(ICON - 2.0 * t, t)),
+                ] {
+                    painter.rect_filled(e, 0.0, c);
+                }
+            }
+        }
+        rects
     }
 
     /// A game's mouse cursor image (UserInputService.MouseIcon / Mouse.Icon)
@@ -1100,11 +1215,19 @@ impl Gui {
         match crate::texture::decode(&bytes) {
             Ok(img) => {
                 let size = [img.width as usize, img.height as usize];
-                let h = ctx.load_texture(
-                    format!("gui:{id}"),
-                    egui::ColorImage::from_rgba_unmultiplied(size, &img.pixels),
-                    egui::TextureOptions::LINEAR,
-                );
+                let base = egui::ColorImage::from_rgba_unmultiplied(size, &img.pixels);
+                let mut levels = Vec::new();
+                let mut cur = base.clone();
+                while levels.len() < 8 && (cur.size[0] >= 8 || cur.size[1] >= 8) {
+                    cur = half_image(&cur);
+                    levels.push(ctx.load_texture(
+                        format!("gui:{id}#{}", levels.len() + 1),
+                        cur.clone(),
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                self.mips.insert(id.to_string(), levels);
+                let h = ctx.load_texture(format!("gui:{id}"), base, egui::TextureOptions::LINEAR);
                 let out = (h.id(), size);
                 self.images.insert(id.to_string(), Img::Ready(h, size));
                 share().loaded.insert(id.to_string());
@@ -1114,6 +1237,19 @@ impl Gui {
                 self.images.insert(id.to_string(), Img::Failed);
                 None
             }
+        }
+    }
+
+    /// The texture to draw image `id` with when `minify` texels of its level
+    /// 0 fall on each drawn pixel: level floor(log2(minify)), or `base`.
+    pub(crate) fn mip(&self, id: &str, base: egui::TextureId, minify: f32) -> egui::TextureId {
+        if !(minify >= 2.0) {
+            return base;
+        }
+        let level = minify.log2().floor() as usize;
+        match self.mips.get(id) {
+            Some(l) if !l.is_empty() => l[level.min(l.len()) - 1].id(),
+            _ => base,
         }
     }
 
@@ -1156,6 +1292,33 @@ impl Gui {
         self.vf_meshes.insert(cache_key, loaded.clone());
         loaded
     }
+}
+
+/// An image at half size (odd edges keep their last texel), each texel the
+/// mean of up to four premultiplied texels.
+fn half_image(src: &egui::ColorImage) -> egui::ColorImage {
+    let [w, h] = src.size;
+    let (nw, nh) = (w.div_ceil(2).max(1), h.div_ceil(2).max(1));
+    let mut out = Vec::with_capacity(nw * nh);
+    for y in 0..nh {
+        for x in 0..nw {
+            let mut acc = [0u32; 4];
+            let mut n = 0u32;
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let (sx, sy) = (x * 2 + dx, y * 2 + dy);
+                if sx < w && sy < h {
+                    let c = src.pixels[sy * w + sx];
+                    for (a, v) in acc.iter_mut().zip(c.to_array()) {
+                        *a += v as u32;
+                    }
+                    n += 1;
+                }
+            }
+            let v = |i: usize| ((acc[i] + n / 2) / n) as u8;
+            out.push(Color32::from_rgba_premultiplied(v(0), v(1), v(2), v(3)));
+        }
+    }
+    egui::ColorImage::new([nw, nh], out)
 }
 
 // ------------------------------------------------------------------ rich text
@@ -1316,6 +1479,17 @@ fn rich_runs(src: &str) -> Vec<Run> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GUI images get halved copies with premultiplied means (odd edges kept).
+    #[test]
+    fn half_image_box_filter() {
+        let px = |a: u8| Color32::from_rgba_premultiplied(a, a, a, a);
+        let img = egui::ColorImage::new([3, 2], vec![px(0), px(255), px(10), px(255), px(0), px(30)]);
+        let h = half_image(&img);
+        assert_eq!(h.size, [2, 1]);
+        assert_eq!(h.pixels[0], px(128));
+        assert_eq!(h.pixels[1], px(20));
+    }
 
     #[test]
     fn rich_text_runs() {

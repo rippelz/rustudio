@@ -309,6 +309,19 @@ pub fn resolve(id: &str, doc_dir: Option<&Path>) -> Option<PathBuf> {
             {
                 return Some(alt);
             }
+            // The retired death sound: Studio plays sounds/oof.ogg (its 2022
+            // replacement) for it; rustudio plays the classic Oof once fetched.
+            if matches!(rest.to_ascii_lowercase().as_str(), "sounds/uuhhh.mp3" | "sounds/uuhhh.wav") {
+                let classic = crate::studio_content::classic_oof();
+                if classic.is_file() {
+                    return Some(classic);
+                }
+                crate::studio_content::fetch_classic_oof_once();
+                let oof = content_dir().join("sounds/oof.ogg");
+                if oof.is_file() {
+                    return Some(oof);
+                }
+            }
             // An old built-in file Studio loads by asset id instead.
             if legacy_content(rest).is_some() {
                 return None;
@@ -325,8 +338,13 @@ pub fn resolve(id: &str, doc_dir: Option<&Path>) -> Option<PathBuf> {
     let p = PathBuf::from(id);
     if p.is_absolute() {
         Some(p)
+    } else if let Some(d) = doc_dir {
+        Some(d.join(p))
     } else {
-        doc_dir.map(|d| d.join(p))
+        // Play's DataModel copies have no file: an opted-in place folder
+        // (note_opened_place) still names where its relative content lives.
+        let dirs = opted_in_folders().lock().ok()?.clone();
+        dirs.iter().map(|d| d.join(&p)).find(|f| f.is_file())
     }
 }
 
@@ -527,6 +545,43 @@ pub fn is_local_path(id: &str) -> bool {
     !id.is_empty() && (id.starts_with("file://") || (!id.contains("://") && asset_ref(id).is_none()))
 }
 
+/// The marker that opts one folder's files in as place content during Play.
+pub const LOCAL_CONTENT_MARKER: &str = ".rustudio-local-content";
+
+/// Folders of opened places that carry [`LOCAL_CONTENT_MARKER`] (canonical).
+fn opted_in_folders() -> &'static std::sync::Mutex<Vec<PathBuf>> {
+    static DIRS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(Default::default)
+}
+
+/// Called when a place file opens: if its folder holds [`LOCAL_CONTENT_MARKER`]
+/// (e.g. a converted level with its meshes/ and textures/ beside it), files
+/// inside that folder stay loadable while Play runs. Only that folder: a place
+/// saved straight into the home folder without the marker exposes nothing.
+pub fn note_opened_place(path: &Path) {
+    // Canonicalise the file first: a bare "level.rbxlx" has an empty parent.
+    let Some(dir) = path.canonicalize().ok().and_then(|p| p.parent().map(Path::to_path_buf)) else { return };
+    if dir.join(LOCAL_CONTENT_MARKER).is_file() {
+        let mut dirs = opted_in_folders().lock().unwrap_or_else(|e| e.into_inner());
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+}
+
+/// `id`'s file when it lies inside an opted-in place folder (relative ids
+/// resolve against those folders; Play's DataModel copies have no file path).
+fn opted_in_file(id: &str) -> Option<PathBuf> {
+    let dirs = opted_in_folders().lock().ok()?.clone();
+    if dirs.is_empty() || !is_local_path(id) {
+        return None;
+    }
+    let direct = resolve(id, None).into_iter();
+    let relative = dirs.iter().filter_map(|d| resolve(id, Some(d)));
+    direct.chain(relative).filter_map(|p| p.canonicalize().ok())
+        .find(|p| p.is_file() && dirs.iter().any(|d| p.starts_with(d)))
+}
+
 /// Whether place content (a property's image, mesh or sound) may load given
 /// whether scripts are running. Roblox never loads local files for a place;
 /// rustudio's editor does (MECHANICS.md), but not while scripts run: what is
@@ -534,7 +589,7 @@ pub fn is_local_path(id: &str) -> bool {
 /// CreateEditableImageAsync, GetWaveformAsync, AudioAnalyzer, raycasts and
 /// unions against a mesh). Checked before any cache keyed by id (#16).
 pub fn place_content_allowed(id: &str, running: bool) -> bool {
-    !running || !is_local_path(id) || local_content_opt_in()
+    !running || !is_local_path(id) || local_content_opt_in() || opted_in_file(id).is_some()
 }
 
 /// [`place_content_allowed`] for the live Play state.
@@ -712,6 +767,13 @@ impl AssetStore {
         if let Some(b) = self.memory.get(&a) {
             return Fetch::Ready(b.clone());
         }
+        // Downloading: its bytes reach the disk cache only when it's done.
+        // (Asked first: every part waiting on it asks again each time any
+        // asset arrives, and the disk cache read and local asset lookup
+        // below were ~100k instructions per ask in Place B.)
+        if self.pending.contains(&a) {
+            return Fetch::Pending;
+        }
         if let Ok(b) = std::fs::read(cache_path(a)) {
             let b = Arc::new(b);
             self.memory.insert(a, b.clone());
@@ -724,9 +786,6 @@ impl AssetStore {
         }
         if let Some(why) = self.failed.get(&a) {
             return Fetch::Unavailable(why.clone());
-        }
-        if self.pending.contains(&a) {
-            return Fetch::Pending;
         }
         // The session check is still running: wait for it rather than
         // fail anonymously (most assets need the session).
@@ -879,7 +938,8 @@ fn load_mesh_projected(bytes: &[u8]) -> Result<(Vec<Vec3>, Vec<Vec3>, Vec<Vec2>,
     // Normals are pre-scaled by the extent; the shader divides by the drawn size.
     let normals = m.normals.iter().map(|n| *n * extent).collect();
     let planes = (0..m.positions.len()).map(|i| extent.extend(m.projection_tags.get(i).copied().unwrap_or(0) as f32)).collect();
-    Ok((positions, normals, m.uvs, extent, m.colors, planes))
+    let colors = m.gpu_colors();
+    Ok((positions, normals, m.uvs, extent, colors, planes))
 }
 
 /// Uploads positions, normals, UVs and (possibly empty) per-corner colours.
@@ -1138,6 +1198,25 @@ impl TextureCache {
             Some(_) => Some(Ok(())),
             None => Some(Err(self.reasons.get(id).cloned().unwrap_or_else(|| "failed".into()))),
         }
+    }
+
+    /// Failed for good (not fetched or not decoded): a part showing it has
+    /// nothing to wait for (Studio draws it without, and doesn't ask again).
+    pub fn failed(&self, id: &str) -> bool {
+        matches!(self.entries.get(id), Some(None))
+    }
+
+    /// Whether asking for `id` again can get further: false while its
+    /// download or decode is still running (a part waiting on it is left
+    /// alone until then).
+    pub fn can_progress(&self, id: &str, store: &AssetStore) -> bool {
+        if self.entries.contains_key(id) || self.decoded.contains_key(id) {
+            return true;
+        }
+        if self.decoding.contains(id) {
+            return false;
+        }
+        !asset_ref(id).is_some_and(|a| store.pending.contains(&a))
     }
 
     /// A cached composite, building it the first time.
@@ -1437,6 +1516,240 @@ pub fn mesh_for_upload(bytes: &[u8]) -> Option<(Vec<Vec3>, Vec<Vec3>, Vec<Vec2>)
     Some((p, n, uv))
 }
 
+// ------------------------------------------------------------- R15 composit
+//
+// Studio composites an R15 character's classic clothing on the GPU into one
+// 916 × 568 atlas, and the R15 body MeshParts sample their own cell of it
+// with their own mesh UVs (Studio 0.744):
+// - layer list Studio: a CompositQuad body-colour fill per cell
+//   (Studio: type 1 → TexCompFS, blend One/Zero), then the Pants layer
+//   (), the Shirt layer (), the T-shirt (), each through
+//   avatar/compositing/R15Composit*Base.mesh (Studio: type 0 →
+//   TexCompPMAFS, blend One/InvSrcAlpha, colour = the clothing's Color3);
+// - draw Studio: TexCompOversampleVS (pos·scale + offset in an ortho
+//   over the target, uv as authored), linear filter, LOD bias −10 (mip 0);
+// - cells Studio (table Studio, 1/916 and 1/568 at Studio):
+//   UpperTorso/LowerTorso (0,0,388,272), left arm (388,0), right arm
+//   (652,0), left leg (388,284), right leg (652,284), each 264 × 284; rows
+//   counted from the top as the body meshes' UVs are (the GL draws sit at
+//   y = 568 − y − h).
+
+/// The R15 clothing atlas Studio composites (Studio: 1/916, 1/568).
+pub const R15_ATLAS_W: u32 = 916;
+pub const R15_ATLAS_H: u32 = 568;
+
+/// An R15 body part's cell of the atlas (x, y, w, h in atlas pixels).
+pub fn r15_cell(part: &str) -> Option<[f32; 4]> {
+    Some(match part {
+        "UpperTorso" | "LowerTorso" => [0.0, 0.0, 388.0, 272.0],
+        "LeftUpperArm" | "LeftLowerArm" | "LeftHand" => [388.0, 0.0, 264.0, 284.0],
+        "RightUpperArm" | "RightLowerArm" | "RightHand" => [652.0, 0.0, 264.0, 284.0],
+        "LeftUpperLeg" | "LeftLowerLeg" | "LeftFoot" => [388.0, 284.0, 264.0, 284.0],
+        "RightUpperLeg" | "RightLowerLeg" | "RightFoot" => [652.0, 284.0, 264.0, 284.0],
+        _ => return None,
+    })
+}
+
+/// The groups whose first part colours each cell (Studio checks the
+/// parts in this order, Studio: a MeshPart with a loadable TextureID;
+/// none such → the first part present): torso, left arm, right arm, left
+/// leg, right leg.
+pub const R15_CELL_GROUPS: [&[&str]; 5] = [
+    &["UpperTorso", "LowerTorso"],
+    &["LeftUpperArm", "LeftLowerArm", "LeftHand"],
+    &["RightUpperArm", "RightLowerArm", "RightHand"],
+    &["LeftUpperLeg", "LeftLowerLeg", "LeftFoot"],
+    &["RightUpperLeg", "RightLowerLeg", "RightFoot"],
+];
+
+/// What an R15 character's atlas is made of besides the clothing images.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct R15Look {
+    /// Body colour per cell group (R15_CELL_GROUPS), sRGB bytes.
+    pub cell_colors: [[u8; 3]; 5],
+    /// Shirt / Pants Color3 (multiplies the template).
+    pub shirt_color: [f32; 3],
+    pub pants_color: [f32; 3],
+}
+
+impl R15Look {
+    /// A cache key for the composite.
+    pub fn key(&self) -> String {
+        format!("{:?}{:?}{:?}", self.cell_colors, self.shirt_color, self.pants_color)
+    }
+}
+
+/// An R15 body part mesh's UVs moved into its atlas cell (Studio with
+/// the normalise flag: (x + pad) / 916, (y + pad) / 568, (w − 2 pad) / 916,
+/// (h − 2 pad) / 568; pad 0 for body cells).
+pub fn r15_atlas_uvs(part: &str, uvs: &[Vec2]) -> Option<Vec<Vec2>> {
+    let [x, y, w, h] = r15_cell(part)?;
+    let (aw, ah) = (R15_ATLAS_W as f32, R15_ATLAS_H as f32);
+    Some(uvs.iter().map(|uv| Vec2::new((x + uv.x * w) / aw, (y + uv.y * h) / ah)).collect())
+}
+
+/// Studio's three R15 composit meshes (torso, left arm, right arm): pixel
+/// positions (x, y up) and template UVs, as triangle lists.
+struct CompositMeshes {
+    torso: (Vec<Vec3>, Vec<Vec2>),
+    left: (Vec<Vec3>, Vec<Vec2>),
+    right: (Vec<Vec3>, Vec<Vec2>),
+}
+
+fn composit_meshes() -> Option<&'static CompositMeshes> {
+    static M: std::sync::OnceLock<Option<CompositMeshes>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let dir = crate::default_scripts::studio_dir()?.join("content/avatar/compositing");
+        let load = |n: &str| {
+            let m = crate::mesh::parse(&std::fs::read(dir.join(n)).ok()?).ok()?;
+            Some((m.positions, m.uvs))
+        };
+        Some(CompositMeshes {
+            torso: load("R15CompositTorsoBase.mesh")?,
+            left: load("R15CompositLeftArmBase.mesh")?,
+            right: load("R15CompositRightArmBase.mesh")?,
+        })
+    })
+    .as_ref()
+}
+
+/// The 916 × 568 atlas being composited: RGBA8 rows from the top, as the
+/// GPU target holds them (premultiplied by the PMA layers).
+struct Target {
+    px: Vec<u8>,
+}
+
+impl Target {
+    /// One triangle rasterized like the GPU does it (pixel centres, top-left
+    /// fill rule), `shade` giving the source colour at a pixel from the
+    /// interpolated uv and `blend` writing it.
+    fn triangle(&mut self, p: [Vec2; 3], uv: [Vec2; 3], shade: &dyn Fn(Vec2) -> [f32; 4], pma: bool) {
+        let (w, h) = (R15_ATLAS_W as i32, R15_ATLAS_H as i32);
+        let area = (p[1] - p[0]).perp_dot(p[2] - p[0]);
+        if area == 0.0 {
+            return;
+        }
+        // Counter-clockwise either way: flip to a positive area.
+        let (p, uv) = if area < 0.0 { ([p[0], p[2], p[1]], [uv[0], uv[2], uv[1]]) } else { (p, uv) };
+        let area = area.abs();
+        let min = p[0].min(p[1]).min(p[2]);
+        let max = p[0].max(p[1]).max(p[2]);
+        let x0 = (min.x - 0.5).ceil().max(0.0) as i32;
+        let y0 = (min.y - 0.5).ceil().max(0.0) as i32;
+        let x1 = ((max.x - 0.5).floor() as i32).min(w - 1);
+        let y1 = ((max.y - 0.5).floor() as i32).min(h - 1);
+        // Top-left rule: with rows down and a positive perp-dot area the
+        // winding is clockwise on screen, so a top edge runs +x and a left
+        // edge runs −y; pixels exactly on those edges are the triangle's.
+        let owns = |a: Vec2, b: Vec2| {
+            let e = b - a;
+            (e.y == 0.0 && e.x > 0.0) || e.y < 0.0
+        };
+        let edges = [(p[1], p[2], owns(p[1], p[2])), (p[2], p[0], owns(p[2], p[0])), (p[0], p[1], owns(p[0], p[1]))];
+        for y in y0..=y1.max(y0 - 1) {
+            for x in x0..=x1.max(x0 - 1) {
+                let c = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                let mut l = [0f32; 3];
+                let mut inside = true;
+                for (k, (a, b, own)) in edges.iter().enumerate() {
+                    let e = (*b - *a).perp_dot(c - *a);
+                    if e < 0.0 || (e == 0.0 && !own) {
+                        inside = false;
+                        break;
+                    }
+                    l[k] = e / area;
+                }
+                if !inside {
+                    continue;
+                }
+                let t = uv[0] * l[0] + uv[1] * l[1] + uv[2] * l[2];
+                let s = shade(t);
+                let o = ((y * w + x) * 4) as usize;
+                let d = &mut self.px[o..o + 4];
+                for k in 0..4 {
+                    let dst = d[k] as f32 / 255.0;
+                    let v = if pma { s[k] + dst * (1.0 - s[3]) } else { s[k] };
+                    d[k] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Bilinear, clamped to the edge, at mip 0 (TexComp's LOD bias −10), the
+/// image's straight RGBA in 0..1.
+fn sample_bilinear(im: &Rgba, uv: Vec2) -> [f32; 4] {
+    let (w, h) = (im.width.max(1) as i64, im.height.max(1) as i64);
+    let x = uv.x * w as f32 - 0.5;
+    let y = uv.y * h as f32 - 0.5;
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let at = |xi: i64, yi: i64| {
+        let (xi, yi) = (xi.clamp(0, w - 1), yi.clamp(0, h - 1));
+        let o = ((yi * w + xi) * 4) as usize;
+        let p = im.pixels.get(o..o + 4).unwrap_or(&[0, 0, 0, 0]);
+        [p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32]
+    };
+    let (x0, y0) = (x0 as i64, y0 as i64);
+    let (a, b, c, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+    let mut out = [0f32; 4];
+    for k in 0..4 {
+        let top = a[k] + (b[k] - a[k]) * fx;
+        let bot = c[k] + (d[k] - c[k]) * fx;
+        out[k] = (top + (bot - top) * fy) / 255.0;
+    }
+    out
+}
+
+/// Composites an R15 character's clothing atlas as Studio does: the five
+/// cells filled with their body colours, then Pants, then Shirt through the
+/// R15 composit meshes. None when Studio's composit meshes aren't installed.
+pub fn r15_composite(look: &R15Look, shirt: Option<&Rgba>, pants: Option<&Rgba>) -> Option<Rgba> {
+    let meshes = composit_meshes()?;
+    let (w, h) = (R15_ATLAS_W, R15_ATLAS_H);
+    let mut t = Target { px: vec![0; (w * h * 4) as usize] };
+    // Body colours: CompositQuad (0..1024, uv 0..1) scaled to the cell,
+    // replace (Studio, TexCompFS with a white texture × (colour, 1)).
+    let cells: [[f32; 4]; 5] = [
+        [0.0, 0.0, 388.0, 272.0],
+        [388.0, 0.0, 264.0, 284.0],
+        [652.0, 0.0, 264.0, 284.0],
+        [388.0, 284.0, 264.0, 284.0],
+        [652.0, 284.0, 264.0, 284.0],
+    ];
+    for (cell, col) in cells.iter().zip(look.cell_colors) {
+        let c = [col[0] as f32 / 255.0, col[1] as f32 / 255.0, col[2] as f32 / 255.0, 1.0];
+        let [x, y, cw, ch] = *cell;
+        let q = [Vec2::new(x, y), Vec2::new(x + cw, y), Vec2::new(x + cw, y + ch), Vec2::new(x, y + ch)];
+        let shade = move |_: Vec2| c;
+        t.triangle([q[0], q[1], q[2]], [Vec2::ZERO; 3], &shade, false);
+        t.triangle([q[0], q[2], q[3]], [Vec2::ZERO; 3], &shade, false);
+    }
+    // A clothing layer: mesh pixels (y up) at a GL offset, so atlas row
+    // = 568 − (offset y + mesh y); TexCompPMAFS: (rgb·a·colour, a), over.
+    let mut layer = |mesh: &(Vec<Vec3>, Vec<Vec2>), off: Vec2, im: &Rgba, col: [f32; 3]| {
+        let shade = |uv: Vec2| {
+            let s = sample_bilinear(im, uv);
+            [s[0] * s[3] * col[0], s[1] * s[3] * col[1], s[2] * s[3] * col[2], s[3]]
+        };
+        for (tri, tuv) in mesh.0.chunks_exact(3).zip(mesh.1.chunks_exact(3)) {
+            let p = |v: Vec3| Vec2::new(off.x + v.x, h as f32 - (off.y + v.y));
+            t.triangle([p(tri[0]), p(tri[1]), p(tri[2])], [tuv[0], tuv[1], tuv[2]], &shade, true);
+        }
+    };
+    if let Some(im) = pants {
+        layer(&meshes.torso, Vec2::new(0.0, 296.0), im, look.pants_color);
+        layer(&meshes.right, Vec2::new(652.0, 0.0), im, look.pants_color);
+        layer(&meshes.left, Vec2::new(388.0, 0.0), im, look.pants_color);
+    }
+    if let Some(im) = shirt {
+        layer(&meshes.torso, Vec2::new(0.0, 296.0), im, look.shirt_color);
+        layer(&meshes.right, Vec2::new(652.0, 284.0), im, look.shirt_color);
+        layer(&meshes.left, Vec2::new(388.0, 284.0), im, look.shirt_color);
+    }
+    Some(Rgba { width: w, height: h, pixels: t.px })
+}
+
 /// Shirt over pants (alpha "over"), for torso parts.
 pub fn composite_over(under: Option<&Rgba>, over: Option<&Rgba>) -> Option<Rgba> {
     match (under, over) {
@@ -1581,6 +1894,31 @@ mod tests {
             assert!(!is_local_path(id), "{id}");
             assert!(place_content_allowed(id, true), "{id}");
         }
+    }
+
+    #[test]
+    fn marked_place_folder_is_play_content() {
+        let root = std::env::temp_dir().join(format!("rs-local-content-{}", std::process::id()));
+        let marked = root.join("marked");
+        let plain = root.join("plain");
+        std::fs::create_dir_all(marked.join("meshes")).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(marked.join(LOCAL_CONTENT_MARKER), "").unwrap();
+        std::fs::write(marked.join("meshes/a.obj"), "v 0 0 0").unwrap();
+        std::fs::write(plain.join("b.obj"), "v 0 0 0").unwrap();
+        std::fs::write(marked.join("level.rbxlx"), "").unwrap();
+        std::fs::write(plain.join("other.rbxlx"), "").unwrap();
+        note_opened_place(&marked.join("level.rbxlx"));
+        note_opened_place(&plain.join("other.rbxlx"));
+        assert!(place_content_allowed("meshes/a.obj", true));
+        let abs = format!("file://{}", marked.join("meshes/a.obj").display());
+        assert!(place_content_allowed(&abs, true));
+        assert_eq!(resolve("meshes/a.obj", None), Some(marked.join("meshes/a.obj")));
+        // Unmarked folders, and escapes out of a marked one, stay blocked.
+        assert!(!place_content_allowed(&format!("file://{}", plain.join("b.obj").display()), true)
+            || local_content_opt_in());
+        assert!(!place_content_allowed("../plain/b.obj", true) || local_content_opt_in());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

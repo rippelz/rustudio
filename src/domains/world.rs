@@ -1,6 +1,6 @@
 //! Engine API domain: world (physics and the 3D world API). See
 //! src/domains/mod.rs for the hook contract and checks/parity/world.md for
-//! what was measured in Studio (offline Studio, Studio 0.705) and what's left.
+//! what was measured in Studio (offline Studio 0.705) and what's left.
 //!
 //! Submodules:
 //! - world_part.rs: BasePart mass / assemblies / network ownership /
@@ -29,7 +29,7 @@ use rbx_dom_weak::types::Ref;
 use crate::runtime::*;
 
 #[path = "world_part.rs"]
-mod part;
+pub(crate) mod part;
 #[path = "world_camera.rs"]
 mod camera;
 #[path = "world_constraints.rs"]

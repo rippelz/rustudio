@@ -8,7 +8,8 @@
 //!
 //! The pass runs after the opaque scene, reading a copy of its colour and
 //! its (multisampled) depth, so it tests depth itself and has no depth
-//! attachment. See-through parts are drawn after it.
+//! attachment shared with that snapshot. A separate depth attachment orders
+//! overlapping water surfaces. See-through parts are drawn after it.
 
 use egui_wgpu::wgpu;
 use wgpu::util::DeviceExt;
@@ -118,7 +119,13 @@ impl WaterPass {
                 buffers,
             },
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
             multisample: wgpu::MultisampleState {
                 count: samples,
                 mask: !0,

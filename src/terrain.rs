@@ -22,6 +22,9 @@
 //!   starts at voxel `32c` (stud `128c`).
 #![allow(dead_code)]
 
+#[path = "grass_pack.rs"]
+pub(crate) mod grass_pack;
+
 use std::collections::HashMap;
 
 /// Studs per voxel edge.
@@ -506,6 +509,22 @@ impl Voxels {
         }
     }
 
+    /// Whether `p` is under the water as it is drawn: the surface-nets level
+    /// of the column (a top water voxel of occupancy o reaches o voxels above
+    /// its centre) less WATER_RAY_DROP, where Studio draws it. The camera's
+    /// underwater fog uses this; a whole-voxel test turned it on up to two
+    /// studs above the visible water (Pirate Island, voxels 62 % full).
+    pub fn under_drawn_water(&self, p: [f32; 3]) -> bool {
+        let y = p[1] + WATER_RAY_DROP;
+        let v = [p[0], y, p[2]].map(|x| (x / VOXEL).floor() as i32);
+        let level = |vy: i32| (vy as f32 + 0.5) * VOXEL + self.water(v[0], vy, v[2]) * VOXEL;
+        if self.water(v[0], v[1], v[2]) > 0.0 {
+            self.water(v[0], v[1] + 1, v[2]) > 0.0 || y < level(v[1])
+        } else {
+            self.water(v[0], v[1] - 1, v[2]) > 0.0 && y < level(v[1] - 1)
+        }
+    }
+
     /// Water occupancy (0..1): the occupancy of a Water voxel, or the shoreline
     /// water stored beside a partial solid.
     pub fn water(&self, x: i32, y: i32, z: i32) -> f32 {
@@ -773,6 +792,9 @@ pub struct MaterialMesh {
     pub material: u8,
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
+    /// Per vertex: its cell's random byte (Studio's detiling offset; the
+    /// water shader blends three offset samples by it, as SmoothWater does).
+    pub rand: Vec<u8>,
     pub indices: Vec<u32>,
 }
 
@@ -814,6 +836,7 @@ fn cidx(c: [usize; 3]) -> usize {
 struct Grid {
     solid: Vec<f32>,
     water: Vec<f32>,
+    water_kind: Vec<u8>,
     mat: Vec<u8>,
     occ: [f32; 256],
 }
@@ -822,6 +845,7 @@ struct Grid {
 struct Builder {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
+    rand: Vec<u8>,
     indices: Vec<u32>,
 }
 
@@ -861,6 +885,7 @@ impl Grid {
         Grid {
             solid: vec![0.0; P * P * P],
             water: vec![0.0; P * P * P],
+            water_kind: vec![0; P * P * P],
             mat: vec![0; P * P * P],
             occ,
         }
@@ -914,6 +939,57 @@ impl Grid {
                 }
             }
         }
+        // Native water preprocessing: air/liquid/solid are distinct
+        // classes. One simultaneous horizontal ring continues liquid into banks;
+        // liquid immediately above a bank continues down with full occupancy.
+        // Sample an extra apron so these rules agree at storage chunk seams.
+        self.water_kind.fill(0);
+        if v.has_water_near(key) {
+            const Q: usize = P + 4;
+            let qi = |x: usize, y: usize, z: usize| x + Q * (y + Q * z);
+            let mut raw = vec![(0u8, 0.0f32, false); Q * Q * Q];
+            for z in 0..Q { for y in 0..Q { for x in 0..Q {
+                let w = [x,y,z].map(|c| c as i32 - 3);
+                let w = [0,1,2].map(|a| (key[a] << CHUNK_SHIFT) + w[a]);
+                let (m,o) = v.get(w[0],w[1],w[2]);
+                let liquid = v.water(w[0],w[1],w[2]);
+                raw[qi(x,y,z)] = if liquid > 0.0 {
+                    (1, liquid, m != WATER && o > 1.0/256.0)
+                } else if m != 0 && m != WATER { (2,o,true) }
+                else { (0,0.0,false) };
+            }}}
+            let mut continued = raw.clone();
+            for z in 1..Q-1 { for y in 1..Q-1 { for x in 1..Q-1 {
+                let i = qi(x,y,z);
+                if raw[i].0 == 0 || (raw[i].0 == 1 && !raw[i].2) { continue; }
+                if raw[qi(x,y+1,z)].0 == 1 {
+                    continued[i] = (1,1.0,raw[i].2);
+                } else {
+                    let mut o = 0.0f32;
+                    for dz in -1i32..=1 { for dx in -1i32..=1 {
+                        if dx == 0 && dz == 0 { continue; }
+                        let n = raw[qi((x as i32+dx) as usize,y,(z as i32+dz) as usize)];
+                        if n.0 == 1 { o = o.max(n.1); }
+                    }}
+                    if o > 0.0 { continued[i] = (1,o,raw[i].2); }
+                }
+            }}}
+            for z in 0..P { for y in 0..P { for x in 0..P {
+                let (xx,yy,zz) = (x+2,y+2,z+2);
+                let (mut kind,mut o,_) = continued[qi(xx,yy,zz)];
+                // The native second pass opens exposed remaining solid samples
+                // to air, retaining only fully occupied enclosed bank samples.
+                if kind == 2 && (o < 1.0 ||
+                    continued[qi(xx-1,yy,zz)].0 == 0 || continued[qi(xx+1,yy,zz)].0 == 0 ||
+                    continued[qi(xx,yy-1,zz)].0 != 2 || continued[qi(xx,yy+1,zz)].0 == 0 ||
+                    continued[qi(xx,yy,zz-1)].0 == 0 || continued[qi(xx,yy,zz+1)].0 == 0) {
+                    kind = 0; o = 0.0;
+                }
+                let i = pidx(x,y,z);
+                self.water_kind[i] = kind;
+                self.water[i] = if kind != 0 { 0.5 + 0.5*o } else { 0.0 };
+            }}}
+        }
         let (mut any_s, mut all_s, mut any_w) = (false, true, false);
         for (s, w) in self.solid.iter().zip(&self.water) {
             let i = *s >= ISO;
@@ -932,13 +1008,21 @@ impl Grid {
         let base = pidx(c[0], c[1], c[2]);
         let mut d = [0f32; 8];
         for (i, di) in d.iter_mut().enumerate() {
-            *di = f[base + (i & 1) + ((i >> 1) & 1) * P + ((i >> 2) & 1) * PP];
+            let sample = base + (i & 1) + ((i >> 1) & 1) * P + ((i >> 2) & 1) * PP;
+            *di = f[sample];
         }
+        let kinds = std::array::from_fn::<_, 8, _>(|i| {
+            if field == 0 { (d[i] >= ISO) as u8 } else {
+                self.water_kind[base + (i & 1) + ((i >> 1) & 1)*P + ((i >> 2) & 1)*PP]
+            }
+        });
         let mut sum = [0f32; 3];
         let mut n = 0u32;
         for &(a, b) in &CUBE_EDGES {
             let (da, db) = (d[a], d[b]);
-            if (da >= ISO) != (db >= ISO) {
+            let crossing = if field == 0 { kinds[a] != kinds[b] }
+                else { matches!((kinds[a], kinds[b]), (0,1) | (1,0)) };
+            if crossing {
                 // Solid: the surface crosses an edge from an occupied voxel
                 // to air at its occupancy's share of the way (solid samples
                 // hold 0.5 + 0.5 × occupancy). Studio's lone voxels top out
@@ -946,7 +1030,7 @@ impl Grid {
                 // .1 and a full slab's top lies half a voxel above it
                 // (terrain_probe.luau, round 21): exactly this.
                 // Water samples are kept the same way.
-                let t = if da >= ISO {
+                let t = if kinds[a] > kinds[b] {
                     ((da - 0.5) * 2.0).clamp(0.0, 1.0)
                 } else {
                     1.0 - ((db - 0.5) * 2.0).clamp(0.0, 1.0)
@@ -1086,11 +1170,13 @@ impl State {
             return l.idx;
         }
         let (pos, nrm, first_free) = (l.pos, l.nrm, l.mat == NO_MAT);
+        let rand = cell_rand([0, 1, 2].map(|k| (key[k] << CHUNK_SHIFT) + c[k] as i32 - 1));
         let builders = &mut self.builders;
         let mut push = || {
             let b = &mut builders[mat as usize];
             b.positions.push(pos);
             b.normals.push(nrm);
+            b.rand.push(rand);
             (b.positions.len() - 1) as u32
         };
         let idx = if c.iter().any(|&k| k == 0 || k == NC - 1) {
@@ -1117,18 +1203,19 @@ impl State {
             for y in 1..=CS {
                 for x in 1..=CS {
                     let p = pidx(x, y, z);
-                    let a_in = f[p] >= ISO;
+                    let density = |i: usize| f[i];
+                    let a_in = density(p) >= ISO;
                     for axis in 0..3 {
                         let q = p + STRIDE[axis];
-                        if (f[q] >= ISO) == a_in {
+                        if field == 1 && !matches!((g.water_kind[p], g.water_kind[q]), (0,1) | (1,0)) {
                             continue;
                         }
-                        let (inside, outside) = if a_in { (p, q) } else { (q, p) };
+                        if (density(q) >= ISO) == a_in {
+                            continue;
+                        }
+                        let inside = if a_in { p } else { q };
                         let mat = if field == 1 {
-                            // Water hidden behind solid gets no surface.
-                            if g.solid[outside] >= ISO {
-                                continue;
-                            }
+                            // Bank overlap is already encoded in the water field.
                             WATER
                         } else {
                             g.mat[inside]
@@ -1178,7 +1265,7 @@ impl State {
 
 /// Smooth surface (surface nets over occupancy, iso 0.5, samples at voxel
 /// centres) in world studs, one mesh per material. Water is its own mesh
-/// (material 1) and only covers water that faces non-solid space. Vertices are
+/// (material 1), overlapping the bank for depth clipping. Vertices are
 /// welded per material, including across chunk borders. Triangles wind
 /// counter-clockwise seen from outside.
 pub fn build_meshes(v: &Voxels) -> Vec<MaterialMesh> {
@@ -1187,7 +1274,13 @@ pub fn build_meshes(v: &Voxels) -> Vec<MaterialMesh> {
 
 /// The water surface alone (the renderer draws solid terrain by chunk).
 pub fn build_water_meshes(v: &Voxels) -> Vec<MaterialMesh> {
-    build_fields(v, [false, true])
+    let mut meshes = build_fields(v, [false, true]);
+    // Native water vertex producer Studio adds -0.5 voxel after placement.
+    // Solid terrain remains at its own net surface elevation.
+    for mesh in &mut meshes {
+        for p in &mut mesh.positions { p[1] -= WATER_RAY_DROP; }
+    }
+    meshes
 }
 
 fn build_fields(v: &Voxels, fields: [bool; 2]) -> Vec<MaterialMesh> {
@@ -1231,6 +1324,7 @@ fn build_fields(v: &Voxels, fields: [bool; 2]) -> Vec<MaterialMesh> {
             material: m as u8,
             positions: b.positions,
             normals: b.normals,
+            rand: b.rand,
             indices: b.indices,
         })
         .collect()
@@ -1284,6 +1378,8 @@ pub struct TerrainVertex {
     pub axis: [u8; 4],
     /// The three corners' random bytes (detiling rotation / offset).
     pub rand: [u8; 4],
+    /// Native decoded POSITION.xz before chunk translation.
+    pub wind_local: [f32; 4],
 }
 
 /// Palette entry of a material's face (Top 0, Side 1, Bottom 2).
@@ -1295,7 +1391,7 @@ pub fn palette(material: u8, face: u8) -> u8 {
 /// diagonals, exactly as stored): 0 +X, 1 −X, 2 +Z, 3 −Z, 4–7 the XZ
 /// diagonals, 8 up, 9–12 tilted up (+X, −X, +Z, −Z), 13 down, 14–17 tilted
 /// down. Texture coordinate = (P·U, P·V) × tiling (Studio 0.744:
-/// tables at .rdata Studio / Studio, filled by Studio).
+/// tables at .rdata Studio, filled by Studio).
 pub const AXIS_U: [[f32; 3]; 18] = [
     [0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
     [0.7, 0.0, -0.7], [-0.7, 0.0, -0.7], [0.7, 0.0, 0.7], [-0.7, 0.0, 0.7],
@@ -1382,7 +1478,20 @@ impl Grid {
     /// (round 21, against an offline Studio: its 4-material checker keeps
     /// Grass and Sand and shows Rock and Snow as small patches, and a lone
     /// Snow voxel on a Basalt slab stays a bump on Basalt).
+    /// Decoration writer Studio: compact occupied solid slots, then
+    /// reduce adjacent pairs. A global per-material sum changes ownership.
+    fn decoration_material(&self, c: [usize; 3]) -> u8 {
+        let base = pidx(c[0], c[1], c[2]);
+        let offsets = [0, 1, 1 + P, P, PP, PP + 1, PP + 1 + P, PP + P];
+        let raw = offsets.map(|o| {
+            let p = base + o;
+            (self.mat[p], ((self.solid[p] * 2.0 - 1.0) * 256.0 - 1.0).round().clamp(0.0, 255.0) as u8)
+        });
+        decoration_owner(raw)
+    }
+
     fn cell_material(&self, c: [usize; 3]) -> u8 {
+
         let base = pidx(c[0], c[1], c[2]);
         let mut sums: [(u8, f32); 8] = [(0, 0.0); 8];
         let mut n = 0;
@@ -1411,10 +1520,37 @@ impl Grid {
     }
 }
 
+/// Native packed occupancy stores weight minus one for material > 1.
+fn decoration_owner(raw: [(u8, u8); 8]) -> u8 {
+    let mut slots = [(0u32, 0u8); 8];
+    let mut n = 0;
+    for (material, occupancy) in raw {
+        if material > 1 {
+            slots[n] = (occupancy as u32 + 1, material);
+            n += 1;
+        }
+    }
+    let mut width = 8;
+    while width > 1 {
+        for i in 0..width / 2 {
+            let (a, b) = (slots[2 * i], slots[2 * i + 1]);
+            slots[i] = if a.1 == b.1 { (a.0 + b.0, a.1) }
+                else if a.0 > b.0 || (a.0 == b.0 && a.1 < b.1) { a }
+                else { b };
+        }
+        width /= 2;
+    }
+    slots[0].1
+}
+
 /// The solid surface owned by chunk `key` as terrain-shader triangles (the
 /// same cell vertices and quads as `build_meshes`, so the drawn shape is the
 /// collision shape). `cube(material)` says which materials map as a cube.
 pub fn chunk_triangles(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool) -> Vec<TerrainVertex> {
+    chunk_triangles_impl(v, key, cube, false)
+}
+
+fn chunk_triangles_impl(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool, grass_domains: bool) -> Vec<TerrainVertex> {
     let mut g = Grid::new();
     let (any_s, all_s, _) = g.fill(v, key);
     if !any_s || all_s {
@@ -1435,13 +1571,14 @@ pub fn chunk_triangles(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool) -> 
             cells.entry(ci).or_insert_with(|| {
                 let (pos, nrm) = g.cell_vertex(0, c, key);
                 let gc = [0, 1, 2].map(|k| (key[k] << CHUNK_SHIFT) + c[k] as i32 - 1);
-                Corner { pos, nrm, mat: g.cell_material(c), gc, c }
+                Corner { pos, nrm, mat: if grass_domains { g.decoration_material(c) } else { g.cell_material(c) }, gc, c }
             });
             ci
         };
-        for z in 1..=CS {
-            for y in 1..=CS {
+        for outer in 1..=CS {
+            for middle in 1..=CS {
                 for x in 1..=CS {
+                    let (y, z) = if grass_domains { (outer, middle) } else { (middle, outer) };
                     let p = pidx(x, y, z);
                     let a_in = g.solid[p] >= ISO;
                     for axis in 0..3 {
@@ -1471,12 +1608,18 @@ pub fn chunk_triangles(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool) -> 
     let tris: Vec<[usize; 3]> = quads.iter().flat_map(|q4| {
         let m = |i: usize| cells[&q4[i]].mat;
         if m(1) == m(3) && (m(1) == m(2) || m(1) == m(0)) {
-            [[q4[0], q4[1], q4[3]], [q4[1], q4[2], q4[3]]]
+            [[q4[0], q4[1], q4[3]], [q4[3], q4[1], q4[2]]]
         } else {
-            [[q4[0], q4[1], q4[2]], [q4[0], q4[2], q4[3]]]
+            // Decoration preserves the native alternate diagonal's cyclic
+            // starts. Rotating either triangle changes its material sampler
+            // and placement seed, even with identical triangle geometry.
+            if grass_domains { [[q4[3], q4[0], q4[2]], [q4[2], q4[0], q4[1]]] }
+            else { [[q4[0], q4[1], q4[2]], [q4[0], q4[2], q4[3]]] }
         }
     }).collect();
-    // Vertex normals (Studio): the area-weighted sum of the touching
+    // The second q1–q3 triangle starts at q3: native index table
+    // Studio row3 = [0,1,3,3,1,2], confirmed by both voxel fixtures.
+    // Vertex normals: the area-weighted sum of the touching
     // triangles' normals, from the final (deformed) positions. Cells on the
     // chunk's rim also touch the neighbour's triangles; they keep the
     // field's gradient normal, which both chunks agree on.
@@ -1496,11 +1639,19 @@ pub fn chunk_triangles(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool) -> 
         }
     }
     let mut out = Vec::with_capacity(quads.len() * 6);
-    let mut tri = |t: [usize; 3]| {
+    let mut tri = |t: [usize; 3], quad_hi: [f32; 3]| {
         let c = t.map(|i| &cells[&i]);
+        // Native decoration batches use the owning voxel region, including
+        // apron vertices that cross its boundary. A displaced first vertex
+        // cannot select that region (paired slope fixture crosses Y=0).
+        let domain_origin: [f32; 3] = std::array::from_fn(|axis| {
+            let owner = c.iter().map(|k| k.gc[axis]).max().unwrap();
+            ((owner >> 4) * 64 + 32) as f32
+        });
         // Cells with no solid sample of their own take a neighbour's material.
-        let fallback = c.iter().map(|k| k.mat).find(|&m| m != 0).unwrap_or(2);
-        let mats = c.map(|k| if k.mat == 0 { fallback } else { k.mat });
+        let material = |k: &Corner| k.mat;
+        let fallback = c.iter().map(|k| material(k)).find(|&m| m != 0).unwrap_or(2);
+        let mats = c.map(|k| if material(k) == 0 { fallback } else { material(k) });
         // Hard materials (Studio's "hard" / "hardsoft": Rock, Basalt, Brick…)
         // shade each triangle flat; the rest smooth.
         let (a, b, d) = (glam::Vec3::from(c[0].pos), glam::Vec3::from(c[1].pos), glam::Vec3::from(c[2].pos));
@@ -1533,11 +1684,29 @@ pub fn chunk_triangles(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool) -> 
                 palette: [pal[0], pal[1], pal[2], 0],
                 axis: [ax[0], ax[1], ax[2], 0],
                 rand: [rnd[0], rnd[1], rnd[2], 0],
+                wind_local: if grass_domains { [domain_origin[0], domain_origin[1], domain_origin[2], 0.0] } else { [0.0; 4] },
             });
         }
+        if grass_domains {
+            // Native 16-voxel decoration regions retain the last owning
+            // voxel's triangles in the adjacent region's apron as well.
+            // The slope readback contains 32 such domains with distinct seeds.
+            // Touching is not crossing: native X/Z fixtures exclude quads
+            // whose maximum lies exactly on the neighboring region boundary.
+            let owner: [i32; 3] = std::array::from_fn(|axis| c.iter().map(|k| k.gc[axis]).max().unwrap());
+            let original: [TerrainVertex; 3] = out[out.len()-3..].try_into().unwrap();
+            for mask in 1..8 {
+                if (0..3).any(|axis| mask & (1 << axis) != 0 && (owner[axis].rem_euclid(16) != 15 || quad_hi[axis] <= domain_origin[axis] + 32.0)) { continue; }
+                for mut vertex in original {
+                    for axis in 0..3 { if mask & (1 << axis) != 0 { vertex.wind_local[axis] += 64.0; } }
+                    out.push(vertex);
+                }
+            }
+        }
     };
-    for t in tris {
-        tri(t);
+    for pair in tris.chunks_exact(2) {
+        let quad_hi = std::array::from_fn(|axis| pair.iter().flatten().map(|i| cells[i].pos[axis]).fold(f32::NEG_INFINITY, f32::max));
+        for t in pair { tri(*t, quad_hi); }
     }
     out
 }
@@ -1546,67 +1715,221 @@ pub fn chunk_triangles(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool) -> 
 /// VS): blades standing on the chunk's Grass top faces, `length` = the
 /// Terrain's GrassLength. Each blade is two triangles (both sides) of
 /// terrain vertices flagged in `palette[3]` (1 = base, 2 = tip); a tip's
-/// `rand[3]` holds the blade height × 32 so the vertex shader can sink it
-/// into the ground with distance, as Studio's does.
+/// `rand[3]` holds the native displacement × 32 (root .1, tip axis+.1),
+/// so the shared color/depth vertex shader sinks both with distance.
 pub fn grass_blades(v: &Voxels, key: [i32; 3], length: f32) -> Vec<TerrainVertex> {
-    let tris = chunk_triangles(v, key, &|_| false);
+    grass_blades_density(v, key, length, 1.0)
+}
+
+/// Real blades retain their native allocated slot even when filler copies are omitted.
+#[derive(Default)]
+pub struct GrassGeometry {
+    pub vertices: Vec<TerrainVertex>,
+    pub batches: [GrassBatch; 2],
+    pub cells: Vec<GrassCell>,
+}
+#[derive(Default)]
+pub struct GrassBatch {
+    pub allocated: usize,
+    /// (native generated ordinal, first source vertex); each blade has six vertices.
+    pub blades: Vec<(usize, usize)>,
+}
+
+pub struct GrassCell {
+    pub lo: glam::Vec3,
+    pub hi: glam::Vec3,
+    pub near: bool,
+    pub batch: GrassBatch,
+}
+
+pub fn grass_blades_density(v: &Voxels, key: [i32; 3], length: f32, density: f32) -> Vec<TerrainVertex> {
+    grass_geometry_density(v, key, length, density).vertices
+}
+
+pub fn grass_geometry_density(v: &Voxels, key: [i32; 3], length: f32, density: f32) -> GrassGeometry {
+    // Optional retained RenderDoc diagnostic: captured post-VS positions,
+    // with zero encoded displacement, bypass generation only when requested.
+    if let Ok(path) = std::env::var("RUSTUDIO_CAPTURED_GRASS") {
+        if key != [0, 0, 0] { return GrassGeometry::default(); }
+        return GrassGeometry { vertices: std::fs::read(path).expect("captured grass diagnostic")
+            .chunks_exact(28)
+            .map(|bytes| {
+                // Retained captures use the original 28-byte terrain layout.
+                let mut vertex: TerrainVertex = bytemuck::Zeroable::zeroed();
+                bytemuck::bytes_of_mut(&mut vertex)[..28].copy_from_slice(bytes);
+                vertex
+            }).collect(), ..Default::default() };
+    }
+
+    let export = std::env::var_os("RUSTUDIO_COVERAGE_EXPORT");
+    let mut provenance = std::collections::HashMap::new();
+    let mut export_domains = Vec::new();
+    let tris = chunk_triangles_impl(v, key, &|_| false, true);
     let grass_top = palette(2, 0);
     let mut out = Vec::new();
-    let density = crate::mech::GRASS_BLADES_PER_STUD2;
-    let base_h = (length * crate::mech::GRASS_HEIGHT_PER_LENGTH).max(0.05);
+    let mut batches: [GrassBatch; 2] = Default::default();
+    let mut domains = 0;
+    let mut domain_cells = Vec::new();
+    let mut blade_domains: [Vec<usize>; 2] = Default::default();
+    let mut fillers: [Vec<(usize, usize, usize)>; 2] = Default::default();
+
+    let scale = (crate::mech::GRASS_LENGTH_SCALE_BASE + length * crate::mech::GRASS_LENGTH_SCALE_SLOPE).max(0.0);
     for (ti, t) in tris.chunks_exact(3).enumerate() {
-        if t[0].palette[..3].iter().any(|&p| p != grass_top) {
+        if t[0].palette[..3].iter().all(|&p| p / 3 != grass_top / 3) {
             continue;
         }
         let (a, b, c) = (glam::Vec3::from(t[0].pos), glam::Vec3::from(t[1].pos), glam::Vec3::from(t[2].pos));
         let n = (b - a).cross(c - a);
         let area = n.length() * 0.5;
-        if area < 1e-4 || n.y / (2.0 * area) < crate::mech::TERRAIN_TOP_NORMAL_Y {
+        // Decoration producer Studio compares normalized up dot against
+        // f32(0.7) at Studio; terrain texture top threshold is separate.
+        if area < 1e-4 || n.y / (2.0 * area) < 0.7 {
             continue;
         }
-        // A fixed random stream per triangle (same blades every rebuild).
+        let first_origin = glam::Vec3::new(t[0].wind_local[0], t[0].wind_local[1], t[0].wind_local[2]);
+        let local_first = (a - first_origin).to_array();
+        // Retain the existing shade stream independently of material sampling.
         let mut seed = (ti as u32).wrapping_mul(0x9e37_79b9) ^ (key[0] as u32).wrapping_mul(0x85eb_ca6b)
-            ^ (key[1] as u32).wrapping_mul(0xc2b2_ae35) ^ (key[2] as u32).wrapping_mul(0x27d4_eb2f);
-        let mut rnd = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            (seed & 0x00ff_ffff) as f32 / 16_777_216.0
-        };
-        let count = (area * density + rnd()).floor() as usize;
-        for _ in 0..count {
-            let (mut u, mut w) = (rnd(), rnd());
-            if u + w > 1.0 {
-                u = 1.0 - u;
-                w = 1.0 - w;
+                ^ (key[1] as u32).wrapping_mul(0xc2b2_ae35) ^ (key[2] as u32).wrapping_mul(0x27d4_eb2f);
+        if seed == 0 { seed = 0x6d2b_79f5; }
+        let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; (seed & 0x00ff_ffff) as f32 / 16_777_216.0 };
+        let _ = (rnd(), rnd());
+        let indicators = std::array::from_fn(|i| {
+            if t[0].palette[i] / 3 == grass_top / 3 { 1.0 } else { 0.0 }
+        });
+        let weight = crate::grass_stream::material_weight(
+            [a.to_array(), b.to_array(), c.to_array()], indicators);
+        // Native retains three zero-size records at zero weight. Omit those
+        // degenerate triangles instead of normalizing a zero blade plane.
+        domain_cells.push(first_origin.to_array().map(|x| (x / 64.0).floor() as i32));
+        let domain = domains;
+        if export.is_some() { export_domains.push(serde_json::json!({"domain":domain,"triangle":ti,"vertices":[a.to_array(),b.to_array(),c.to_array()],"region":domain_cells[domain],"weight":weight,"area":area})); }
+        domains += 1;
+        // Terrain queues both batches; the near batch
+        // has its own 16-point domain and .85 geometry scale.
+        for (samples, size, near) in [
+            (crate::mech::GRASS_SAMPLE_POINTS.as_slice(), 1.0, false),
+            (crate::mech::GRASS_NEAR_SAMPLE_POINTS.as_slice(), 0.85, true),
+        ] {
+            let mut stream = crate::grass_stream::Stream::new(local_first);
+            let allocated = crate::grass_stream::sample_count(length, density, near);
+            let slots = stream.shuffled_slots(allocated);
+            let batch = &mut batches[usize::from(near)];
+            batch.allocated += allocated;
+            if weight == 0.0 { continue; }
+            let count = ((allocated as f32 * weight).floor() as usize).max(3).min(allocated);
+            let blade_scale = (scale * size) * weight;
+            for (sample_index, sample) in samples.iter().take(count).enumerate() {
+                batch.blades.push((slots[sample_index], out.len()));
+                blade_domains[usize::from(near)].push(domain);
+                let (u, w) = crate::grass_stream::fold(weight * sample[0] * 0.5 + 0.5, weight * sample[1] * 0.5 + 0.5);
+                let p = a + (b - a) * u + (c - a) * w;
+                if export.is_some() { provenance.insert(out.len(), (domain, p.to_array())); }
+                let origin = first_origin;
+                let p = p - origin;
+                let (height, width, template) = stream.blade();
+                let h = blade_scale * height;
+                let (base_axis, tip_axis) = grass_template(template);
+                let half_width = blade_scale * width;
+                // Blade orientation from one of 1024 templates (grass_template).
+                let side = base_axis * half_width;
+                let tip = p + tip_axis * h;
+                let shade = (rnd() * 255.0) as u8;
+                // Captured native POSITION.w: roots=51/512, tips=axis length+.1.
+                // Both batches use the same emitter; vertical
+                // height leaves regular tips above sloping terrain at full fade.
+                let encoded = grass_pack::emit(p.to_array(), base_axis.to_array(), tip_axis.to_array(), half_width, h);
+                // Each side receives light according to its actual blade plane.
+                let face = (side * 2.0).cross(tip - p).normalize();
+                let vert = |index: usize, corner: i8, flag: u8, sign: f32| {
+                    let pos = glam::Vec3::from_array(encoded[index][..3].try_into().unwrap()) + origin;
+                    TerrainVertex {
+                    pos: pos.to_array(),
+                    wind_local: [pos.x - (key[0] * 128) as f32, pos.z - (key[2] * 128) as f32, scale, encoded[index][3]],
+                    normal: [(face.x * sign * 127.0).round() as i8, (face.y * sign * 127.0).round() as i8, (face.z * sign * 127.0).round() as i8, corner],
+                    palette: [grass_top, grass_top, grass_top, flag],
+                    axis: [8, 8, 8, u8::from(near)],
+                    rand: [shade, shade, shade, 0],
+                }};
+                out.extend_from_slice(&[vert(0, 0, 1, 1.0), vert(1, 1, 1, 1.0), vert(2, 2, 2, 1.0)]);
+                out.extend_from_slice(&[vert(1, 0, 1, -1.0), vert(0, 1, 1, -1.0), vert(2, 2, 2, -1.0)]);
             }
-            let p = a + (b - a) * u + (c - a) * w;
-            let h = base_h * (0.6 + 0.8 * rnd());
-            let ang = rnd() * std::f32::consts::TAU;
-            let side = glam::Vec3::new(ang.cos(), 0.0, ang.sin()) * crate::mech::GRASS_BLADE_HALF_WIDTH;
-            let lean = glam::Vec3::new(rnd() - 0.5, 0.0, rnd() - 0.5) * h * 0.6;
-            let tip = p + glam::Vec3::Y * h + lean;
-            let shade = (rnd() * 255.0) as u8;
-            let hq = (h * 32.0).round().clamp(1.0, 255.0) as u8;
-            let vert = |pos: glam::Vec3, corner: i8, flag: u8| TerrainVertex {
-                pos: pos.to_array(),
-                normal: [0, 127, 0, corner],
-                palette: [grass_top, grass_top, grass_top, flag],
-                axis: [8, 8, 8, 0],
-                rand: [shade, shade, shade, if flag == 2 { hq } else { 0 }],
-            };
-            let (b1, b2) = (p - side, p + side);
-            out.extend_from_slice(&[vert(b1, 0, 1), vert(b2, 1, 1), vert(tip, 2, 2)]);
-            out.extend_from_slice(&[vert(b2, 0, 1), vert(b1, 1, 1), vert(tip, 2, 2)]);
+            if count > 0 {
+                for &slot in &slots[count..] {
+                    fillers[usize::from(near)].push((domain, slot, out.len()-6));
+                }
+            }
         }
     }
-    out
+    for (batch, ids) in batches.iter_mut().zip(blade_domains) {
+        for ((slot, _), domain) in batch.blades.iter_mut().zip(ids) {
+            *slot = *slot * domains + domain;
+        }
+        batch.blades.sort_unstable_by_key(|blade| blade.0);
+    }
+    let mut cells = Vec::new();
+    let keys: std::collections::BTreeSet<_> = domain_cells.iter().copied().collect();
+    for key in keys {
+        let ids: Vec<_> = domain_cells.iter().enumerate().filter_map(|(i,k)| (*k == key).then_some(i)).collect();
+        // Producer Studio..Studio shuffles each region's packed domains
+        // after traversal, seeded by the integer region hash.
+        let seed = (key[0] as u32).wrapping_mul(0x466f45d)
+            ^ (key[1] as u32).wrapping_mul(0x127409f)
+            ^ (key[2] as u32).wrapping_mul(0x4f9ffb7);
+        let order = crate::grass_stream::Stream::from_seed(seed as u64).shuffled_slots(ids.len());
+        let mut rank = vec![0; ids.len()];
+        for (ordinal, original) in order.into_iter().enumerate() { rank[original] = ordinal; }
+        for (near, batch) in batches.iter().enumerate() {
+            let mut selected = GrassBatch { allocated: if domains == 0 {0} else {batch.allocated / domains * ids.len()}, blades: Vec::new() };
+            for &(ordinal, first) in &batch.blades {
+                if let Ok(domain) = ids.binary_search(&(ordinal % domains)) {
+                    selected.blades.push((ordinal / domains * ids.len() + rank[domain], first));
+                }
+            }
+            // Native copies the last generated blade into unused shuffled
+            // slots. Preserve these in the resident upload: the original can
+            // lie beyond the selected prefix while its filler lies inside.
+            for &(domain, slot, first) in &fillers[near] {
+                if let Ok(local) = ids.binary_search(&domain) {
+                    selected.blades.push((slot * ids.len() + rank[local], first));
+                }
+            }
+            selected.blades.sort_unstable_by_key(|blade| blade.0);
+            // Native draw caller receives the owning 64-stud cell expanded by
+            // four studs, independently of occupied domains and residency.
+            let origin = glam::Vec3::from_array(key.map(|v| v as f32 * 64.0));
+            let lo = origin - glam::Vec3::splat(4.0);
+            let hi = origin + glam::Vec3::splat(68.0);
+            cells.push(GrassCell {lo, hi, near: near != 0, batch: selected});
+        }
+    }
+    if let Some(dir) = export {
+        use std::io::Write;
+        let path = std::path::Path::new(&dir).join(format!("chunk_{}_{}_{}.jsonl",key[0],key[1],key[2]));
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        for d in export_domains { writeln!(f,"{}",serde_json::json!({"kind":"domain","storage":key,"data":d})).unwrap(); }
+        for cell in &cells {
+            let camera=glam::Vec3::new(-12.0,155.0,210.0);
+            let distance=camera.distance(camera.clamp(cell.lo,cell.hi));
+            let factor=(2.0/(1.0+distance.min(crate::mech::GRASS_RADIUS)/crate::mech::GRASS_RADIUS)-1.0).clamp(0.0,1.0);
+            let group=if cell.near {3} else {1};
+            let limit=((cell.batch.allocated/group) as f32*factor).trunc() as usize*group;
+            for &(ordinal,first) in &cell.batch.blades {
+                let (domain,root)=provenance[&first];
+                // Identify real slots by their pre-region shuffled slot, independent of domain permutation.
+                let slot=ordinal/(cell.batch.allocated / crate::grass_stream::sample_count(length,density,cell.near)).max(1);
+                let filler=!batches[usize::from(cell.near)].blades.iter().any(|&(o,f)| f==first && o/domains==slot);
+                writeln!(f,"{}",serde_json::json!({"kind":"blade","storage":key,"domain":domain,"root":root,"region":domain_cells[domain],"near":cell.near,"ordinal":ordinal,"allocated":cell.batch.allocated,"limit":limit,"selected":ordinal<limit,"filler":filler})).unwrap();
+            }
+        }
+    }
+    GrassGeometry { vertices: out, batches, cells }
 }
 
 /// Whether chunk `key` has Grass on its top faces (decoration candidates).
 pub fn chunk_has_grass_top(verts: &[TerrainVertex]) -> bool {
     let g = palette(2, 0);
-    verts.chunks_exact(3).any(|t| t[0].palette[..3].iter().all(|&p| p == g))
+    verts.chunks_exact(3).any(|t| t[0].palette[..3].iter().any(|&p| p / 3 == g / 3))
 }
 
 /// The chunks a render must re-mesh after `old` became `new`: those whose
@@ -1694,16 +2017,18 @@ pub fn materials_present(v: &Voxels) -> [bool; 23] {
 /// Whether the water in two grids differs (so its mesh must be rebuilt).
 pub fn water_changed(old: Option<&Voxels>, new: &Voxels) -> bool {
     let Some(o) = old else { return true };
-    let water = |c: &Chunk| -> Vec<u8> {
+    // Native liquid extraction also depends on the solid bank samples.
+    if !o.same_solid(new) { return true; }
+    let water = |c: &Chunk| -> Vec<u16> {
         c.mat
             .iter()
             .zip(c.occ.iter())
             .enumerate()
             .map(|(i, (&m, &b))| {
                 if m == WATER {
-                    b.saturating_add(1)
+                    b as u16 + 1
                 } else {
-                    c.water.as_ref().map(|w| (w[i] != 0) as u8).unwrap_or(0) * 255
+                    c.water.as_ref().map_or(0, |w| w[i])
                 }
             })
             .collect()
@@ -1712,7 +2037,7 @@ pub fn water_changed(old: Option<&Voxels>, new: &Voxels) -> bool {
     keys.into_iter().any(|k| {
         let a = o.chunks.get(k).map(water).unwrap_or_default();
         let b = new.chunks.get(k).map(water).unwrap_or_default();
-        let empty = |v: &Vec<u8>| v.iter().all(|&x| x == 0);
+        let empty = |v: &Vec<u16>| v.iter().all(|&x| x == 0);
         if a.is_empty() || b.is_empty() {
             !(empty(&a) && empty(&b))
         } else {
@@ -1736,8 +2061,272 @@ pub fn collision_mesh(meshes: &[MaterialMesh]) -> (Vec<[f32; 3]>, Vec<u32>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires checks/water-full-re native GPU evidence"]
+    fn water_matches_native_gpu_positions() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("checks/water-full-re");
+        let rows: Vec<(i32,i32,i32,String,f32,f32)> = serde_json::from_slice(
+            &std::fs::read(root.join("slope-voxels.json")).unwrap()).unwrap();
+        let mut v = Voxels::empty();
+        for (x,y,z,name,solid,liquid) in rows {
+            let mat = if solid > 0.0 { material_index(&name).unwrap() } else { WATER };
+            let occ = ((if solid > 0.0 {solid} else {liquid})*255.0).round() as u8;
+            let water = if solid > 0.0 && liquid > 0.0 { (liquid*255.0).round() as u16+1 } else {0};
+            let p = [x,y,z];
+            v.chunk_mut(chunk_key(p)).write(local_index(p),1,mat,occ,water);
+        }
+        let meshes = build_water_meshes(&v);
+        let ours: Vec<_> = meshes.iter().flat_map(|m| m.positions.iter().copied()).collect();
+        let triangles: Vec<[[f32;3];3]> = meshes.iter().flat_map(|m| m.indices.chunks_exact(3).map(|t| [m.positions[t[0] as usize],m.positions[t[1] as usize],m.positions[t[2] as usize]])).collect();
+        std::fs::write(root.join("rustudio-water-triangles.json"),serde_json::to_vec(&triangles).unwrap()).unwrap();
+        std::fs::write(root.join("rustudio-water-positions.json"),serde_json::to_vec(&ours).unwrap()).unwrap();
+        let mut errors = Vec::new();
+        for event in [499, 502, 505, 508, 511, 514, 517, 520] {
+            let native: Vec<[f32;3]> = serde_json::from_slice(&std::fs::read(root.join(format!("positions-{event}.json"))).unwrap()).unwrap();
+            for p in native {
+                let d = ours.iter().map(|q| (0..3).map(|k| (p[k]-q[k]).powi(2)).sum::<f32>()).fold(f32::INFINITY,f32::min).sqrt();
+                errors.push(d);
+            }
+        }
+        errors.sort_by(f32::total_cmp);
+        let report = format!("samples={} ours={} median={} p95={} maximum={}\n",errors.len(),ours.len(),errors[errors.len()/2],errors[errors.len()*95/100],errors.last().unwrap());
+        std::fs::write(root.join("geometry-comparison.txt"),&report).unwrap();
+        assert!(*errors.last().unwrap() < 0.12,"{report}");
+    }
+
+    #[test]
+    fn water_land_interface_has_no_internal_curtains() {
+        let mut v = Voxels::empty();
+        for x in -4..=4 { for y in -4..=0 { for z in -4..=4 {
+            v.set([x,y,z], if x <= 0 { WATER } else { 2 }, 1.0);
+        }}}
+        let meshes = build_water_meshes(&v);
+        let water = &meshes[0];
+        let mut shoreline = 0;
+        for tri in water.indices.chunks_exact(3) {
+            let p = [tri[0],tri[1],tri[2]].map(|i| water.positions[i as usize]);
+            let center = [0,1,2].map(|k| (p[0][k]+p[1][k]+p[2][k])/3.0);
+            if center[0] > 0.0 && center[0] < 5.0 && center[2].abs() < 8.0 && center[1] > -12.0 {
+                assert!(p.iter().all(|p| (p[1]-4.0).abs()<1e-5), "internal wall: {p:?}");
+                shoreline += 1;
+            }
+        }
+        assert!(shoreline > 0, "top surface must reach the bank");
+    }
+
+    #[test]
+    fn water_bank_changes_invalidate_water_mesh() {
+        let mut before = Voxels::empty();
+        before.set([0,0,0],WATER,1.0);
+        let mut after = Voxels::empty();
+        after.set([0,0,0],WATER,1.0);
+        after.set([1,0,0],2,0.5);
+        assert!(water_changed(Some(&before),&after));
+    }
+
+    #[test]
+    fn mixed_liquid_occupancy_changes_invalidate_water_mesh() {
+        let mut before = Voxels::empty();
+        let mut after = Voxels::empty();
+        before.chunk_mut([0,0,0]).write(0,1,2,127,64);
+        after.chunk_mut([0,0,0]).write(0,1,2,127,192);
+        assert!(before.same_solid(&after));
+        assert!(water_changed(Some(&before),&after));
+    }
+
+    #[test]
+    fn water_mixed_banks_agree_across_all_chunk_axes() {
+        let mut v = Voxels::empty();
+        for z in -3i32..=36 { for y in -3i32..=36 { for x in -3i32..=36 {
+            if y > 33 { continue; }
+            let bank = x + z > 31;
+            let occ = if bank { 0.25 + (y.rem_euclid(4) as f32)*0.25 } else { 1.0 };
+            v.set([x,y,z],if bank {2} else {WATER},occ);
+            if bank && y == 32 {
+                let p = [x,y,z];
+                let c = v.chunk_mut(chunk_key(p));
+                c.write(local_index(p),1,2,127,192);
+            }
+        }}}
+        let mut a = Grid::new(); a.fill(&v,[0,0,0]);
+        for axis in 0..3 {
+            let mut key = [0,0,0];key[axis] = 1;
+            let mut b = Grid::new();b.fill(&v,key);
+            for u in 1..=CS { for w in 1..=CS {
+                let mut p = [0;3];p[axis]=32;p[(axis+1)%3]=u;p[(axis+2)%3]=w;
+                let mut q=p;q[axis]=0;
+                let (i,j)=(pidx(p[0],p[1],p[2]),pidx(q[0],q[1],q[2]));
+                assert_eq!((a.water_kind[i],a.water[i]),(b.water_kind[j],b.water[j]),"axis {axis}, {p:?}");
+            }}
+        }
+    }
+
+    #[test]
+    fn water_bank_extension_agrees_across_chunk_seam() {
+        let mut v = Voxels::empty();
+        for x in 28..=35 { for z in -2..=2 { for y in -2..=0 {
+            v.set([x,y,z], if x <= 30 { WATER } else { 2 }, 1.0);
+        }}}
+        let mut a = Grid::new();
+        let mut b = Grid::new();
+        a.fill(&v, [0,0,0]);
+        b.fill(&v, [1,0,0]);
+        assert_eq!(a.water_kind[pidx(32,1,1)], 1);
+        assert_eq!(a.water[pidx(32,1,1)], b.water[pidx(0,1,1)]);
+        assert_eq!(a.cell_vertex(1,[32,1,1],[0,0,0]).0,
+                   b.cell_vertex(1,[0,1,1],[1,0,0]).0);
+    }
+
+    #[test]
+    fn water_surface_keeps_its_level_beside_a_higher_bank() {
+        let mut v = Voxels::empty();
+        for x in -3..=3 { for z in -3..=3 { for y in -3..=2 {
+            if x > 0 { v.set([x,y,z], 2, 1.0); }
+            else if y <= 0 { v.set([x,y,z], WATER, 1.0); }
+        }}}
+        let mut g = Grid::new();
+        g.fill(&v, [0,0,0]);
+        let (p, _) = g.cell_vertex(1, [1,1,1], [0,0,0]);
+        assert!((p[1]-6.0).abs() < 1e-6, "bank must not lift water: {p:?}");
+        assert!(g.water[pidx(2,1,1)] >= ISO, "water must overlap the occupied bank");
+    }
+
+    #[test]
+    fn water_shoreline_continues_across_solid_samples() {
+        let mut voxels = Voxels::empty();
+        // A level lake meets a level bank at x=1, including a chunk seam.
+        for x in -2..=3 { for z in -2..=3 {
+            voxels.set([x, 0, z], if x <= 0 { WATER } else { 2 }, 1.0);
+        }}
+        let mut grid = Grid::new();
+        grid.fill(&voxels, [0, 0, 0]);
+        let (water, _) = grid.cell_vertex(1, [1, 1, 1], [0, 0, 0]);
+        let (land, _) = grid.cell_vertex(0, [2, 1, 1], [0, 0, 0]);
+        assert!((water[1] - land[1]).abs() < 1e-6,
+            "shoreline must not retract down toward the solid bank: {water:?} {land:?}");
+        assert!(water.iter().all(|v| v.is_finite()));
+    }
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn grass_generation_is_distributed_repeatable_and_scaled() {
+        let mut v = Voxels::empty();
+        for x in -1..=3 {
+            for z in -1..=3 {
+                v.set([x, 0, z], 2, 1.0);
+            }
+        }
+        let blades = grass_blades(&v, [0, 0, 0], 0.7);
+        assert!(!blades.is_empty());
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&blades),
+            bytemuck::cast_slice::<_, u8>(&grass_blades(&v, [0, 0, 0], 0.7)));
+        let taller = grass_blades(&v, [0, 0, 0], 0.6999);
+        assert_eq!(blades.len(), taller.len());
+        // Native template allocation is per triangle, including small faces.
+        let surface = chunk_triangles(&v, [0, 0, 0], &|_| false);
+        let eligible_area: f32 = surface.chunks_exact(3).filter_map(|t| {
+            let a = glam::Vec3::from(t[0].pos);
+            let n = (glam::Vec3::from(t[1].pos) - a).cross(glam::Vec3::from(t[2].pos) - a);
+            (n.y / n.length() >= 0.7).then_some(n.length() * 0.5)
+        }).sum();
+        let count = blades.len() / 6;
+        assert!(eligible_area > 0.0);
+        let eligible = surface.chunks_exact(3).filter(|t| {
+            let a = glam::Vec3::from(t[0].pos);
+            let n = (glam::Vec3::from(t[1].pos)-a).cross(glam::Vec3::from(t[2].pos)-a);
+            n.y / n.length() >= 0.7
+        }).count();
+        // Four domains have Q14=16383: one fewer real blade in each batch.
+        assert_eq!(eligible, 32);
+        assert_eq!(count, eligible * (13 + 16) - 8);
+        let near_count = blades.chunks_exact(6).filter(|b| b[0].axis[3] == 1).count();
+        assert_eq!(near_count, eligible * 16 - 4);
+        assert_eq!(count - near_count, eligible * 13 - 4);
+        for b in blades.chunks_exact(6) {
+            assert!(b.iter().all(|v| v.axis[3] == b[0].axis[3]));
+        }
+        let scale = 0.45 + 0.825 * 0.7;
+        let mut roots = std::collections::HashSet::new();
+        for (blade, tall) in blades.chunks_exact(6).zip(taller.chunks_exact(6)) {
+            assert_eq!(blade[0].palette[3], 1);
+            assert_eq!(blade[2].palette[3], 2);
+            assert_eq!(blade[0].wind_local[3], 51.0 / 512.0);
+            let root_mid = (glam::Vec3::from(blade[0].pos) + glam::Vec3::from(blade[1].pos)) * 0.5;
+            let axis_length = glam::Vec3::from(blade[2].pos).distance(root_mid);
+            assert!((blade[2].wind_local[3] - axis_length - 0.1).abs() <= 4.0 / 512.0 + 1e-5);
+            let root = (glam::Vec3::from(blade[0].pos) + glam::Vec3::from(blade[1].pos)) * 0.5;
+            roots.insert(root.to_array().map(f32::to_bits));
+            let expected = (glam::Vec3::from(blade[1].pos) - glam::Vec3::from(blade[0].pos))
+                .cross(glam::Vec3::from(blade[2].pos) - root).normalize();
+            let normal = glam::Vec3::new(blade[0].normal[0] as f32, blade[0].normal[1] as f32, blade[0].normal[2] as f32) / 127.0;
+            assert!(normal.dot(expected) > 0.99, "blade normal follows its face");
+            for axis in 0..3 { assert_eq!(blade[0].normal[axis], -blade[3].normal[axis]); }
+            let height = blade[2].pos[1] - root.y;
+            assert!((0.85 * 1.65 * scale * 40.0_f32.to_radians().cos() - 1e-5..=3.8 * scale + 1e-5).contains(&height));
+            let width = glam::Vec3::from(blade[1].pos).distance(glam::Vec3::from(blade[0].pos));
+            assert!((0.85 * 0.2 * scale - 2.0 * 3.0_f32.sqrt() / 512.0..=0.6 * scale + 2.0 * 3.0_f32.sqrt() / 512.0).contains(&width));
+            assert!((tall[2].pos[1] - root.y - ((0.45 + 0.825 * 0.6999) / (0.45 + 0.825 * 0.7)) * height).abs() < 8.0 / 512.0);
+        }
+        assert!(roots.len() > blades.len() / 12, "blades must not pile up at one root");
+        if std::env::var_os("RUSTUDIO_GRASS_MEASURE").is_some() {
+            for batch in 0..=1 {
+                let mut ranges = [[f32::INFINITY, f32::NEG_INFINITY]; 3];
+                for b in blades.chunks_exact(6).filter(|b| b[0].axis[3] == batch) {
+                    let a = glam::Vec3::from(b[0].pos);
+                    let c = glam::Vec3::from(b[1].pos);
+                    let root = (a + c) * 0.5;
+                    for (i, v) in [root.y, a.distance(c), b[2].pos[1] - root.y].into_iter().enumerate() {
+                        ranges[i][0] = ranges[i][0].min(v);
+                        ranges[i][1] = ranges[i][1].max(v);
+                    }
+                }
+                println!("batch={batch} root_y/width/vertical_height={ranges:?}");
+            }
+        }
+
+    }
+
+    #[test]
+    fn mixed_grass_faces_remain_decoration_candidates() {
+        let mut v = Voxels::empty();
+        for x in -2..=5 { for z in -2..=5 {
+            v.set([x, 0, z], if x < 2 { 2 } else { 8 }, 1.0);
+        }}
+        let surface = chunk_triangles(&v, [0, 0, 0], &|_| false);
+        let mixed: Vec<_> = surface.chunks_exact(3).filter(|t|
+            t[0].palette[..3].iter().any(|&p| p / 3 == 2) &&
+            t[0].palette[..3].iter().any(|&p| p / 3 != 2)).collect();
+        assert!(!mixed.is_empty());
+        for t in mixed { assert!(chunk_has_grass_top(t)); }
+        let blades = grass_blades(&v, [0, 0, 0], 0.7);
+        assert!(blades.iter().all(|v| v.pos.iter().all(|x| x.is_finite())));
+        // Mixed weights shrink geometry, rather than rejecting the whole face.
+        assert!(blades.chunks_exact(6).any(|b|
+            glam::Vec3::from(b[0].pos).distance(glam::Vec3::from(b[1].pos)) < 0.2 * (0.45+0.825*0.7)));
+    }
+
+    #[test]
+    fn decoration_ownership_matches_accepted_native_source_cells() {
+        let rows: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/grass/decoration-regression.json")).unwrap();
+        for row in rows.as_array().unwrap() {
+            let raw = std::array::from_fn(|i| {
+                let r = &row["raw"][i];
+                (r[0].as_u64().unwrap() as u8, r[1].as_u64().unwrap() as u8)
+            });
+            assert_eq!(decoration_owner(raw), row["native"].as_u64().unwrap() as u8,
+                "source cell {:?}", row["cell"]);
+            let mut grid = Grid::new();
+            for (offset, (material, occupancy)) in
+                [0, 1, 1 + P, P, PP, PP + 1, PP + 1 + P, PP + P].into_iter().zip(raw) {
+                let p = pidx(1, 1, 1) + offset;
+                grid.mat[p] = material;
+                grid.solid[p] = if material > 1 { 0.5 + 0.5 * occupancy_from_byte(occupancy) } else { 0.0 };
+            }
+            assert_eq!(grid.decoration_material([1, 1, 1]), row["native"].as_u64().unwrap() as u8);
+        }
+    }
 
     #[test]
     fn corner_material_sums_occupancy_and_breaks_ties_by_slot() {
@@ -2208,7 +2797,7 @@ mod tests {
         let mut cells = block([0, 0, 0], [1, 1, 1], (2, 255, None));
         cells.extend(block([2, 0, 0], [3, 1, 1], (8, 255, None)));
         cells.extend(block([0, 0, 5], [1, 1, 6], (WATER, 255, None)));
-        // Water touching solid: no water face against the rock.
+        // Water touching solid: its closed surface extends beneath the bank.
         cells.extend(block([4, 0, 0], [4, 1, 1], (WATER, 255, None)));
         let v = Voxels::decode(&encode(&cells)).unwrap();
         let meshes = build_meshes(&v);
@@ -2216,13 +2805,14 @@ mod tests {
         assert_eq!(mats, vec![WATER, 2, 8]);
         let water = &meshes[0];
         assert!(is_water(water.material));
-        // No water vertex lies deep in the rock (x < 16): the rim's reach at
-        // most half a voxel in, as every surface sits half a voxel out from
-        // full voxels (round 21's crossing rule, water as solid).
+        // Native bank preprocessing permits overlap beneath the rock.
+        // The separate pool keeps its own bounds.
         assert!(water
             .positions
             .iter()
-            .all(|p| p[0] >= 14.0 - 1e-4 || p[2] >= 18.0 - 1e-4));
+            .all(|p| p[0] >= 6.0 - 1e-4 || p[2] >= 18.0 - 1e-4));
+        assert!(water.positions.iter().any(|p| p[0] < 14.0 && p[2] < 18.0),
+            "touching water must cover the bank intersection");
         let (pos, idx) = collision_mesh(&meshes);
         assert!(!pos.is_empty() && idx.len() % 3 == 0);
     }
@@ -2258,4 +2848,285 @@ mod tests {
             bytes.len()
         );
     }
+}
+
+#[test]
+#[ignore = "reads local evidence under checks/"]
+fn grass_native_domain_fixtures(){
+ use crate::terrain;
+ let base=std::path::Path::new("checks/grass-full-re/domain-fixtures");
+ for name in ["flat","slope"] {
+ let d=std::fs::read(base.join(format!("{name}-voxels.bin"))).unwrap();let mut v=terrain::Voxels::empty();
+ for r in d.chunks_exact(20){let i=|o|i32::from_le_bytes(r[o..o+4].try_into().unwrap());let occ=f32::from_le_bytes(r[16..20].try_into().unwrap());v.set_raw_many([([i(0),i(4),i(8)],(if i(12)==1280 {2}else{0},(occ*256.0-1.0).max(0.0) as u8,0))]);}
+ let mut tris=Vec::new();let mut grass=Vec::new();for y in -1..=0 {for x in -1..=0 {for z in -1..=0 {let key=[x,y,z];tris.extend(terrain::chunk_triangles(&v,key,&|_|false));grass.extend(terrain::grass_blades(&v,key,0.7));}}}
+ std::fs::write(base.join(format!("{name}-rust-tris.bin")),bytemuck::cast_slice(&tris)).unwrap();std::fs::write(base.join(format!("{name}-rust-grass.bin")),bytemuck::cast_slice(&grass)).unwrap();println!("{name} {} tris {} grass vertices stride {}",tris.len()/3,grass.len(),std::mem::size_of::<terrain::TerrainVertex>());
+ assert_eq!(grass.len()/6, if name=="flat" {3694} else {6226});
+ let captures: &[(usize,[f32;3],bool)] = if name=="flat" { &[(6,[32.,32.,32.],false),(7,[32.,32.,32.],true)] } else { &[(8,[32.,32.,32.],false),(9,[32.,32.,32.],true),(10,[32.,-32.,32.],true),(11,[32.,-32.,32.],false)] };
+ // Compare source to native as well: native allocation contains filler copies.
+ for blade in grass.chunks_exact(6) {
+  let near = blade[0].axis[3] != 0;
+  assert!(captures.iter().filter(|c|c.2==near).any(|&(capture,origin,_)| {
+   let native=std::fs::read(base.join(format!("output-{capture}-0.bin"))).unwrap();
+   native.chunks_exact(36).any(|n|(0..3).all(|v|(0..3).all(|axis| {
+    let p=i16::from_le_bytes(n[v*12+axis*2..v*12+axis*2+2].try_into().unwrap()) as f32/512.0+origin[axis];
+    (blade[v].pos[axis]-p).abs()<=2.0/512.0
+   })))
+  }),"{name}: source blade without native counterpart");
+ }
+ for &(capture,origin,near) in captures {
+  let native=std::fs::read(base.join(format!("output-{capture}-0.bin"))).unwrap();
+  for (ordinal,blade) in native.chunks_exact(36).enumerate() {
+   let positions: [[f32;3];3] = std::array::from_fn(|v|std::array::from_fn(|axis|i16::from_le_bytes(blade[v*12+axis*2..v*12+axis*2+2].try_into().unwrap()) as f32/512.0+origin[axis]));
+   assert!(grass.chunks_exact(6).filter(|v| (v[0].axis[3]!=0)==near).any(|v| (0..3).all(|corner|(0..3).all(|axis|(v[corner].pos[axis]-positions[corner][axis]).abs()<=2.0/512.0))),"{name} capture {capture} blade {ordinal}");
+  }
+ }
+
+ }
+}
+
+#[test]
+#[ignore = "retained mixed-material native ownership investigation"]
+fn grass_mixed_material_ownership_probe() {
+ let base_path=std::env::var("MIXED_PROBE_DIR").unwrap_or_else(|_| "checks/grass-full-re/mixed-material".into());
+ let base=std::path::Path::new(&base_path);
+ for name in ["sand","flat","slope","transition"] {
+  let d=std::fs::read(base.join(format!("{name}-voxels.bin"))).unwrap();
+  let mut v=Voxels::empty();
+  for r in d.chunks_exact(20) {
+   let i=|o|i32::from_le_bytes(r[o..o+4].try_into().unwrap());
+   let occ=f32::from_le_bytes(r[16..20].try_into().unwrap());
+   let mat=match i(12) {1280=>2,1296=>6,1792|0=>0,m=>panic!("unmapped material {m}")};
+   v.set_raw_many([([i(0),i(4),i(8)],(mat,(occ*256.0-1.0).max(0.0) as u8,0))]);
+  }
+  let mut rows=Vec::new();
+  for ky in -1..=0 {for kx in -1..=0 {for kz in -1..=0 {
+   let key=[kx,ky,kz];let mut g=Grid::new();g.fill(&v,key);
+   for z in 0..P-1 {for y in 0..P-1 {for x in 0..P-1 {
+    let c=[x,y,z];let (pos,_)=g.cell_vertex(0,c,key);
+    let gc=[0,1,2].map(|a|(key[a]<<CHUNK_SHIFT)+c[a] as i32-1);
+    rows.push(serde_json::json!({"pos":pos,"gc":gc,"mat":g.cell_material(c)}));
+   }}}
+  }}}
+  std::fs::write(base.join(format!("{name}-source-cells.json")),serde_json::to_vec(&rows).unwrap()).unwrap();
+ }
+}
+
+#[test]
+#[ignore = "reads local evidence under checks/"]
+fn grass_atomic_mixed_boundary_export() {
+ let base=std::path::Path::new("checks/grass-full-re/mixed-atomic");
+
+ for name in ["slope","slope-plus","slope-minus"] {
+  let d=std::fs::read(base.join(format!("{name}-packed.bin"))).unwrap();
+  let mut vox=Voxels::empty();
+  vox.set_raw_many(d.chunks_exact(16).map(|r| {
+   let c=std::array::from_fn(|a|i32::from_le_bytes(r[a*4..a*4+4].try_into().unwrap()));
+   (c,(r[12],r[13],0))
+  }));
+  let mut domains=Vec::new();
+  for y in -1..=0 {for x in -1..=0 {for z in -1..=0 {
+   for t in chunk_triangles_impl(&vox,[x,y,z],&|_|false,true).chunks_exact(3) {
+    let a=glam::Vec3::from(t[0].pos);let b=glam::Vec3::from(t[1].pos);let c=glam::Vec3::from(t[2].pos);let n=(b-a).cross(c-a);
+    if n.length()<0.0002 || n.y/n.length()<0.7 || t[0].palette[..3].iter().all(|p|p/3!=2) {continue;}
+    let xyz=[t[0].pos,t[1].pos,t[2].pos];let indicators=std::array::from_fn(|i|if t[0].palette[i]/3==2 {1.0}else{0.0});
+    let q14=(crate::grass_stream::material_weight(xyz,indicators)*16384.0) as i32;
+    domains.push(serde_json::json!({"xyz":xyz,"q14":q14}));
+   }
+  }}}
+  std::fs::write(base.join(format!("{name}-domains.json")),serde_json::to_vec(&domains).unwrap()).unwrap();
+  let mut blades=Vec::new();
+  for y in -1..=0 {for x in -1..=0 {for z in -1..=0 {blades.extend(grass_blades(&vox,[x,y,z],0.7));}}}
+  std::fs::write(base.join(format!("{name}-rust-grass.bin")),bytemuck::cast_slice(&blades)).unwrap();
+  let start=match name {"slope"=>0,"slope-plus"=>4,_=>8};
+  let mut native_blades=Vec::new();
+  for capture in start..start+4 {
+   let origin=[32.0,if matches!(capture,0|1|6|7|10|11) {-32.0}else{32.0},32.0];
+   let input=std::fs::read(base.join(format!("input-{capture}.bin"))).unwrap();
+   for r in input.chunks_exact(28) {
+    let f=|i:usize|i16::from_le_bytes(r[i*2..i*2+2].try_into().unwrap()) as f32/512.0;
+    let xyz: [[f32;3];3]=std::array::from_fn(|v|std::array::from_fn(|a|origin[a]+f(a)+if v==0 {0.0}else{f(v*3+a)}));
+    let q=u16::from_le_bytes(r[18..20].try_into().unwrap());
+    assert!(domains.iter().any(|d| d["q14"].as_u64()==Some(q as u64) && (0..3).all(|v|(0..3).all(|a|(d["xyz"][v][a].as_f64().unwrap() as f32-xyz[v][a]).abs()<=2.0/512.0))),"{name} capture {capture}: native Q14/domain missing {xyz:?} {q}");
+   }
+   let meta:serde_json::Value=serde_json::from_slice(&std::fs::read(base.join(format!("output-{capture}.json"))).unwrap()).unwrap();
+   let object=meta["object"].as_str().unwrap();let sample_count=u32::from_le_bytes(std::array::from_fn(|a|u8::from_str_radix(&object[(76+a)*2..(77+a)*2],16).unwrap()));
+   let near=sample_count==16;
+   let raw=std::fs::read(base.join(format!("output-{capture}-0.bin"))).unwrap();
+   for r in raw.chunks_exact(36) {
+    let xyz: [[f32;3];3]=std::array::from_fn(|v|std::array::from_fn(|a|origin[a]+i16::from_le_bytes(r[v*12+a*2..v*12+a*2+2].try_into().unwrap()) as f32/512.0));
+    native_blades.push((xyz,near));
+   }
+  }
+  let same=|r:&[TerrainVertex],n:&([[f32;3];3],bool)| (r[0].axis[3]!=0)==n.1 && (0..3).all(|v|(0..3).all(|a|(r[v].pos[a]-n.0[v][a]).abs()<=2.0/512.0));
+  for n in &native_blades { assert!(blades.chunks_exact(6).any(|r|same(r,n)),"{name}: native blade missing"); }
+  for r in blades.chunks_exact(6) { assert!(native_blades.iter().any(|n|same(r,n)),"{name}: Rust blade missing"); }
+  assert_eq!(blades.len()/6,match name {"slope"=>3388,"slope-plus"=>3384,_=>2920});
+  println!("atomic {name}: {} blades, stride {}",blades.len()/6,std::mem::size_of::<TerrainVertex>());
+ }
+}
+
+#[test]
+fn grass_nondefault_generation_counts() {
+    let mut vox=Voxels::empty();
+    for x in -1..=3 {for z in -1..=3 {vox.set([x,0,z],2,1.0);}}
+    // 32 native domains, four with Q14=16383; minimum-three acceptance
+    // suppresses the regular-batch deficit when allocation is three.
+    for (length,density,expected) in [
+        (0.1,1.0,32*(26+32)-8), (0.6999,1.0,32*(13+16)-8),
+        (0.7,1.0,32*(13+16)-8), (0.7001,1.0,32*(12+15)-8),
+        (1.0,1.0,32*(9+11)-8), (0.7,0.0,0),
+        (0.7,0.25,32*(3+4)-4), (0.7,0.5,32*(6+8)-8),
+    ] {
+        assert_eq!(grass_blades_density(&vox,[0,0,0],length,density).len()/6,expected,
+            "length {length} density {density}");
+    }
+}
+
+#[cfg(test)]
+mod grass_ordinal_tests {
+    use super::*;
+    #[test]
+    fn allocated_ordinals_survive_filler_omission() {
+        let mut vox = Voxels::empty();
+        for x in -1..=3 { for z in -1..=3 { vox.set([x,0,z],2,1.0); } }
+        for length in [0.1, 0.7, 1.0] {
+            let geometry = grass_geometry_density(&vox, [0,0,0], length, 1.0);
+            let mut covered = vec![false; geometry.vertices.len()/6];
+            for (near, batch) in geometry.batches.iter().enumerate() {
+                assert!(batch.allocated >= batch.blades.len());
+                assert!(batch.blades.windows(2).all(|p| p[0].0 < p[1].0));
+                for &(ordinal, first) in &batch.blades {
+                    assert!(ordinal < batch.allocated);
+                    assert_eq!(first % 6, 0);
+                    assert_eq!(geometry.vertices[first].axis[3] as usize, near);
+                    assert!(!covered[first/6]);
+                    covered[first/6] = true;
+                }
+            }
+            let mut cell_covered = vec![false; geometry.vertices.len()/6];
+            for cell in &geometry.cells {
+                assert!(cell.batch.blades.windows(2).all(|p|p[0].0 < p[1].0));
+                for &(ordinal, first) in &cell.batch.blades {
+                    assert!(ordinal < cell.batch.allocated);
+                    cell_covered[first/6] = true;
+                    assert_eq!(geometry.vertices[first].axis[3] != 0, cell.near);
+                }
+            }
+            assert_eq!(covered, cell_covered);
+            assert!(covered.into_iter().all(|v| v));
+        }
+    }
+}
+
+#[test]
+#[ignore = "reads local evidence under checks/"]
+fn native_producer_domain_order() {
+    let base = std::path::Path::new("checks/grass-full-re/domain-fixtures");
+    for (name, captures, mixed) in [("flat", vec![(8, [0,0,0])],false), ("slope", vec![(10,[0,0,0]), (12,[0,-1,0])],false),
+        ("slope",vec![(0,[0,-1,0]),(2,[0,0,0])],true),
+        ("slope-plus",vec![(4,[0,0,0]),(6,[0,-1,0])],true),
+        ("slope-minus",vec![(8,[0,0,0]),(10,[0,-1,0])],true)] {
+        let base = if mixed { std::path::Path::new("checks/grass-full-re/mixed-atomic") } else { base };
+        let mut voxels = Voxels::empty();
+        if mixed {
+            let data=std::fs::read(base.join(format!("{name}-packed.bin"))).unwrap();
+            voxels.set_raw_many(data.chunks_exact(16).map(|r|(std::array::from_fn(|a|i32::from_le_bytes(r[a*4..a*4+4].try_into().unwrap())),(r[12],r[13],0))));
+        } else { for r in std::fs::read(base.join(format!("{name}-voxels.bin"))).unwrap().chunks_exact(20) {
+            let i = |o| i32::from_le_bytes(r[o..o+4].try_into().unwrap());
+            let occ = f32::from_le_bytes(r[16..20].try_into().unwrap());
+            voxels.set_raw_many([([i(0),i(4),i(8)],(if i(12)==1280 {2}else{0},(occ*256.0-1.0).max(0.0) as u8,0))]);
+        }
+        }
+        for (capture, region) in captures {
+            let mut domains = Vec::new();
+            for y in -1..=0 { for z in -1..=0 { for x in -1..=0 {
+                let tris = chunk_triangles_impl(&voxels,[x,y,z],&|_|false,true);
+                for t in tris.chunks_exact(3) {
+                    let n = (glam::Vec3::from(t[1].pos)-glam::Vec3::from(t[0].pos)).cross(glam::Vec3::from(t[2].pos)-glam::Vec3::from(t[0].pos));
+                    if n.length()<0.0002 || n.y/n.length()<0.7 || t[0].palette[..3].iter().all(|p|p/3!=2) {continue;}
+                    if std::array::from_fn::<_,3,_>(|a|(t[0].wind_local[a]/64.0).floor() as i32)!=region {continue;}
+                    domains.push(t.iter().map(|v|v.pos).collect::<Vec<_>>());
+                }
+            }}}
+            let seed=(region[0] as u32).wrapping_mul(0x466f45d) ^ (region[1] as u32).wrapping_mul(0x127409f) ^ (region[2] as u32).wrapping_mul(0x4f9ffb7);
+            let order=crate::grass_stream::Stream::from_seed(seed as u64).shuffled_slots(domains.len());
+            let native=std::fs::read(base.join(format!("input-{capture}.bin"))).unwrap();
+            assert_eq!(domains.len(),native.len()/28);
+            for (ordinal,r) in native.chunks_exact(28).enumerate() {
+                let word=|i|i16::from_le_bytes(r[i*2..i*2+2].try_into().unwrap()) as f32/512.0;
+                for v in 0..3 {for a in 0..3 {
+                    let expected=word(a)+if v==0 {0.0}else{word(v*3+a)}+region[a] as f32*64.0+32.0;
+                    assert!((domains[order[ordinal]][v][a]-expected).abs()<=2.0/512.0,"{name} mixed={mixed} region {region:?} ordinal {ordinal}: source {:?}, expected {expected}",domains[order[ordinal]]);
+                }}
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "explicit same-input X/Z boundary source inventory"]
+fn square_boundary_source_inventory() {
+ let base=std::path::Path::new("checks/grass-square-boundaries/runtime");
+ for name in ["flat","slope"] {
+  let mut vox=Voxels::empty();
+  for r in std::fs::read(base.join(format!("{name}-voxels.bin"))).unwrap().chunks_exact(20) {
+   let i=|o|i32::from_le_bytes(r[o..o+4].try_into().unwrap());
+   let occ=f32::from_le_bytes(r[16..20].try_into().unwrap());
+   vox.set_raw_many([([i(0),i(4),i(8)],(if i(12)==1280 {2}else{0},(occ*256.0-1.0).max(0.0) as u8,0))]);
+  }
+  let mut rows=Vec::new();
+  for key in dirty_chunks(None,&vox) {
+   for t in chunk_triangles_impl(&vox,key,&|_|false,true).chunks_exact(3) {
+    let n=(glam::Vec3::from(t[1].pos)-glam::Vec3::from(t[0].pos)).cross(glam::Vec3::from(t[2].pos)-glam::Vec3::from(t[0].pos));
+    if n.length()<0.0002 || n.y/n.length()<0.7 || t[0].palette[..3].iter().all(|p|p/3!=2) {continue;}
+    let region=std::array::from_fn::<_,3,_>(|a|(t[0].wind_local[a]/64.0).floor() as i32);
+    rows.push(serde_json::json!({"region":region,"xyz":[t[0].pos,t[1].pos,t[2].pos],"palette":t[0].palette,"storage":key}));
+   }
+  }
+  // Compare per-region multisets, retaining duplicate native assignments.
+  let native: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(base.join(format!("{name}-native-source.json"))).unwrap()).unwrap();
+  let inventory = |data: &[serde_json::Value]| {
+   let mut result = std::collections::BTreeMap::new();
+   for row in data {
+    let region: [i32; 3] = std::array::from_fn(|a| row["region"][a].as_i64().unwrap() as i32);
+    let mut triangle: [[i32; 3]; 3] = std::array::from_fn(|v| std::array::from_fn(|a| (row["xyz"][v][a].as_f64().unwrap()*512.0).round() as i32));
+    triangle.sort();
+    *result.entry((region, triangle)).or_insert(0usize) += 1;
+   }
+   result
+  };
+  assert_eq!(inventory(&rows), inventory(&native), "native region ownership: {name}");
+  std::fs::write(base.join(format!("{name}-rust-source.json")),serde_json::to_vec(&rows).unwrap()).unwrap();
+ }
+}
+
+#[test]
+#[ignore = "explicit CPU production Village coverage export"]
+fn village_coverage_export() {
+ let path=format!("{}/.cache/rustudio/templates/520390648/v63.rbxl",std::env::var("HOME").unwrap());
+ let dom=rbx_binary::from_reader(std::fs::File::open(&path).unwrap()).unwrap();
+ let v=Voxels::from_dom(&dom).unwrap().unwrap();
+ let terrain=dom.root().children().iter().filter_map(|r|dom.get_by_ref(*r)).find(|i|i.class=="Workspace").unwrap().children().iter().filter_map(|r|dom.get_by_ref(*r)).find(|i|i.class=="Terrain").unwrap();
+ let length=match terrain.properties.get(&rbx_dom_weak::ustr("GrassLength")) {Some(rbx_types::Variant::Float32(x))=>*x,_=>crate::mech::GRASS_LENGTH_DEFAULT};
+ let mut keys=dirty_chunks(None,&v); keys.sort();
+ for key in keys { let lo=glam::Vec3::from_array(key.map(|x|x as f32*128.0)); let cam=glam::Vec3::new(-12.0,155.0,210.0); if cam.distance(cam.clamp(lo,lo+glam::Vec3::splat(128.0)))<=crate::mech::GRASS_RADIUS {grass_geometry_density(&v,key,length,1.0);} }
+}
+
+
+/// Blade orientation `i` of 1024: a horizontal base axis at a random heading
+/// and a unit tip axis leaning 10°–40° off vertical across it.
+fn grass_template(i: usize) -> (glam::Vec3, glam::Vec3) {
+    let mut z = (i as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut next = || {
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut x = z;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((x ^ (x >> 31)) >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let heading = next() * std::f32::consts::TAU;
+    let base = glam::Vec3::new(heading.cos(), 0.0, heading.sin());
+    let lean = (10.0 + 30.0 * next()).to_radians() * if next() < 0.5 { -1.0 } else { 1.0 };
+    let across = glam::Vec3::new(-heading.sin(), 0.0, heading.cos());
+    (base, glam::Vec3::Y * lean.cos() + across * lean.sin())
 }

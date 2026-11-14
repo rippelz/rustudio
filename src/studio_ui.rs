@@ -102,6 +102,8 @@ pub struct UiState {
     pub show_gui: bool,
     pub grid_size: f32,
     pub about: bool,
+    /// File > Studio Settings (src/studio_settings.rs).
+    pub studio_settings: crate::studio_settings::Dialog,
     pub insert_popup: Option<InsertPopup>,
     pub recent: Vec<PathBuf>,
 }
@@ -122,6 +124,7 @@ impl Default for UiState {
             show_gui: true,
             grid_size: crate::mech::GRID_SPACING,
             about: false,
+            studio_settings: Default::default(),
             insert_popup: None,
             recent: load_recent(),
         }

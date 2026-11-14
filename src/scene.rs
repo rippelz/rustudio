@@ -30,12 +30,23 @@ pub struct ScenePart {
     pub decals: Vec<DecalDesc>,
     /// Classic clothing on a character body part: (part name, shirt id, pants id).
     pub clothing: Option<(String, Option<String>, Option<String>)>,
+    /// An R15 body MeshPart under that clothing: its character's atlas
+    /// colours (assets::r15_composite).
+    pub r15_look: Option<crate::assets::R15Look>,
     /// Locked parts can't be clicked in the viewport.
     pub locked: bool,
     /// A MaterialVariant replaces the material's own texture pack.
     pub variant: bool,
+    /// That variant as a registered material pack (matpack.rs) and its
+    /// StudsPerTile. The viewport draws it through the part material shader
+    /// (Studio: uvScale = Size / StudsPerTile, uvOffset 0, face UVs from the
+    /// primitive's own faces, including wedge slopes); the six ColorMap
+    /// decals in `decals` are only the fallback while it can't load.
+    pub variant_pack: Option<(u64, f32)>,
     /// The box decals sit on: the part's Size, or a Head mesh's drawn size.
     pub decal_size: Vec3,
+    /// Where that box sits in the part (a legacy mesh's Offset), part space.
+    pub decal_offset: Vec3,
     /// Children / siblings whose changes alter this part's look (meshes,
     /// decals, clothing).
     pub deps: Vec<Ref>,
@@ -211,6 +222,48 @@ fn character_clothing(
     (clothing, if torso { graphic } else { None })
 }
 
+/// An R15 body MeshPart's character as Studio composites its atlas
+///: each cell's colour from the first part of its group that
+/// is a MeshPart with a TextureID, else the group's first
+/// part present; the Shirt / Pants Color3.
+fn r15_look(doc: &Document, inst: &Instance) -> Option<crate::assets::R15Look> {
+    if inst.class != "MeshPart" || crate::assets::r15_cell(&inst.name).is_none() {
+        return None;
+    }
+    let model = doc.dom.get_by_ref(inst.parent())?;
+    let child = |name: &str| {
+        model.children().iter().copied().find(|c| {
+            doc.dom.get_by_ref(*c).is_some_and(|i| i.name == name && doc::is_a(&i.class, "BasePart"))
+        })
+    };
+    let colour = |r: Ref| color_of(doc.prop(r, "Color")).or_else(|| color_of(doc.prop(r, "BrickColor")));
+    let mut cell_colors = [[0u8; 3]; 5];
+    for (k, group) in crate::assets::R15_CELL_GROUPS.iter().enumerate() {
+        let parts: Vec<Ref> = group.iter().filter_map(|n| child(n)).collect();
+        let textured = parts.iter().copied().find(|p| {
+            doc.class_of(*p).is_some_and(|c| c == "MeshPart")
+                && (content_string(doc.prop(*p, "TextureID")).is_some()
+                    || content_string(doc.prop(*p, "TextureContent")).is_some())
+        });
+        let pick = textured.or_else(|| parts.first().copied());
+        cell_colors[k] = pick.and_then(colour).unwrap_or([255, 255, 255]);
+    }
+    let cloth = |class: &str| {
+        model
+            .children()
+            .iter()
+            .copied()
+            .find(|c| doc.class_of(*c).is_some_and(|k| k == class))
+            .and_then(|c| match doc.prop(c, "Color3") {
+                Some(Variant::Color3(c)) => Some([c.r, c.g, c.b]),
+                Some(Variant::Color3uint8(c)) => Some([c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0]),
+                _ => None,
+            })
+            .unwrap_or([1.0, 1.0, 1.0])
+    };
+    Some(crate::assets::R15Look { cell_colors, shirt_color: cloth("Shirt"), pants_color: cloth("Pants") })
+}
+
 /// A short content hash for a mesh blob without its own (MeshData).
 fn blake3_hex(data: &[u8]) -> String {
     use std::hash::{Hash, Hasher};
@@ -245,7 +298,13 @@ pub(crate) fn union_mesh(doc: &Document, r: Ref) -> Option<MeshAsset> {
             },
         },
     };
-    let (bytes, hash) = blob?;
+    let Some((bytes, hash)) = blob else {
+        let mut id = content_string(doc.prop(r, "Content"))?;
+        if matches!(doc.prop(r, "UsePartColor"), Some(Variant::Bool(true))) {
+            id.push_str("#partcolor");
+        }
+        return Some(MeshAsset { id, fit_to_part: true, scale: Vec3::ONE, offset: Vec3::ZERO });
+    };
     if std::env::var_os("RUSTUDIO_UNION_DENSITY_TRACE").is_some() {
         static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
         if SEEN.get_or_init(Default::default).lock().unwrap().insert(hash.clone()) {
@@ -294,9 +353,11 @@ pub struct MeshAsset {
 pub fn use_2022_materials(doc: &Document) -> bool {
     doc.find_child(doc.dom.root_ref(), "MaterialService")
         .and_then(|ms| {
+            // Consult serialized values before reflection defaults: the API
+            // property can default false while the XML property stores true.
             ["Use2022Materials", "Use2022MaterialsXml"]
                 .iter()
-                .find_map(|k| match doc.prop(ms, k) {
+                .find_map(|k| match doc.dom.get_by_ref(ms)?.properties.get(&rbx_dom_weak::ustr(k)).cloned() {
                     Some(Variant::Bool(b)) => Some(b),
                     _ => None,
                 })
@@ -305,6 +366,37 @@ pub fn use_2022_materials(doc: &Document) -> bool {
 }
 
 fn material_variant(doc: &Document, part: Ref, material: u32) -> Option<(String, f32)> {
+    let v = material_variant_ref(doc, part, material)?;
+    let map = content_string(doc.prop(v, "ColorMap"))
+        .or_else(|| content_string(doc.prop(v, "ColorMapContent")))?;
+    Some((map, variant_studs(doc, v)))
+}
+
+fn variant_studs(doc: &Document, v: Ref) -> f32 {
+    f32_of(doc.prop(v, "StudsPerTile")).unwrap_or(10.0).max(0.01)
+}
+
+/// The part's MaterialVariant as a material pack (its four maps), registered
+/// with matpack like terrain variants, and its StudsPerTile.
+fn material_variant_pack(doc: &Document, part: Ref, material: u32) -> Option<(u64, f32)> {
+    let v = material_variant_ref(doc, part, material)?;
+    let id = |key: &str| {
+        let uri = content_string(doc.prop(v, key))
+            .or_else(|| content_string(doc.prop(v, &format!("{key}Content"))))?;
+        uri.strip_prefix("rbxassetid://").unwrap_or(&uri).trim().parse::<u64>().ok()
+    };
+    let pack = crate::matpack::Pack {
+        color: Some(id("ColorMap")?),
+        normal: id("NormalMap"),
+        roughness: id("RoughnessMap"),
+        metalness: id("MetalnessMap"),
+        tiling: 1.0,
+        ..Default::default()
+    };
+    Some((crate::matpack::register_terrain_variant(pack), variant_studs(doc, v)))
+}
+
+fn material_variant_ref(doc: &Document, part: Ref, material: u32) -> Option<Ref> {
     let ms = doc.find_child(doc.dom.root_ref(), "MaterialService")?;
     let mat_name = crate::ltypes::LEnumItem::from_value("Material", material)?.name;
     let name = match doc.prop(part, "MaterialVariant") {
@@ -323,14 +415,7 @@ fn material_variant(doc: &Document, part: Ref, material: u32) -> Option<(String,
                 && enum_u32(doc.prop(i.referent(), "BaseMaterial")).unwrap_or(256) == material
         })?
         .referent();
-    let map = content_string(doc.prop(v, "ColorMap"))
-        .or_else(|| content_string(doc.prop(v, "ColorMapContent")))?;
-    Some((
-        map,
-        f32_of(doc.prop(v, "StudsPerTile"))
-            .unwrap_or(10.0)
-            .max(0.01),
-    ))
+    Some(v)
 }
 
 pub fn content_string(v: Option<Variant>) -> Option<String> {
@@ -356,7 +441,21 @@ pub struct SceneChanges {
     pub changed: Vec<Ref>,
     /// Parts that only moved (CFrame changed).
     pub moved: Vec<Ref>,
+    /// Parts whose only changes were to how they're tinted (Transparency,
+    /// Color, Reflectance, CastShadow …): re-read here, and their draws
+    /// patched in place by the viewport rather than rebuilt.
+    pub restyled: Vec<Ref>,
     pub removed: Vec<Ref>,
+}
+
+/// Part properties that only change a part's colour, opacity, reflectance
+/// or shadow casting: the drawn instance keeps its shape, mesh, textures and
+/// batch (Studio's renderer updates them in the instance data).
+fn style_prop(name: &str) -> bool {
+    matches!(
+        name,
+        "Transparency" | "LocalTransparencyModifier" | "Color" | "Color3uint8" | "BrickColor" | "Reflectance" | "CastShadow"
+    )
 }
 
 /// The parts to draw, kept up to date from the document's change journal so
@@ -541,6 +640,7 @@ impl Scene {
         let Some(root) = Self::root(doc) else { return };
         let mut full: std::collections::HashSet<Ref> = Default::default();
         let mut moved: std::collections::HashSet<Ref> = Default::default();
+        let mut restyled: std::collections::HashSet<Ref> = Default::default();
         let cframe = rbx_dom_weak::ustr("CFrame");
         let marks_scope = crate::bench::scope("ss_marks");
         for m in marks {
@@ -562,6 +662,8 @@ impl Scene {
                     if self.index.contains_key(&r) {
                         if name == cframe {
                             moved.insert(r);
+                        } else if style_prop(name.as_str()) {
+                            restyled.insert(r);
                         } else {
                             full.insert(r);
                         }
@@ -621,6 +723,24 @@ impl Scene {
                 Some(p) => {
                     self.insert(p);
                     self.changes.changed.push(r);
+                }
+                None => {
+                    if self.remove(r) {
+                        self.changes.removed.push(r);
+                    }
+                }
+            }
+        }
+        for r in restyled.iter().copied() {
+            if full.contains(&r) {
+                continue;
+            }
+            // (still a part under the root: a removal comes as a Tree mark)
+            let p = doc.dom.get_by_ref(r).and_then(|inst| part_draw(doc, inst));
+            match p {
+                Some(p) => {
+                    self.insert(p);
+                    self.changes.restyled.push(r);
                 }
                 None => {
                     if self.remove(r) {
@@ -748,6 +868,10 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
     let mut draw_offset = Vec3::ZERO;
     let mut ellipsoid = false;
     let mut head_mesh = false;
+    // Legacy shape meshes (Brick, Wedge, Sphere, … SpecialMesh; BlockMesh,
+    // CylinderMesh) carry their part's Decals on the stretched shape: Pirate
+    // Island's rear sail is a 0.47-stud part whose Brick mesh is scaled to 37 studs.
+    let mut legacy_shape = false;
     let mut deps = Vec::new();
 
     // A SpecialMesh child changes the drawn shape; file meshes become placeholders.
@@ -797,6 +921,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
         tex_kind = mesh_kind;
     }
     let (clothing, tshirt) = character_clothing(doc, inst);
+    let r15_look = clothing.as_ref().and_then(|_| r15_look(doc, inst));
     if let Some(g) = tshirt {
         decals.push(DecalDesc {
             face: 5,
@@ -913,7 +1038,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
             Vec3::new(s.y, s.x, s.z),
         )
     };
-    // The light grid's view of the mesh children (FUN_146654ff0): the
+    // The light grid's view of the mesh children (FUN_Studio): the
     // SpecialMesh type, or a BlockMesh / CylinderMesh.
     let mut light_special: Option<u32> = None;
     let mut light_legacy: Option<bool> = None;
@@ -951,6 +1076,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
             let scale = vec3_of(doc.prop(*c, "Scale")).unwrap_or(Vec3::ONE);
             draw_offset = vec3_of(doc.prop(*c, "Offset")).unwrap_or(Vec3::ZERO);
             draw_size = size * scale;
+            legacy_shape = true;
             if child.class == "CylinderMesh" {
                 (draw_rot, draw_size) = vertical(draw_size);
                 mesh = MeshKind::Cylinder;
@@ -964,6 +1090,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
             if mesh_type != 5 {
                 draw_offset = vec3_of(doc.prop(*c, "Offset")).unwrap_or(Vec3::ZERO);
                 draw_size = size * scale;
+                legacy_shape = mesh_type != 0;
             }
             match mesh_type {
                 // Head: Studio's own head mesh (content/avatar/heads/head.mesh),
@@ -1031,6 +1158,12 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                 doc.class_of(*c)
                     .is_some_and(|k| matches!(k.as_str(), "Shirt" | "Pants" | "ShirtGraphic"))
             }));
+            // The R15 atlas takes its cell colours from the other body parts.
+            if r15_look.is_some() {
+                deps.extend(model.children().iter().copied().filter(|c| {
+                    *c != r && doc.dom.get_by_ref(*c).is_some_and(|i| crate::assets::r15_cell(&i.name).is_some())
+                }));
+            }
         }
     }
     if class == "NegateOperation" {
@@ -1105,9 +1238,12 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
         emissive: surface_emissive(doc, inst),
         decals,
         clothing,
+        r15_look,
         locked,
         variant: has_variant,
-        decal_size: if head_mesh { draw_size } else { size },
+        variant_pack: if has_variant { material_variant_pack(doc, r, material_id) } else { None },
+        decal_size: if head_mesh || legacy_shape { draw_size } else { size },
+        decal_offset: if legacy_shape { draw_offset } else { Vec3::ZERO },
         // A skinned MeshPart redraws when a Bone or its FaceControls changes (skin.rs).
         deps: if class == "MeshPart" {
             let mut deps = deps;
@@ -1194,6 +1330,16 @@ pub fn brick_rgb(b: BrickColor) -> [u8; 3] {
 mod tint_tests {
     use super::*;
     use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+    #[test]
+    fn serialized_material_generation_precedes_api_default() {
+        for (property, value) in [("Use2022MaterialsXml", true), ("Use2022MaterialsXml", false), ("Use2022Materials", true)] {
+            let service = InstanceBuilder::new("MaterialService").with_property(property, value);
+            let doc = Document::from_play_dom(WeakDom::new(
+                InstanceBuilder::new("DataModel").with_child(service)), "materials".into());
+            assert_eq!(use_2022_materials(&doc), value, "{property}");
+        }
+    }
 
     #[test]
     fn file_mesh_texture_uses_vertex_color() {

@@ -41,11 +41,10 @@ pub const BLOOM_MAX_RADIUS: i32 = 96; // half-resolution taps each side at most 
 pub const TECHNOLOGY_SOFT: [u32; 4] = [0, 1, 2, 3]; // Enum.Technology Legacy, Voxel, Compatibility, ShadowMap: places saved without LightingStyle draw Soft in Studio, as do places saving neither (tools/fidelity: Place A saves neither and reads Soft; Voxel is Studio's default Technology; round 19: Place B's og.rbxl saves ShadowMap and no LightingStyle and reads Soft)
 pub const TECHNOLOGY_FUTURE: u32 = 4; // Enum.Technology.Future: PrioritizeLightingQuality on when not saved (control place reads true; Place A Voxel reads false)
 pub const TERRAIN_BRUSH_INTERVAL_S: f32 = 1.0 / 30.0; // Terrain Editor: one brush application per this while the button is held (estimated, not measured in Studio)
-pub const UNDERWATER_FOG: [f32; 2] = [1.066, 0.00137]; // camera in terrain water: visibility = clamp(2^(a − k·d) − 1, 0, 1) toward the lit WaterColor (Studio's exp2 fog form, fs FogParams); fitted to Place B's lake (F4, place-b-terrain 22 s: hit distances 63–698 studs, linear-light blue channel, < 0.02 off): clear to 48 studs, gone by 778
+pub const UNDERWATER_FOG: [f32; 2] = [1.066, 0.00137]; // camera in terrain water: visibility = clamp(2^(a − k·d) − 1, 0, 1) toward the lit WaterColor (Studio's exp2 fog form, fs FogParams); fitted to Place B's lake (F4, Place B-terrain 22 s: hit distances 63–698 studs, linear-light blue channel, < 0.02 off): clear to 48 studs, gone by 778
 pub const RANDOM_PCG_INC: u64 = 0x69; // Random: PCG32 (multiplier 0x5851f42d4c957f2d) with increment 105, seeded like pcg32_srandom; NextNumber = (second draw << 32 | first) × 2^-64, NextNumber(a, b) = min(1 − t) + max·t clamped; matches Studio's sequences for seeds 0, 1, 1001, 1005, 123456789
-pub const TECHNOLOGY_NO_TONE_CURVE: [u32; 1] = [2]; // Enum.Technology Compatibility only (Studio migrates it on load to Voxel + a ColorGradingEffect TonemapperPreset Retro, roughly sqrt). Measured 2026-11-08 in an offline Studio (~/.cache/rustudio/lightov/tone/REPORT.md): Legacy, Voxel, ShadowMap and Future all draw the Default curve, bit-identical (RMS 1.03 levels on TONE_CURVE); round 21 had Legacy/Voxel curve-free, which only offset the sRGB texel decode fixed in 3f3dffc
+pub const TECHNOLOGY_NO_TONE_CURVE: [u32; 1] = [2]; // Enum.Technology Compatibility only (Studio migrates it on load to Voxel + a ColorGradingEffect TonemapperPreset Retro, roughly sqrt). Measured 2026-11-08 in Studio (~/.cache/rustudio/lightov/tone/REPORT.md): Legacy, Voxel, ShadowMap and Future all draw the Default curve, bit-identical (RMS 1.03 levels on TONE_CURVE); round 21 had Legacy/Voxel curve-free, which only offset the sRGB texel decode fixed in 3f3dffc
 pub const TECHNOLOGY_QUALITY: [u32; 2] = [3, 4]; // Enum.Technology ShadowMap, Future: PrioritizeLightingQuality on when not saved (control place, Future, reads true; Place B, ShadowMap, reads true; Place A, Voxel, false)
-pub const MOVER_HOLDS_CHARACTER_FORCE: f32 = 2000.0; // a Vector LinearVelocity on the HumanoidRootPart with at least this MaxForce carries the character (an R15 weighs ~10 × 196.2 = 1962 force units: below it gravity wins); estimated, round 19 (Place C's ship: 1e7)
 /// Services every place has in Studio even when its file doesn't list them
 /// (made on load). Checked against offline Studio by tools/fidelity (the
 /// structural dump of a place whose file holds only three services).
@@ -216,14 +215,8 @@ pub const LIGHTOCC_DENSITY: f32 = 20.0; // per stud of solid: light let through 
 pub const LIGHTOCC_START_VOXELS: f32 = 1.0; // the march starts this many voxels out along the normal (past the surface's own part)
 pub const LIGHTOCC_LIGHT_SKIP_VOXELS: f32 = 0.5; // and stops this far short of the light (its fitting)
 pub const LIGHTOCC_MAX_STEPS: f32 = 24.0; // samples per light at most (one per voxel up to this)
-// See-through Neon (round 26, corpus lightwall-soft / -real: cyan (60, 220,
-// 255) panels at Transparency 0.5 / 0.86 / three stacked 0.86 over a grey
-// floor, the same in Soft and Realistic): Studio adds none of the weak
-// channel (red stays the floor's 31) and the strong ones evenly (green =
-// blue: 231 / 114 / 175), and hides nothing behind: as if each channel's
-// glow (colour² × 4) over the cut were added × (1 − Transparency).
-pub const NEON_SEE_THROUGH_CUT: f32 = 1.0; // fitted (rustudio 200 / 121 / 164)
-pub const NEON_SEE_THROUGH_MAX: f32 = 1.2; // at most this much glow per channel (fitted)
+// See-through Neon: no fitted constants; shader.wgsl neon_over_scene ports
+// Studio's encoded SrcAlpha blend (checks/laser-tag-parity/render/findings.md).
 
 // Undo
 pub const UNDO_LIMIT: usize = 500;
@@ -245,9 +238,9 @@ pub const GRAVITY: f32 = 196.2; // studs/s², Workspace.Gravity default
 pub const PART_DENSITY: f32 = 0.7; // Plastic, g/cm³ (PhysicalProperties)
 pub const PART_FRICTION: f32 = 0.3; // Plastic
 pub const PART_ELASTICITY: f32 = 0.5; // Plastic
-pub const PHYSICS_HZ: f32 = 60.0; // fixed step rate
+pub const PHYSICS_HZ: f32 = 240.0; // fixed world step rate = Studio's: one world step is 1/240 s (Studio returns .rdata Studio = 0.0041667; checks/humanoid-physics/SPEC.md); the Humanoid controller's gains assume it
 pub const STUDIO_PHYSICS_HZ: f32 = 240.0; // Studio's physics step rate; a character in the air moves by its velocity before gravity each step (tools/fidelity jumpApex: 7.269 at JumpPower 50 = 53²/2g + 53/480)
-pub const PHYSICS_SUBSTEPS: usize = 4; // 240 Hz solver
+pub const PHYSICS_SUBSTEPS: usize = 1; // rapier solver iterations per 1/240 s world step (SPEC §4.1.4: 1–2; perf measured in checks/humanoid-physics/P0-PERF.md)
 pub const FALLEN_PARTS_HEIGHT: f32 = -500.0; // Workspace.FallenPartsDestroyHeight default
 
 // Character (Play)
@@ -279,8 +272,6 @@ pub const HUMANOID_WALL_LAND_DECEL: f32 = 50.0; // landing from that slide, the 
 pub const HUMANOID_WALL_NORMAL_Y: f32 = 0.7; // a body-box contact whose normal is flatter than this is a wall (rustudio's own)
 pub const HUMANOID_BOX_SKIN: f32 = 0.02; // the body box's contact offset (rustudio's own)
 pub const HUMANOID_BOX_CLIMB_DEG: f32 = 5.0; // the body box itself never climbs slopes steeper than this: the floor rays do the climbing (rustudio's own)
-pub const LANDED_TO_RUNNING_S: f32 = 0.05; // Studio's Landed → Running (movement_probe: 0.05 s in jump_stand, jump_run, ledge, ceiling_jump)
-pub const SWIM_TILT_RATE: f32 = 6.0; // a swimming Humanoid's root tips forward to flat at this rate /s (Studio: flat within ~0.75 s of swimming forward, movement_probe water; the rate is estimated)
 pub const WATER_DRAG_PER_PART: f32 = 13.4; // water drag /s on a swimming Humanoid = this × its parts / its mass; against SWIM_GAIN 35 it settles at 35 / (35 + drag) × WalkSpeed (fitted, round 22 movement_probe water: Studio R15 16 parts, mass 14.26 → 11.12 studs/s at 16; R6 7 parts, 12.6 → 13.26; this predicts 11.14 and 13.20)
 pub const CHARACTER_RADIUS: f32 = 1.0;
 pub const CHARACTER_HALF_HEIGHT: f32 = 1.5; // capsule: 5 studs tall
@@ -305,10 +296,9 @@ pub const STARTER_PLAYER_TO_PLAYER: &[(&str, &str)] = &[
     ("HealthDisplayDistance", "HealthDisplayDistance"),
     ("NameDisplayDistance", "NameDisplayDistance"),
 ];
-pub const JUMP_TAKEOFF_FACTOR: f32 = 1.06; // Humanoid jump: commanded speed (JumpPower, or √(2gh)/1.06) leaves at 1.06×; an offline Studio: 7.27 studs at JumpPower 50, 28.86 at 100
-pub const JUMP_SPEED_MAX: f32 = 1000.0; // JumpHeight's commanded speed is clamped to [0, 1000]
-pub const WHEEL_INPUT_PER_NOTCH: f32 = 0.5; // the game's wheel input (InputObject.Position.Z, PointerAction) per notch: Studio's camera zoomed 12.5 → 23.375 → 14.917 → 19.146 studs for one Qt wheel event of −3 / +2 / −1 notches (offline Studio), the ZoomController step for 0.5 per notch
-pub const TURN_RATE: f32 = 7.0; // Humanoid turning toward its walking direction: the angle left shrinks as exp(-7 t) (fitted to Studio's turn in an offline Studio: 1.48 rad left → 0.93 / 0.38 / 0.12 after 0.10 / 0.22 / 0.35 s)
+pub const JUMP_TAKEOFF_FACTOR: f32 = 1.06; // Humanoid jump: commanded speed (JumpPower, or √(2gh)/1.06) leaves at 1.06× (Studio, constant .rdata Studio); Studio: 7.27 studs at JumpPower 50, 28.86 at 100
+pub const JUMP_SPEED_MAX: f32 = 1000.0; // JumpHeight's commanded speed is clamped to [0, 1000] (Studio, .rdata Studio)
+pub const WHEEL_INPUT_PER_NOTCH: f32 = 0.5; // the game's wheel input (InputObject.Position.Z, PointerAction) per notch: Studio's camera zoomed 12.5 → 23.375 → 14.917 → 19.146 studs for one Qt wheel event of −3 / +2 / −1 notches, the ZoomController step for 0.5 per notch
 pub const CAMERA_TYPE_CUSTOM: u32 = 5; // Enum.CameraType.Custom: a joining client's camera
 pub const CHARACTER_SKIN: [u8; 3] = [245, 205, 48]; // head and arms: Studio's offline Play character (offline Studio: Head / RightUpperArm.Color)
 pub const CHARACTER_SHIRT: [u8; 3] = [13, 105, 172]; // torso (offline Studio: UpperTorso / LowerTorso.Color)
@@ -330,48 +320,9 @@ pub const SEAT_WELD_MIN_ROOT_HEIGHT: f32 = 0.05; // R6 SeatWeld C1.Y = -(max(roo
 pub const PROJECT_DEBOUNCE_MS: u64 = 150; // a project folder's disk changes are applied once the folder has been quiet this long (well inside the 1 s promise)
 pub const GAMEPAD_SCAN_S: f32 = 1.0; // how often Play looks for plugged / unplugged gamepads (rustudio's own polling)
 pub const SEAT_COOLDOWN_S: f32 = 1.0; // after leaving a seat the humanoid doesn't sit again for this long (estimated; Roblox debounces re-sitting)
-/// The climb target along a tilted ladder: the vertical climb speed turned
-/// into the plane of the sensor's hit normal, its speed kept. Not Studio
-/// code: Studio leaves the target vertical (its Studio /
-/// Studio only bend it along the *floor* normal) and contact with the
-/// truss bends the path. Fitted to own hidden Studio pid 6184, R6, 1 s
-/// averages: 10° (0,10.7205,1.8894), 20° (0,10.4890,3.8164); the
-/// direction matches to 0.05°, the speed to 0.33 studs/s.
-pub fn climb_velocity(normal: glam::Vec3, speed: f32) -> glam::Vec3 {
-    let tangent = glam::Vec3::Y - normal * normal.y;
-    tangent.normalize_or_zero() * speed
-}
 
-/// Studio steps the Humanoid controller at 240 Hz; a frame covers this
-/// many steps (at least one).
-pub fn humanoid_steps(dt: f32) -> u32 {
-    ((dt * HUMANOID_STEP_HZ).round() as u32).max(1)
-}
-pub const HUMANOID_STEP_HZ: f32 = 240.0;
-/// Climbing's velocity controller, per 1/240 s step: the vertical speed
-/// closes CLIMB_GAIN_PER_STEP of its gap, the horizontal the same but at
-/// most CLIMB_HORIZONTAL_STEP_MAX. Own hidden Studio pid 6184 (R6,
-/// WalkSpeed 16): re-grab from −0.8175 read 6.6934 after one step, then
-/// 10.5663, 11.1109 (gap × 0.375 per step); walking off at the foot of a
-/// truss vertical −11.2 → −4.2000 → −0.5906 → −0.0831 and horizontal
-/// 0 → 3.0902 → 9.2705 → 14.6352 (3.0902 per step, then 0.625 × the gap).
-pub fn climb_controller(v: glam::Vec3, target: glam::Vec3, steps: u32) -> glam::Vec3 {
-    let mut v = v;
-    for _ in 0..steps {
-        v.y += (target.y - v.y) * CLIMB_GAIN_PER_STEP;
-        let flat = glam::Vec3::new(target.x - v.x, 0.0, target.z - v.z) * CLIMB_GAIN_PER_STEP;
-        v += flat.clamp_length_max(CLIMB_HORIZONTAL_STEP_MAX);
-    }
-    v
-}
-pub const CLIMB_GAIN_PER_STEP: f32 = 0.625;
-pub const CLIMB_HORIZONTAL_STEP_MAX: f32 = 3.0902;
-pub const CLIMB_SPEED_FACTOR: f32 = 0.7; // Climbing update Studio: vertical speed = |move velocity| × 0.7 (.rdata Studio), no sideways velocity
-pub const CLIMB_MIN_INPUT: f32 = 0.1; // Studio: a move speed under 0.1 (.rdata Studio) climbs at CLIMB_CREEP instead
-pub const CLIMB_CREEP: f32 = 0.01; // Studio: .rdata Studio
-pub const CLIMB_DOWN_DOT: f32 = -0.2; // Studio: a move direction whose dot with the root's flat look is under -0.2 (.rdata Studio) climbs down (sign -1, Studio)
 pub const CLIMB_REACH: f32 = 0.7; // FindLadder caller Studio, .rdata Studio (R6; scaled by head size); measured truss face 1.0 accepted, 1.1 rejected. Query length is twice this.
-pub const CLIMB_REACH_R15: f32 = 1.2; // Studio rig branch, float Studio; both rigs multiply by Head.Size.Y ().
+pub const CLIMB_REACH_R15: f32 = 1.2; // Studio rig branch, float Studio; both rigs multiply by the character Model's scale (parent).
 pub const CLIMB_QUERY_TOP: f32 = 1.0; // Studio: the broad query box ends 1 stud above the root (.rdata Studio); measured own Studio pid 6184 (truss bottom +0.9 climbs, +1.1 does not)
 pub const CLIMB_QUERY_DEPTH_FACTOR: f32 = 0.75; // Studio broad query half depth, .rdata Studio
 #[cfg(test)]
@@ -380,9 +331,8 @@ pub const CLIMB_SCAN_DIVISOR: f32 = 3.0; // Studio, .rdata Studio
 pub const CLIMB_SCAN_EXTRA_SAMPLES: usize = 10; // Studio: floor((height - 0.3)/step) + 10 loop bound; float Studio.
 pub const CLIMB_SCAN_STEP_FACTOR: f32 = 1.0 / 7.0; // Studio, .rdata Studio
 pub const CLIMB_BOTTOM_MARGIN: f32 = 0.3; // Studio, .rdata Studio
-pub const CLIMB_GAP_FACTOR: f32 = 2.45; // Studio, .rdata Studio
+pub const CLIMB_GAP_FACTOR: f32 = 2.45; // 0x140ace7xx, .rdata Studio
 pub const CLIMB_SINGLE_RUNG_DIVISOR: f32 = 5.0; // .rdata Studio
-pub const CLIMB_JUMP_COMPONENT: f32 = std::f32::consts::FRAC_1_SQRT_2; // Studio: normalize(up - normalized flat look)
 pub const SWIM_FORCE_MAX: f32 = 10000.0; // Swimming Studio: the swim force's per-axis limit (X, Z both ways, Y down; .data Studio 10000 / 0 / 10000, Studio −10000 ×3), × the Humanoid's scale³ ()
 pub const SWIM_FORCE_UP_MAX: f32 = 1000.0; // the same, upward (.data Studio = 1000)
 pub const SWIM_GAIN: f32 = 35.0; // Swimming Studio: force = 35 (.rdata Studio) × mass × (desired − current velocity): the velocity closes on the move vector at 35 /s
@@ -392,14 +342,9 @@ pub const SWIM_FLOAT_SPEED_R6: f32 = 0.446; // the same for R6 (Studio: 0.446 ev
 pub const SWIM_SURFACE_GAP: f32 = 0.19; // the float fades to 0 at the water's surface − this (root centre, studs) …
 pub const SWIM_SURFACE_FADE: f32 = 0.27; // … over this depth (Studio R15 in an 8-deep pool: 1.63 at 7.21, 1.28 at 7.60, 0.26 at 7.77, round 23 movement_probe water; was a step at the capsule centre + 1.5, which stopped at 7.19)
 pub const SWIM_ENTER_WATER: f32 = 0.5; // water occupancy at the root that starts Swimming
-pub const FALLING_DOWN_S: f32 = 3.0; // RBX:HUMAN:FallingDown: timer = 3.0 (0x40400000); every state's timer starts at 0 otherwise
-pub const RAGDOLL_TIMER_S: f32 = 5.0; // RBX::HUMAN::Ragdoll: timer = FInt RagdollDefaultTimerTenthSecond / 10
-pub const RAGDOLL_EARLY_EXIT_S: f32 = 2.0; // Ragdoll exit check: with the humanoid's jump byte, ends once 5.0 − 2.0 s remain
-pub const RAGDOLL_SLOW_ENOUGH: f32 = 1.0; // ends when the root's |linear velocity|² and |angular velocity|² are both under (FInt RagdollSlowEnoughToNotTenth 10 / 10)²
-pub const GETTING_UP_S: f32 = 0.0; // RBX::HUMAN::GettingUp has no timed exit: it ends once upright; the controller's character is always upright, so one step
-pub const ROOT_PART_FALLBACK_R15: &str = "UpperTorso"; // Humanoid RootPart / Torso getter: R15 slot, else (index 1, "UpperTorso")
-pub const ROOT_PART_FALLBACK_R6: &str = "Torso"; // same getter, R6: slot, else (index 6, "Torso")
-pub const ATTRIBUTE_NAME_MAX: usize = 100; // Instance:SetAttribute name check: at most 0x64 bytes, [A-Za-z0-9_./-] only, not empty
+pub const ROOT_PART_FALLBACK_R15: &str = "UpperTorso"; // Humanoid RootPart / Torso getter Studio: R15 (RigType [] ≠ 0) slot (HumanoidRootPart, index 15 of the R15 name table Studio), else (index 1, "UpperTorso" .rdata Studio)
+pub const ROOT_PART_FALLBACK_R6: &str = "Torso"; // same getter, R6: slot (HumanoidRootPart, index 0 of table Studio), else (index 6, "Torso" .rdata Studio)
+pub const ATTRIBUTE_NAME_MAX: usize = 100; // Instance:SetAttribute name check Studio: at most 0x64 bytes, [A-Za-z0-9_./-] only, not empty
 pub const BENCH_WARMUP_S: f32 = 3.0; // frames ignored after load / Play start before measuring
 pub const PERF_SECONDS: f32 = 10.0; // --bench default measured time
 pub const SELFTEST_PERF_SECONDS: f32 = 5.0; // the self-test's perf step (round 20: it runs after the 74 s Place A child and the run has 90 s in all)
@@ -411,7 +356,8 @@ pub const PENDING_MAX: usize = 4096; // ...or as soon as this many are waiting
 pub const DYNAMIC_SETTLE_S: f32 = 5.0; // a per-frame part this long without changes rejoins the static batches
 pub const STATIC_REBUILD_MIN_S: f32 = 3.0; // static rebuilds (a full re-sort + upload) at most this often
 pub const DEPTH_BIAS_STEP: f32 = 4e-7; // per-part relative depth nudge (16 steps) against coplanar flicker
-pub const MAX_PHYSICS_STEPS: usize = 3; // physics steps per frame at most (slow frames slow the simulation instead of piling up)
+pub const PHYSICS_SERIAL_MAX_AWAKE: usize = 128; // awake bodies up to which a world step runs on the stepping thread instead of rapier's rayon pool (fan-out costs more than it saves on small active sets; checks/Place B-perf/findings.md)
+pub const MAX_PHYSICS_STEPS: usize = 16; // 240 Hz world steps per frame at most = MAX_FRAME_DT × 240: Studio caps the game step at 1/15 s, slower frames slow the simulation instead of piling up
 pub const PHYSICS_LENGTH_UNIT: f32 = 5.0; // rapier length scale in studs (sleep thresholds, contact tolerances) (estimated)
 pub const MAX_FRAME_DT: f32 = 1.0 / 15.0; // Play's game step per frame at most (Studio 0.746: PreAnimation dt and DistributedGameTime stop at 0.0667 s however long the frame; waits keep wall time)
 pub const SCRIPT_FRAME_BUDGET_MS: f64 = 6.0; // per side: waiting scripts past this resume next frame (estimated)
@@ -445,11 +391,26 @@ pub const WATER_WAVE_AMPLITUDE: f32 = 1.0; // studs per WaterWaveSize (CB3[0].z,
 pub const WATER_WAVE_FADE: f32 = 1.0 / 800.0; // waves fade out by this many studs of view depth (CB0[28].y, estimated)
 pub const WATER_DEPTH_SCALE: f32 = 0.0003; // how fast the bottom fades into WaterColor per stud of water (to Studio's 500-stud depth cap), × (1 − T) / (T + WATER_DEPTH_SOFT) (CB3[2].x, fitted to place-b-water W1/W2: 0.05 → MAE 25.5 / 20.6, 0.005 → 20.5 / 17.8, this → 17.1 / 15.7; Studio shows the bottom through 50+ studs at T 0.3)
 pub const WATER_DEPTH_SOFT: f32 = 0.05;
-pub const GRASS_BLADES_PER_STUD2: f32 = 4.0; // Terrain.Decoration blades per square stud of Grass top (estimated from an offline Studio's grass hill)
-pub const GRASS_HEIGHT_PER_LENGTH: f32 = 2.5; // blade height in studs per unit of Terrain.GrassLength (estimated)
-pub const GRASS_BLADE_HALF_WIDTH: f32 = 0.1; // studs (estimated)
+// Historical area-density inference; NOT a recovered native density.
+// Native queues regular (13) and near (16, .85 size) batches per triangle.
+// triangle+18 is Q14 grass-material weight, 1 for an all-Grass face.
+
+pub const GRASS_LENGTH_SCALE_BASE: f32 = 0.45;
+pub const GRASS_LENGTH_SCALE_SLOPE: f32 = 0.8250001072883606;
+pub const GRASS_HEIGHT_MIN: f32 = 1.65;
+pub const GRASS_HEIGHT_MAX: f32 = 3.8;
+pub const GRASS_HALF_WIDTH_MIN: f32 = 0.1;
+pub const GRASS_HALF_WIDTH_MAX: f32 = 0.3;
 pub const GRASS_LENGTH_DEFAULT: f32 = 0.7; // Terrain.GrassLength when the place doesn't set it
-pub const GRASS_RADIUS: f32 = 260.0; // chunks within this many studs of the camera get their blades (they have sunk away by 250)
+// Matched Studio quality21 Village: cap290, captured regular fade275..290.
+// Rust has no native automatic-quality controller: retain the existing full-quality
+// default. Nondefault fade writer branches are not established by this capture.
+pub const GRASS_RADIUS: f32 = 290.0;
+pub const GRASS_FADE_LEN: f32 = 15.0;
+pub const GRASS_NEAR_RADIUS: f32 = 64.0;
+pub const GRASS_NEAR_FADE_LEN: f32 = 48.0;
+// Cache hysteresis is a Rust policy, beyond the fully invisible distance.
+pub const GRASS_EVICTION_RADIUS: f32 = GRASS_RADIUS * 1.25;
 pub const TERRAIN_TOP_NORMAL_Y: f32 = 0.5; // a terrain corner shows its material's top texture from this normal Y up (bottom from minus it down), else the side (estimated)
 pub const TERRAIN_OCCUPANCY_SCALE: f32 = 255.0; // occupancy byte = round(share × 255), read (byte + 1) / 256: ReadVoxels after FillBlock / FillBall in an offline Studio (round 21, terrain_probe.luau)
 /// The flat colour (sRGB) an offline Studio draws a pre-2022 terrain
@@ -480,6 +441,18 @@ pub const SNAP_ON_BY_DEFAULT: bool = false; // Studio opens with move and rotate
 /// unticked; a drag onto the baseplate made no Weld until Join was ticked).
 pub const COLLISIONS_ON_BY_DEFAULT: bool = false;
 pub const JOIN_SURFACES_ON_BY_DEFAULT: bool = false;
+/// Dragger settings menu (DraggerService.DraggerMovementMode /
+/// PartSnapEnabled / UseBoundingBoxes, StudioService.AlignDraggedObjects):
+/// Geometric, Snap to Parts ticked, Use Bounding Boxes unticked, Align
+/// Dragged Objects ticked, as a person's Studio shows them
+/// (checks/dragger-modes/user-*.png).
+pub const PHYSICAL_DRAG_BY_DEFAULT: bool = false;
+pub const PART_SNAP_ON_BY_DEFAULT: bool = true;
+pub const USE_BOUNDING_BOXES_BY_DEFAULT: bool = false;
+pub const ALIGN_DRAGGED_BY_DEFAULT: bool = true;
+/// Studio.DraggerSoftSnapMarginFactor (GlobalSettings_13.xml default 1):
+/// Snap to Parts snaps within 0.02 · sin(FieldOfView) · depth · this.
+pub const SOFT_SNAP_MARGIN: f32 = 1.0;
 /// Collisions: a handle move that would overlap another part by more than
 /// this is pulled back (PartMover.isIntersectingOthers, ArePartsTouchingOthers).
 pub const COLLISION_OVERLAP: f32 = 0.001;
@@ -499,7 +472,7 @@ pub const TEXT_WIDTH_PER_SIZE: f32 = 0.5; // TextBounds before the text is first
 // the formulas are Studio's (ParticleCustomVS / FS, TrailFSLight); these are
 // the caps and scales the CPU side chooses.
 pub const FX_MAX_DIST: f32 = 1024.0; // effects farther from the camera aren't simulated or drawn (estimated; keeps Place B's far emitters free)
-pub const FX_PARTICLES_PER_EMITTER: usize = 10_000; // live particles one emitter may hold (a guard, estimated: Studio showed no per-emitter cap; effects-lanes' Rate 1000 screen held ~2700 at 6 s and ~5700 at 12 s, still rising)
+pub const FX_PARTICLES_PER_EMITTER: usize = 50_000; // live-particle safety guard; rendered lifetimes are capped at 20 s
 pub const FX_MAX_RATE: f32 = 500.0; // particles per second one emitter makes at most (measured: effects-lanes, Rate 1000 covers its screen as ~470 / s would, 2700 at 6 s and 5700 at 12 s, while Rate 100 makes 100 / s; FRMParticleBudget* flags, values not found)
 pub const FX_TRAIL_AGE_LEAD: f32 = 0.12; // s: Studio reads a trail's Color as if each point were this much older, and drops points this much early (measured: effects-lanes, trails at 6 studs/s with Lifetime 1: the white → green ramp fits to ±2 levels with 0.12 s, and the trail is 0.7 studs short)
 pub const FX_TRAIL_FADE_LEAD: f32 = 0.06; // s: the same for Transparency (measured: effects-lanes' white 0 → 1 trail fits to ±2 levels over its first two thirds with 0.06 s; 0 reads 8–15 levels bright, 0.12 6–29 dark)
@@ -507,7 +480,7 @@ pub const FX_LIGHT_TOWARD_CAMERA: f32 = 6.0; // studs: a particle's light is rea
 pub const FX_GLASS_MAX_DIST: f32 = 256.0; // studs: see-through parts farther than this don't dim effects (CPU budget, estimated)
 pub const FX_GLASS_MAX: usize = 512; // the nearest see-through parts kept for that per frame (CPU budget)
 pub const FX_GLASS_MIN_ALPHA: f32 = 0.02; // see-through parts more opaque than this dim the effects behind them (round 26: the world GUI pass runs after them)
-pub const FX_PARTICLES_MAX: usize = 20_000; // particles drawn per frame across all emitters (CPU budget, nearest emitters first)
+pub const FX_PARTICLES_MAX: usize = 100_000; // particles drawn per frame (CPU guard, nearest emitters first); Village fields alone need ~45,000
 pub const FX_MIN_PIXELS: f32 = 0.35; // a particle narrower than this on screen is skipped (it can't cover a pixel centre: the pass has no MSAA)
 pub const FX_PARTICLE_HALF_SIZE: f32 = 1.0; // a particle quad's half-width per stud of Size: Size is its radius (measured: effects place, a Size 4 SquareParticle is 71 px wide in Studio, 35 px with Size as the full width)
 pub const FX_BEAM_MAX_SEGMENTS: i32 = 1000; // Beam.Segments is clamped to 1..1000 (Roblox's documented range)
@@ -916,4 +889,76 @@ pub const GC_FRAME_MAX_KB: f64 = 200.0; // most Luau GC work in one frame: Studi
 pub const GC_IDLE_CYCLE_S: f64 = 8.0; // seconds a background Luau GC cycle is spread over while no new unparented instance shows up (only ones scripts still hold)
 pub const GC_BUSY_ORPHANS: usize = 64; // unparented instances arriving (or freed) between two collector passes from which the Luau GC is stepped at the fast rate
 pub const HUMANOID_LAND_GAP: f32 = 0.25; // a falling Humanoid can jump again once its root is within this of floor + HipHeight + half the root (the floor rays reach 1–2 studs further; holding Space re-jumped that far up)
-pub const HUMANOID_COYOTE_S: f32 = 0.1; // a jump still takes off this long after walking off a ledge (offline Studio, 2026-11-09: always within 0.04 s, sometimes to 0.10 s, never from 0.11 s, at WalkSpeed 16 and 8; Running turns Freefall ~0.11 s after the floor goes)
+pub const HUMANOID_COYOTE_S: f32 = 0.1; // a jump still takes off this long after walking off a ledge (Studio via Studio, 2026-11-09: always within 0.04 s, sometimes to 0.10 s, never from 0.11 s, at WalkSpeed 16 and 8; Running turns Freefall ~0.11 s after the floor goes)
+
+// Studio, signed template coordinates, default renderer path.
+pub const GRASS_SAMPLE_POINTS: [[f32; 2]; 32] = [
+    [0.0, 0.0],
+    [-0.8837230801582336, 0.4603631794452667],
+    [0.9107699990272522, -0.3980715572834015],
+    [-0.03131217136979103, 0.9930884838104248],
+    [-0.8037872910499573, -0.5331446528434753],
+    [0.13051369786262512, -0.9397267699241638],
+    [0.8085044026374817, 0.5143094062805176],
+    [-0.5347122550010681, -0.02990530990064144],
+    [-0.23458144068717957, -0.5179694890975952],
+    [0.3282508850097656, -0.4431091845035553],
+    [0.22689498960971832, 0.5276340246200562],
+    [0.5657429099082947, 0.07126203179359436],
+    [-0.23809920251369476, 0.45098695158958435],
+    [0.4299964904785156, 0.8614091277122498],
+    [-0.4903990924358368, -0.863496720790863],
+    [-0.586198091506958, 0.7989761233329773],
+    [-0.9489821791648865, 0.0528949536383152],
+    [0.657222330570221, -0.7188012599945068],
+    [0.932299792766571, -0.044122956693172455],
+    [0.9595549702644348, 0.25326067209243774],
+    [-0.545700192451477, 0.4489186406135559],
+    [0.009720067493617535, -0.34875524044036865],
+    [0.29706868529319763, -0.04601133242249489],
+    [-0.5086399912834167, -0.35495105385780334],
+    [-0.26604247093200684, 0.7648065686225891],
+    [-0.270325630903244, 0.15919581055641174],
+    [0.08184818178415298, -0.6371060609817505],
+    [0.6610154509544373, -0.216851606965065],
+    [0.05560477823019028, 0.2924371659755707],
+    [-0.16324898600578308, -0.8355538845062256],
+    [0.519210696220398, 0.45599254965782166],
+    [0.3644690215587616, -0.7488822937011719],
+];
+
+// Native near grass batch: Studio, selected by bundle=1.
+pub const GRASS_NEAR_SAMPLE_POINTS: [[f32; 2]; 32] = [
+    [-0.05820624530315399, -0.49743717908859253],
+    [-0.07088255882263184, -0.3308195471763611],
+    [-0.5985963344573975, 0.5806329250335693],
+    [0.5232378840446472, -0.7890536785125732],
+    [-0.6176415085792542, -0.8489363789558411],
+    [-0.08081001788377762, -0.5948762893676758],
+    [-0.09491314738988876, 0.7066769599914551],
+    [0.7302801012992859, 0.12770165503025055],
+    [-0.07404129952192307, -0.7126812934875488],
+    [-0.09575032442808151, 0.45308718085289],
+    [-0.5577936768531799, -0.4965115785598755],
+    [-0.3059884309768677, 0.3254929184913635],
+    [-0.4106157720088959, -0.6688597798347473],
+    [-0.28706392645835876, 0.24893879890441895],
+    [0.329673171043396, 0.3749844431877136],
+    [-0.6559852361679077, -0.3419703543186188],
+    [-0.5954422950744629, -0.888588011264801],
+    [0.7093377709388733, 0.6251345872879028],
+    [0.04799618944525719, 0.4671213626861572],
+    [-0.6000184416770935, 0.036429569125175476],
+    [-0.44161251187324524, 0.36640283465385437],
+    [-0.9490121006965637, 0.513698935508728],
+    [-0.9090762138366699, 0.6904475688934326],
+    [-0.03395209461450577, 0.7069441080093384],
+    [0.16443094611167908, 0.0521148219704628],
+    [0.6505544781684875, 0.6587124466896057],
+    [0.690769374370575, -0.958853542804718],
+    [0.3866465389728546, -0.27196431159973145],
+    [-0.553598165512085, -0.43615320324897766],
+    [-0.3695891201496124, 0.7311539649963379],
+    [-0.6272973418235779, -0.9061756730079651],
+    [0.5390124320983887, -0.3205811679363251],
+];

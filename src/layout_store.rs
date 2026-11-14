@@ -37,7 +37,7 @@ pub enum SavedTab {
 }
 
 impl SavedTab {
-    fn from_tab(t: &Tab) -> Option<Self> {
+    pub(crate) fn from_tab(t: &Tab) -> Option<Self> {
         Some(match t {
             Tab::Viewport => SavedTab::Viewport,
             Tab::Explorer => SavedTab::Explorer,
@@ -48,7 +48,7 @@ impl SavedTab {
             Tab::Script(_) => return None,
         })
     }
-    fn tab(self) -> Tab {
+    pub(crate) fn tab(self) -> Tab {
         match self {
             SavedTab::Viewport => Tab::Viewport,
             SavedTab::Explorer => Tab::Explorer,
@@ -106,6 +106,19 @@ pub struct Layout {
     pub snap_rotate: Option<bool>,
     pub rotate_inc: Option<f32>,
     pub local_space: Option<bool>,
+    /// The dragger settings menu (Geometric ▾) and Align Dragged Objects.
+    #[serde(default)]
+    pub dragger: Option<DraggerSettings>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct DraggerSettings {
+    pub physical: bool,
+    pub collisions: bool,
+    pub join_surfaces: bool,
+    pub use_bounding_boxes: bool,
+    pub part_snap: bool,
+    pub align_dragged: bool,
 }
 
 fn path() -> PathBuf {
@@ -117,6 +130,7 @@ impl Harness {
     /// A run a person drives (not a test, bench, screenshot or scripted run).
     pub fn plain(&self) -> bool {
         self.selftest.is_none()
+            && !crate::selftest::running()
             && self.bench.is_none()
             && self.screenshot.is_none()
             && self.ui_shots.is_none()
@@ -220,6 +234,14 @@ impl Layout {
         if let Some(v) = self.snap_rotate { ed.snap_rotate = v; }
         if let Some(v) = self.rotate_inc.and_then(finite).filter(|v| *v > 0.0) { ed.rotate_inc = v; }
         if let Some(v) = self.local_space { ed.local_space = v; }
+        if let Some(d) = self.dragger {
+            ed.physical_drag = d.physical;
+            ed.collisions = d.collisions;
+            ed.join_surfaces = d.join_surfaces;
+            ed.use_bounding_boxes = d.use_bounding_boxes;
+            ed.part_snap = d.part_snap;
+            ed.align_dragged = d.align_dragged;
+        }
     }
 
     /// Size, position and maximized state for the window about to open.
@@ -374,6 +396,14 @@ impl Saver {
             snap_rotate: Some(ed.snap_rotate),
             rotate_inc: Some(ed.rotate_inc),
             local_space: Some(ed.local_space),
+            dragger: Some(DraggerSettings {
+                physical: ed.physical_drag,
+                collisions: ed.collisions,
+                join_surfaces: ed.join_surfaces,
+                use_bounding_boxes: ed.use_bounding_boxes,
+                part_snap: ed.part_snap,
+                align_dragged: ed.align_dragged,
+            }),
         };
         serde_json::to_string_pretty(&layout).unwrap_or_default()
     }

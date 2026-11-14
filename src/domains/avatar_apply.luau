@@ -736,3 +736,4 @@ M.PrepareProjectionMeshDataAsync = function(self)
 		error("PrepareProjectionMeshDataAsync: " .. tostring(err), 0)
 	end
 end
+

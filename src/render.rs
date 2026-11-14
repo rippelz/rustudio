@@ -3,6 +3,9 @@
 //! image, so the 3D view docks like any other panel. The sun's shadow map is
 //! drawn first.
 
+#[path = "env_probe_gpu.rs"]
+mod env_probe_gpu;
+
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -339,6 +342,10 @@ pub struct Frame<'a> {
     pub sky: bool,
     /// Terrain water's waves, animation and clearness (water.rs).
     pub water: crate::water::WaterLook,
+    /// Terrain.Clouds (clouds.rs), drawn with the sky.
+    pub clouds: Option<crate::clouds::CloudsLook>,
+    /// The scene environment probe's work this frame (env_probe.rs).
+    pub probe: Option<crate::env_probe::ProbeFrame>,
 }
 
 /// Studs per side of the cells static parts are grouped into.
@@ -373,6 +380,89 @@ fn transparent_order(a_kind: f32, a_distance: f32, b_kind: f32, b_distance: f32)
 #[cfg(test)]
 mod gpu_tests {
     use super::*;
+
+    #[test]
+    fn primitive_parity_geometry() {
+        let meshes = build_meshes();
+        let points: Vec<_> = ball_outline_points().collect();
+        for vertex in &meshes[MeshKind::Ball as usize] {
+            assert!(points.iter().any(|p| p.distance(Vec3::from_array(vertex.pos)) < 1e-6));
+        }
+        for index in [MeshKind::Wedge as usize, MeshKind::CornerWedge as usize] {
+            assert!(meshes[index].iter().any(|v| v.projection[0] == -99.0));
+        }
+        for index in [0usize, MeshKind::Ball as usize, MeshKind::Cylinder as usize] {
+            assert!(meshes[index].iter().all(|v| v.projection[0] == 0.0));
+        }
+    }
+
+    #[test]
+    fn native_cell_distance_selection_counts() {
+        // Actual quality21 native draws, camera (16,20,-20), 128 domains.
+        for (lo,hi,near,allocated,expected) in [
+            ([-4.,-4.,-4.],[68.,68.,68.],false,1664,1489),
+            ([-4.,-68.,-4.],[68.,4.,68.],false,1664,1423),
+            ([-4.,-4.,-4.],[68.,68.,68.],true,2048,1830),
+            ([-4.,-68.,-4.],[68.,4.,68.],true,2048,1749),
+        ] {
+            let range = GrassRange {start:0,ordinals:(0..allocated).collect(),allocated,near,lo:Vec3::from_array(lo),hi:Vec3::from_array(hi)};
+            assert_eq!(range.count(Vec3::new(16.,20.,-20.))/6,expected);
+        }
+    }
+
+    #[test]
+    fn native_sun_grass_near_mid_selection_counts() {
+        // Actual sun writer + receiver GPU ranges, native frames 377 / 8833.
+        // Both X regions have identical distance at camera X=2 (margin 4).
+        for x in [-64.0, 0.0] {
+            for (z, near, allocated, camera_z, vertices) in [
+                (-64.0, true, 8192, -34.0, 24570),
+                (-64.0, false, 6656, -34.0, 19968),
+                (0.0, true, 8192, -34.0, 19962),
+                (0.0, false, 6656, -34.0, 16224),
+                (-64.0, false, 6656, -150.0, 11163),
+                (0.0, false, 6656, -150.0, 6594),
+            ] {
+                let range = GrassRange { start: 0, ordinals: (0..allocated).collect(), allocated, near,
+                    lo: Vec3::new(x-4.0, -4.0, z-4.0),
+                    hi: Vec3::new(x+68.0, 68.0, z+68.0) };
+                // Rust uploads both sides; native submits one three-vertex triangle.
+                assert_eq!(range.count(Vec3::new(2.0,28.0,camera_z)), vertices*2);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes integrated full-domain renderer selection evidence"]
+    fn export_integrated_grass_selection() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
+        let mut limits = wgpu::Limits::default();
+        limits.max_sampled_textures_per_shader_stage = 24;
+        limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).unwrap();
+        let mut renderer = Renderer::new(&device, &queue);
+        let mut vox = crate::terrain::Voxels::empty();
+        // Same FillBlock: x,z in [0,32), y in [-16,0), full Grass voxels.
+        for x in 0..8 { for y in -4..0 { for z in 0..8 { vox.set([x,y,z],2,1.0); } } }
+        let mut rows = Vec::new();
+        for length in [0.7,0.1] {
+            renderer.clear_terrain();
+            for y in -1..=0 { for x in -1..=0 { for z in -1..=0 {
+                let key = [x,y,z];
+                let geometry = crate::terrain::grass_geometry_density(&vox,key,length,1.0);
+                let positions: Vec<_> = geometry.cells.iter().map(|cell| cell.batch.blades.iter().map(|&(_,first)| geometry.vertices[first..first+3].iter().map(|v|v.pos).collect::<Vec<_>>()).collect::<Vec<_>>()).collect();
+                renderer.set_terrain_grass_geometry(&device,key,geometry);
+                if let Some(chunk) = renderer.terrain_grass.get(&key) {
+                    for (range, blades) in chunk.grass_ranges.iter().zip(positions) {
+                        let count = range.count(Vec3::new(16.,20.,-20.)) as usize / 6;
+                        rows.push(serde_json::json!({"length":length,"key":key,"near":range.near,"lo":range.lo.to_array(),"hi":range.hi.to_array(),"allocated":range.allocated,"ordinals":range.ordinals,"selected_ordinals":range.ordinals[..count],"selected_triangles":blades[..count],"resident_triangles":blades}));
+                    }
+                }
+            } } }
+        }
+        std::fs::write("checks/grass-full-re/integrated-selection/renderer-selection.json",serde_json::to_vec(&rows).unwrap()).unwrap();
+    }
 
     /// Every pipeline of the 3D view, built on this machine's GPU with the
     /// limits the app asks for (main.rs): the WGSL through the platform's
@@ -577,7 +667,27 @@ const HIDDEN: InstanceRaw = InstanceRaw {
 pub const TERRAIN_PALETTE: usize = 69;
 
 /// One terrain chunk's triangles (round 21) and their bounds.
+struct GrassRange {
+    start: u32,
+    ordinals: Vec<usize>,
+    allocated: usize,
+    near: bool,
+    lo: Vec3,
+    hi: Vec3,
+}
+impl GrassRange {
+    fn count(&self, camera: Vec3) -> u32 {
+        let distance = camera.distance(camera.clamp(self.lo, self.hi));
+        let cap = crate::mech::GRASS_RADIUS;
+        let factor = (2.0 / (1.0 + distance.min(cap) / cap) - 1.0).clamp(0.0, 1.0);
+        let group = if self.near {3} else {1};
+        let limit = ((self.allocated / group) as f32 * factor).trunc() as usize * group;
+        (self.ordinals.partition_point(|&o| o < limit) * 6) as u32
+    }
+}
 struct TerrainChunk {
+    grass_ranges: Vec<GrassRange>,
+    diagnostic_positions: Vec<[f32; 3]>,
     vbuf: wgpu::Buffer,
     count: u32,
     lo: Vec3,
@@ -713,6 +823,9 @@ impl MaterialArrays {
 struct Mesh {
     vbuf: wgpu::Buffer,
     count: u32,
+    /// Back faces culled, as Studio draws a MeshPart with DoubleSided off
+    /// (an inverted-hull outline shell then shows only as its rim).
+    cull_back: bool,
 }
 
 struct Target {
@@ -724,14 +837,21 @@ struct Target {
     hdr_view: wgpu::TextureView,
     /// The opaque scene's colour, copied for the water pass to look through.
     scene_copy: wgpu::Texture,
+    scene_copy_view: wgpu::TextureView,
     water_bg: wgpu::BindGroup,
+    water_depth: wgpu::TextureView,
     glass_bg: wgpu::BindGroup,
     glass_depth: wgpu::TextureView,
     hdr_bg: wgpu::BindGroup,
+    post_depth_bg: wgpu::BindGroup,
     dof_bgs: [wgpu::BindGroup; 2],
+    near_bgs: Vec<wgpu::BindGroup>,
+    near_views: Vec<wgpu::TextureView>,
     dof_views: [wgpu::TextureView; 2],
     /// Linear bloom pyramid, from half resolution through 1/32 resolution.
     bloom_view: wgpu::TextureView,
+    bloom_bright_capture: Option<wgpu::Texture>,
+    bloom_textures: Vec<wgpu::Texture>,
     bloom_levels: Vec<wgpu::TextureView>,
     bloom_down_bgs: Vec<wgpu::BindGroup>,
     bloom_up_bgs: Vec<wgpu::BindGroup>,
@@ -764,6 +884,7 @@ pub struct Renderer {
     sky: wgpu::RenderPipeline,
     opaque: wgpu::RenderPipeline,
     transparent: wgpu::RenderPipeline,
+    decal_depth: wgpu::RenderPipeline,
     transparent_culled: wgpu::RenderPipeline,
     glass: wgpu::RenderPipeline,
     glass_culled: wgpu::RenderPipeline,
@@ -771,8 +892,10 @@ pub struct Renderer {
     lines: wgpu::RenderPipeline,
     post: wgpu::RenderPipeline,
     post_dof: bool,
+    post_dof_near: bool,
     dof_h: wgpu::RenderPipeline,
     dof_v: wgpu::RenderPipeline,
+    near_pipelines: Vec<wgpu::RenderPipeline>,
     /// Studio's SSAO passes (shader.wgsl "SSAO"): depth down, occlusion,
     /// blur across, blur down, and the multiply into the HDR scene.
     ssao_layout: wgpu::BindGroupLayout,
@@ -796,10 +919,11 @@ pub struct Renderer {
     /// Studio's terrain shading, and their per-palette parameters.
     terrain: wgpu::RenderPipeline,
     terrain_shadow: wgpu::RenderPipeline,
+    terrain_shadow_back: wgpu::RenderPipeline,
     terrain_params_buf: wgpu::Buffer,
     terrain_bg: wgpu::BindGroup,
     terrain_chunks: HashMap<[i32; 3], TerrainChunk>,
-    /// Decoration grass blades by chunk (drawn with the terrain, no shadow).
+    /// Decoration grass blades by chunk (color and sun shadow passes).
     terrain_grass: HashMap<[i32; 3], TerrainChunk>,
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
@@ -811,9 +935,16 @@ pub struct Renderer {
     shadow_view: wgpu::TextureView,
     /// The sun's shadow cascades: the atlas the shaders read (sun_shadow.rs).
     sun: crate::sun_shadow::SunShadows,
+    /// Terrain.Clouds' passes (clouds.rs), made on first use.
+    clouds: Option<crate::clouds::CloudsGpu>,
     sky_view: wgpu::TextureView,
-    /// Studio's indoor environment (textures/sky/indoor512); white 1×1 until loaded.
+    /// Studio's indoor environment (textures/sky/indoor512); white 1×1 until
+    /// loaded. The scene probe's slots start as it (env_probe_gpu).
     indoor_view: wgpu::TextureView,
+    /// Studio's scene environment probe (env_probe.rs) and the globals its
+    /// faces are drawn with.
+    probe: env_probe_gpu::ProbeGpu,
+    probe_globals_bg: wgpu::BindGroup,
     /// Studio's split-sum BRDF table (brdfLUT.dds, RG16F).
     brdf_view: wgpu::TextureView,
     sky_sampler: wgpu::Sampler,
@@ -964,6 +1095,16 @@ impl Renderer {
                 // Studio's indoor environment cube (PrefilteredEnvIndoorTexture).
                 frag(
                     13,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::Cube,
+                        multisampled: false,
+                    },
+                ),
+                // PrefilteredEnvBlendTargetTexture: the scene probe's next
+                // slot (env_probe.rs), blended in by CB0[32].w (env_spec.w).
+                frag(
+                    21,
                     wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::Cube,
@@ -1138,6 +1279,28 @@ impl Renderer {
         });
         let lshadow = LightShadows::new(device);
         let sun = crate::sun_shadow::SunShadows::new(device, &shadow_view);
+        // Studio's scene environment probe (env_probe.rs): binding 13 is its
+        // current slot, 21 the slot it blends to.
+        let probe = env_probe_gpu::ProbeGpu::new(device, queue, SAMPLES, DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
+        let probe_globals_bg = Self::globals_group(
+            device,
+            &bgl,
+            &probe.globals_buf,
+            &lights_buf,
+            &sky_view,
+            &sky_sampler,
+            &sun.atlas_view,
+            &lightgrid_view,
+            &lightocc_view,
+            &localgrid_view,
+            &studs_view,
+            &studs_sampler,
+            &materials,
+            &probe.slot_views[0],
+            &probe.slot_views[1],
+            &brdf_view,
+            &lshadow,
+        );
         let globals_bg = Self::globals_group(
             device,
             &bgl,
@@ -1152,7 +1315,8 @@ impl Renderer {
             &studs_view,
             &studs_sampler,
             &materials,
-            &indoor_view,
+            &probe.slot_views[0],
+            &probe.slot_views[1],
             &brdf_view,
             &lshadow,
         );
@@ -1286,7 +1450,7 @@ impl Renderer {
                     blend: Option<wgpu::BlendState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(if fs == "fs_part" { &part_layout } else { &layout }),
+                layout: Some(if fs == "fs_part" || fs == "fs_decal_depth" { &part_layout } else { &layout }),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some(vs),
@@ -1313,7 +1477,7 @@ impl Renderer {
                     targets: &[Some(wgpu::ColorTargetState {
                         format: HDR_FORMAT,
                         blend,
-                        write_mask: wgpu::ColorWrites::ALL,
+                        write_mask: if fs == "fs_decal_depth" { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL },
                     })],
                 }),
                 multiview_mask: None,
@@ -1357,6 +1521,9 @@ impl Renderer {
         );
         // fs_part writes premultiplied colour (round 26): see-through Neon
         // adds its glow with cover 0, everything else blends as before.
+        let decal_depth = make("decal opaque texel depth", "vs_part", "fs_decal_depth",
+            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            T::TriangleList, None, true, C::Greater, None);
         let transparent = make(
             "parts-transparent",
             "vs_part",
@@ -1365,7 +1532,7 @@ impl Renderer {
             T::TriangleList,
             None,
             false,
-            C::Greater,
+            C::GreaterEqual,
             Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
         );
         // See-through built-in shapes show their front faces only, as in
@@ -1378,7 +1545,7 @@ impl Renderer {
             T::TriangleList,
             Some(wgpu::Face::Back),
             false,
-            C::Greater,
+            C::GreaterEqual,
             Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
         );
         // GlassTransparentFS already composites the opaque scene. Replace RGB
@@ -1518,7 +1685,7 @@ impl Renderer {
         let terrain_vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<crate::terrain::TerrainVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Uint8x4, 3 => Uint8x4, 4 => Uint8x4],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Uint8x4, 3 => Uint8x4, 4 => Uint8x4, 5 => Float32x4],
         };
         let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("terrain"),
@@ -1567,11 +1734,37 @@ impl Renderer {
                 module: &shader,
                 entry_point: Some("vs_terrain_shadow"),
                 compilation_options: Default::default(),
-                buffers: &[Some(terrain_vertex_layout)],
+                buffers: &[Some(terrain_vertex_layout.clone())],
             },
             primitive: wgpu::PrimitiveState {
                 topology: T::TriangleList,
                 cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(C::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: None,
+            multiview_mask: None,
+            cache: None,
+        });
+        let terrain_shadow_back = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("terrain shadow"),
+            layout: Some(&shadow_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_terrain_shadow"),
+                compilation_options: Default::default(),
+                buffers: &[Some(terrain_vertex_layout.clone())],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: T::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -1616,6 +1809,7 @@ impl Renderer {
             })
         };
 
+
         let dof_v = fullscreen("dof down", "fs_dof_v", 1);
         let bloom_bright = fullscreen("bloom bright", "fs_bloom_bright", 1);
         let bloom_down = fullscreen("bloom pyramid down", "fs_bloom_down", 1);
@@ -1649,6 +1843,10 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None,
+                },
             ],
         });
         let post_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1681,6 +1879,35 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let near_fullscreen = |label: &str, fs: &str, targets: usize| {
+            let t = Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&post_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_post"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &vec![t; targets],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let near_pipelines = ["fs_near_h", "fs_near_v", "fs_near_mask0", "fs_near_mask1", "fs_near_mask2", "fs_near_mask3", "fs_near_mask4", "fs_near_mask5", "fs_near_edge", "fs_near_bokeh", "fs_near_tent"].iter().map(|fs| near_fullscreen("dof near", fs, 1)).collect();
         let dof_h = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("dof prepare"),
             layout: Some(&post_layout),
@@ -1772,6 +1999,7 @@ impl Renderer {
         let meshes = build_meshes()
             .into_iter()
             .map(|verts| Mesh {
+                cull_back: true,
                 count: verts.len() as u32,
                 vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("mesh"),
@@ -1801,14 +2029,17 @@ impl Renderer {
             glass,
             glass_culled,
             transparent,
+            decal_depth,
             lines,
             post,
             post_dof: false,
+            post_dof_near: false,
             ssao_layout,
             ssao_down,
             ssao_main,
             dof_h,
             dof_v,
+            near_pipelines,
             ssao_blur_x,
             ssao_blur_y,
             ssao_apply,
@@ -1819,6 +2050,7 @@ impl Renderer {
             shadow,
             terrain,
             terrain_shadow,
+            terrain_shadow_back,
             terrain_params_buf,
             terrain_bg,
             terrain_chunks: HashMap::new(),
@@ -1833,8 +2065,11 @@ impl Renderer {
             lights_buf,
             shadow_view,
             sun,
+            clouds: None,
             sky_view,
             indoor_view,
+            probe,
+            probe_globals_bg,
             brdf_view,
             sky_sampler,
             lightgrid_tex,
@@ -1943,10 +2178,44 @@ impl Renderer {
         Some((w, h, out))
     }
 
+    /// Bumps whenever the static scene is rebuilt: the scene environment
+    /// probe's world revision (env_probe.rs).
+    pub fn static_gen(&self) -> u64 {
+        self.static_gen
+    }
+
     /// Raw RGBA16Float scene before bloom/tone, for render diagnostics.
     pub fn read_hdr(&self, rs: &egui_wgpu::RenderState) -> Option<(u32, u32, Vec<u8>)> {
         let target = self.target.as_ref()?;
-        let [w, h] = target.size;
+        {
+            if let Ok(path) = std::env::var("RUSTUDIO_DUMP_HDR") {
+                let half = [(target.size[0] >> 1).max(1), (target.size[1] >> 1).max(1)];
+                if let Some(texture) = &target.bloom_bright_capture {
+                    if let Some((w,h,data)) = self.read_hdr_texture(rs, texture, half) {
+                        let _ = std::fs::write(format!("{path}.extract-{w}x{h}"), data);
+                    }
+                }
+                if let Some((w,h,data)) = self.read_hdr_texture(rs, &target.bloom_textures[0], half) {
+                    let _ = std::fs::write(format!("{path}.bloom-{w}x{h}"), data);
+                }
+                // The scene environment probe's current slot, level 0 (env_probe.rs).
+                for f in 0..6 {
+                    let size = [crate::env_probe::SIZE; 2];
+                    if let Some((w,h,data)) = self.read_hdr_layer(rs, &self.probe.slots[self.probe.cur], size, f) {
+                        let _ = std::fs::write(format!("{path}.probe{f}-{w}x{h}"), data);
+                    }
+                }
+            }
+        }
+        self.read_hdr_texture(rs, &target.hdr, target.size)
+    }
+
+    fn read_hdr_texture(&self, rs: &egui_wgpu::RenderState, texture: &wgpu::Texture, size: [u32; 2]) -> Option<(u32,u32,Vec<u8>)> {
+        self.read_hdr_layer(rs, texture, size, 0)
+    }
+
+    fn read_hdr_layer(&self, rs: &egui_wgpu::RenderState, texture: &wgpu::Texture, size: [u32; 2], layer: u32) -> Option<(u32,u32,Vec<u8>)> {
+        let [w, h] = size;
         let row = (w * 8).div_ceil(256) * 256;
         let buf = rs.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("read HDR"),
@@ -1961,9 +2230,9 @@ impl Renderer {
             });
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &target.hdr,
+                texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
@@ -2142,6 +2411,7 @@ impl Renderer {
         studs_sampler: &wgpu::Sampler,
         materials: &MaterialArrays,
         indoor: &wgpu::TextureView,
+        indoor_next: &wgpu::TextureView,
         brdf: &wgpu::TextureView,
         lshadow: &LightShadows,
     ) -> wgpu::BindGroup {
@@ -2197,6 +2467,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 13,
                     resource: B::TextureView(indoor),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 21,
+                    resource: B::TextureView(indoor_next),
                 },
                 wgpu::BindGroupEntry {
                     binding: 14,
@@ -2270,6 +2544,8 @@ impl Renderer {
     /// in wgpu's cube order like `set_sky`).
     pub fn set_indoor(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: u32, faces: &[Vec<u8>; 6]) {
         self.indoor_view = Self::cube_view(device, queue, size, faces);
+        // Both probe slots start as this cube (env_probe_gpu fill_default).
+        self.probe.fill_default(device, queue, &self.indoor_view, size);
         self.rebind_globals(device);
     }
 
@@ -2335,7 +2611,27 @@ impl Renderer {
             &self.studs_view,
             &self.studs_sampler,
             &self.materials,
-            &self.indoor_view,
+            &self.probe.slot_views[self.probe.cur],
+            &self.probe.slot_views[self.probe.next()],
+            &self.brdf_view,
+            &self.lshadow,
+        );
+        self.probe_globals_bg = Self::globals_group(
+            device,
+            &self.globals_layout,
+            &self.probe.globals_buf,
+            &self.lights_buf,
+            &self.sky_view,
+            &self.sky_sampler,
+            &self.sun.atlas_view,
+            &self.lightgrid_view,
+            &self.lightocc_view,
+            &self.localgrid_view,
+            &self.studs_view,
+            &self.studs_sampler,
+            &self.materials,
+            &self.probe.slot_views[self.probe.cur],
+            &self.probe.slot_views[self.probe.next()],
             &self.brdf_view,
             &self.lshadow,
         );
@@ -2413,6 +2709,8 @@ impl Renderer {
         self.terrain_chunks.insert(
             key,
             TerrainChunk {
+                grass_ranges: Vec::new(),
+                diagnostic_positions: if std::env::var_os("RUSTUDIO_CULL_EXPORT").is_some() { verts.iter().map(|v| v.pos).collect() } else { Vec::new() },
                 vbuf,
                 count: verts.len() as u32,
                 lo,
@@ -2438,7 +2736,12 @@ impl Renderer {
         let had = self.terrain_chunks.remove(&key);
         self.set_terrain_chunk(device, key, verts);
         match self.terrain_chunks.remove(&key) {
-            Some(c) => {
+            Some(mut c) => {
+                // |noise| <= 1; native default direction=.5, amplitude=1.0275.
+                let wind = verts.iter().map(|v| 0.2 * v.wind_local[2]).fold(0.0_f32, f32::max);
+                let pad = Vec3::new(wind, 0.0, wind);
+                c.lo -= pad;
+                c.hi += pad;
                 self.terrain_grass.insert(key, c);
             }
             None => {
@@ -2448,6 +2751,23 @@ impl Renderer {
         if let Some(h) = had {
             self.terrain_chunks.insert(key, h);
         }
+    }
+
+    pub fn set_terrain_grass_geometry(&mut self, device: &wgpu::Device, key: [i32;3], geometry: crate::terrain::GrassGeometry) {
+        let mut vertices = Vec::new();
+        let mut ranges = Vec::new();
+        for cell in geometry.cells {
+            let start = vertices.len() as u32;
+            let mut ordinals = Vec::new();
+            for (ordinal, first) in cell.batch.blades {
+                ordinals.push(ordinal);
+                vertices.extend_from_slice(&geometry.vertices[first..first+6]);
+            }
+            ranges.push(GrassRange {start, ordinals, allocated:cell.batch.allocated, near:cell.near, lo:cell.lo, hi:cell.hi});
+        }
+        if ranges.is_empty() { vertices = geometry.vertices; }
+        self.set_terrain_grass(device, key, &vertices);
+        if let Some(chunk) = self.terrain_grass.get_mut(&key) {chunk.grass_ranges = ranges;}
     }
 
     /// Triangles in the drawn terrain chunks.
@@ -2671,6 +2991,8 @@ impl Renderer {
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         );
         let depth_view = depth.create_view(&Default::default());
+        let water_depth = tex("water surface depth", DEPTH_FORMAT, SAMPLES,
+            wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
         let water_bg = self.water.bind(device, &scene_copy.create_view(&Default::default()), &depth_view);
         let glass_depth = tex("glass depth snapshot", wgpu::TextureFormat::R32Float, 1,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
@@ -2702,13 +3024,28 @@ impl Renderer {
                 })
                 .create_view(&Default::default())
         };
-        let bloom_levels: Vec<_> = (1..=5).map(|level| device.create_texture(&wgpu::TextureDescriptor {
+        let bloom_textures: Vec<_> = (1..=5).map(|level| device.create_texture(&wgpu::TextureDescriptor {
             label: Some("bloom pyramid"), size: wgpu::Extent3d { width: (size[0] >> level).max(1), height: (size[1] >> level).max(1), depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
             dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
-        }).create_view(&Default::default())).collect();
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        })).collect();
+        let bloom_levels: Vec<_> = bloom_textures.iter().map(|t| t.create_view(&Default::default())).collect();
         let bloom_view = bloom_levels[0].clone();
-        let dof_views = [half_tex("dof across"), half_tex("dof down")];
+        let bloom_bright_capture = std::env::var_os("RUSTUDIO_DUMP_HDR").map(|_| device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("diagnostic bloom extraction"),
+            size: wgpu::Extent3d { width: (size[0] >> 1).max(1), height: (size[1] >> 1).max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST, view_formats: &[],
+        }));
+        // Native CheapBokeh far path retains full-resolution color/CoC.
+        // Downsampling here imposes blur even as FarIntensity approaches zero.
+        let dof_tex = |label: &str| device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label), size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }).create_view(&Default::default());
+        let dof_views = [dof_tex("dof across"), dof_tex("dof down")];
         let pair = |label: &str, a: &wgpu::TextureView, b: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
@@ -2732,7 +3069,13 @@ impl Renderer {
         };
         let bloom_down_bgs = (0..5).map(|i| pair("bloom pyramid down", if i == 0 { &hdr_view } else { &bloom_levels[i-1] }, &hdr_view)).collect();
         let bloom_up_bgs = (1..5).map(|i| pair("bloom pyramid up", &bloom_levels[i], &hdr_view)).collect();
-        let dof_bgs = [pair("dof across", &hdr_view, &self.black_view), pair("dof down", &dof_views[0], &self.black_view)];
+        let near_views: Vec<_> = (0..11).map(|i| device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dof near quarter"), size: wgpu::Extent3d { width: (size[0]/4).max(1), height: if i == 0 {size[1]} else {(size[1]/4).max(1)}, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+        }).create_view(&Default::default())).collect();
+        let near_bgs = (0..11).map(|i| pair("dof near", if i == 0 { &dof_views[1] } else if i == 8 { &near_views[1] } else { &near_views[i-1] }, if i == 8 || i == 9 { &near_views[7] } else { &self.black_view })).collect();
+        let dof_bgs = [pair("dof across", &hdr_view, &self.black_view), pair("dof down", &dof_views[0], &near_views[10])];
         let hdr_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("post inputs"), layout: &self.tex_layout,
             entries: &[
@@ -2768,9 +3111,11 @@ impl Renderer {
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&depth_view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&scene_copy.create_view(&Default::default())) },
                 ],
             })
         };
+        let post_depth_bg = ssao_bg("post depth and near", &near_views[10]);
         // down (input unused) → a … occlusion reads the depth → a, blur
         // across a → b, blur down b → a, apply reads a.
         let ssao_bgs = [
@@ -2810,14 +3155,21 @@ impl Renderer {
             depth: depth_view,
             hdr,
             hdr_view,
+            scene_copy_view: scene_copy.create_view(&Default::default()),
             scene_copy,
             water_bg,
+            water_depth,
             glass_bg,
             glass_depth,
             hdr_bg,
+            post_depth_bg,
             dof_views,
             dof_bgs,
+            near_bgs,
+            near_views,
             bloom_view,
+            bloom_bright_capture,
+            bloom_textures,
             bloom_levels,
             bloom_down_bgs,
             bloom_up_bgs,
@@ -2868,6 +3220,12 @@ impl Renderer {
             });
             pass.set_pipeline(if i == 0 { &self.bloom_bright } else { &self.bloom_down });
             pass.set_bind_group(0, &self.globals_bg, &[]); pass.set_bind_group(1, &target.bloom_down_bgs[i], &[]); pass.draw(0..3, 0..1);
+            drop(pass);
+            if i == 0 {
+                if let Some(texture) = &target.bloom_bright_capture {
+                    encoder.copy_texture_to_texture(target.bloom_textures[0].as_image_copy(), texture.as_image_copy(), texture.size());
+                }
+            }
         }
         for i in (1..levels).rev() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2882,13 +3240,25 @@ impl Renderer {
         let Some(target) = self.target.as_ref() else { return };
         let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effects post") });
         self.encode_bloom(&mut encoder, target, self.post_bloom_size);
-        let steps: [(&str, &wgpu::RenderPipeline, &wgpu::BindGroup, Vec<&wgpu::TextureView>); 3] = [
+        let steps: [(&str, &wgpu::RenderPipeline, &wgpu::BindGroup, Vec<&wgpu::TextureView>); 14] = [
             ("dof across", &self.dof_h, &target.dof_bgs[0], vec![&target.dof_views[0]]),
             ("dof down", &self.dof_v, &target.dof_bgs[1], vec![&target.dof_views[1]]),
+            ("dof near", &self.near_pipelines[0], &target.near_bgs[0], vec![&target.near_views[0]]),
+            ("dof near", &self.near_pipelines[1], &target.near_bgs[1], vec![&target.near_views[1]]),
+            ("dof near", &self.near_pipelines[2], &target.near_bgs[2], vec![&target.near_views[2]]),
+            ("dof near", &self.near_pipelines[3], &target.near_bgs[3], vec![&target.near_views[3]]),
+            ("dof near", &self.near_pipelines[4], &target.near_bgs[4], vec![&target.near_views[4]]),
+            ("dof near", &self.near_pipelines[5], &target.near_bgs[5], vec![&target.near_views[5]]),
+            ("dof near", &self.near_pipelines[6], &target.near_bgs[6], vec![&target.near_views[6]]),
+            ("dof near", &self.near_pipelines[7], &target.near_bgs[7], vec![&target.near_views[7]]),
+            ("dof near", &self.near_pipelines[8], &target.near_bgs[8], vec![&target.near_views[8]]),
+            ("dof near", &self.near_pipelines[9], &target.near_bgs[9], vec![&target.near_views[9]]),
+            ("dof near", &self.near_pipelines[10], &target.near_bgs[10], vec![&target.near_views[10]]),
             ("post", &self.post, &target.hdr_bg, vec![&target.display_view]),
         ];
         for (label, pipeline, bg, views) in steps {
             if label.starts_with("dof ") && !self.post_dof { continue; }
+            if label == "dof near" && !self.post_dof_near { continue; }
             let attachments: Vec<_> = views
                 .iter()
                 .map(|v| {
@@ -2911,7 +3281,8 @@ impl Renderer {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, bg, &[]);
-            if label == "post" || label == "dof across" { pass.set_bind_group(2, &target.ssao_bgs[0], &[]); }
+            if label == "post" { pass.set_bind_group(2, &target.post_depth_bg, &[]); }
+            else if label == "dof across" || label == "dof near" { pass.set_bind_group(2, &target.ssao_bgs[0], &[]); }
             pass.draw(0..3, 0..1);
         }
         rs.queue.submit([encoder.finish()]);
@@ -2948,9 +3319,40 @@ impl Renderer {
         // cam_pos.w is unused by the camera math. Keep material animation
         // continuous across scene rebuilds, independently of lighting time.
         let mut globals = frame.globals;
+        if std::env::var_os("RUSTUDIO_RENDER_DIAGNOSTICS").is_some() {
+            static LAST: std::sync::Mutex<Option<[f32; 4]>> = std::sync::Mutex::new(None);
+            let state = [globals.cc_tint[3], globals.bloom[1], globals.bloom[0], globals.params[1]];
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            if *last != Some(state) {
+                eprintln!("BLOOM intensity={} size={} threshold={} exposure={} dof={:?} pipeline=bright/down/up/composite-before-tone", state[0],state[1],state[2],state[3],globals.dof);
+                *last = Some(state);
+            }
+        }
+        // Scene environment probe (env_probe.rs): swap the slots when the
+        // blend completed; CB0[32].w is the blend toward the next slot.
+        globals.env_spec[3] = 0.0;
+        if let Some(pf) = frame.probe.as_ref() {
+            if pf.swap {
+                self.probe.cur = self.probe.next();
+                self.rebind_globals(device);
+            }
+            globals.env_spec[3] = pf.blend;
+        }
         self.post_bloom_size = globals.bloom[1];
+        self.post_dof_near = globals.dof[2] > 0.0;
         self.post_dof = globals.dof[2] > 0.0 || globals.dof[3] > 0.0;
         globals.cam_pos[3] = self.material_epoch.elapsed().as_secs_f32();
+        // Deterministic isolated render probes (no effect in ordinary runs).
+        if let Ok(t) = std::env::var("RUSTUDIO_MATERIAL_TIME") {
+            if let Ok(t) = t.parse::<f32>() { globals.cam_pos[3] = t; }
+        }
+        if let Some(n) = crate::grass_temporal::index() {
+            globals.cam_pos[3] = crate::grass_temporal::time(n);
+            use std::io::Write;
+            let dir=std::env::var("RUSTUDIO_GRASS_TEMPORAL").unwrap();
+            let mut f=std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/frames.jsonl")).unwrap();
+            writeln!(f,"{}",serde_json::json!({"frame":n,"shader_time":globals.cam_pos[3],"camera":globals.cam_pos,"spheres":globals.sun_sphere,"matrices":globals.sun_casc,"rects":globals.sun_rect,"viewport":size,"wall":self.material_epoch.elapsed().as_secs_f64()})).unwrap();
+        }
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
         self.gui_fog = Self::gui_fog(&frame.globals);
         self.gui_lightgrid = frame.globals.lightgrid;
@@ -3016,11 +3418,21 @@ impl Renderer {
         let mut dyn_opaque: Vec<((usize, usize), InstanceRaw)> = Vec::new();
         let mut dyn_decal: Vec<((usize, usize), InstanceRaw)> = Vec::new();
         let mut blended: Vec<(f32, (usize, usize), InstanceRaw)> = Vec::new();
+        // Decals / Textures on a solid (or invisible) host: part of the
+        // surface, so drawn with the opaque scene, before terrain water and
+        // glass read it. Studio's water covers a hull's Textures below the
+        // waterline (Pirate Island's Cutter); after the water they showed
+        // through it. Decals on see-through hosts stay sorted with them.
+        let mut surface_decals: Vec<(f32, (usize, usize), InstanceRaw)> = Vec::new();
         let mut water: Vec<((usize, usize), InstanceRaw)> = Vec::new();
         for r in &self.per_frame {
             let Some(item) = self.items.get(r) else {
                 continue;
             };
+            let solid_host = item.draws.first().is_none_or(|h| {
+                h.tex_mode != TexMode::Decal
+                    && (!shows(h) || (h.alpha >= 0.999 && h.material_id != 1584))
+            });
             for d in &item.draws {
                 let rad = radius_of(d);
                 if !shows(d) || !sphere_visible(&planes, d.xf.pos, rad) {
@@ -3039,10 +3451,16 @@ impl Renderer {
                     // winding isn't trusted): from inside its box every face
                     // Studio would draw faces away, so nothing shows.
                     // (Not terrain water, material 5: one mesh whose box can
-                    // span the map, its surface seen from anywhere.)
-                    None if d.custom_mesh.is_some() && d.material != 5.0 && camera_inside(d, cam) => {}
+                    // span the map, its surface seen from anywhere. Not a
+                    // decal either: its plane carries the host's whole Size,
+                    // so a camera low over a Baseplate is "inside" it and
+                    // the grid Texture vanished.)
+                    None if d.custom_mesh.is_some() && d.material != 5.0 && d.tex_mode != TexMode::Decal && camera_inside(d, cam) => {}
                     // Terrain water: its own pass (water.rs).
                     None if d.custom_mesh.is_some() && d.material == 5.0 => water.push((draw_key(d), raw)),
+                    None if solid_host && d.tex_mode == TexMode::Decal && d.texture.is_some() => {
+                        surface_decals.push((dist, draw_key(d), raw))
+                    }
                     None => blended.push((dist, draw_key(d), raw)),
                 }
             }
@@ -3052,6 +3470,8 @@ impl Renderer {
         // Glass samples the opaque scene and must precede other transparents.
         // Preserve the existing back-to-front distance order within each group.
         blended.sort_by(|a, b| transparent_order(a.2.extra[0], a.0, b.2.extra[0], b.0));
+        // Back to front; equal distances keep source order (stable sort).
+        surface_decals.sort_by(|a, b| b.0.total_cmp(&a.0));
         let overlay: Vec<((usize, usize), InstanceRaw)> = frame
             .overlay
             .iter()
@@ -3062,6 +3482,7 @@ impl Renderer {
             .iter()
             .map(|e| e.1)
             .chain(dyn_decal.iter().map(|e| e.1))
+            .chain(surface_decals.iter().map(|e| e.2))
             .chain(blended.iter().map(|e| e.2))
             .chain(overlay.iter().map(|e| e.1))
             .chain(water.iter().map(|e| e.1))
@@ -3096,6 +3517,8 @@ impl Renderer {
         base += dyn_opaque.len() as u32;
         let decal_runs = runs(&mut dyn_decal.iter().map(|e| e.0), base);
         base += dyn_decal.len() as u32;
+        let surface_decal_runs = runs(&mut surface_decals.iter().map(|e| e.1), base);
+        base += surface_decals.len() as u32;
         let glass_count = blended.iter().take_while(|e| (e.2.extra[0] as u32 & 7) == 3).count();
         let glass_end = base + glass_count as u32;
         let mut blend_runs = runs(&mut blended[..glass_count].iter().map(|e| e.1), base);
@@ -3136,10 +3559,13 @@ impl Renderer {
         }
 
         // The sun's shadow cascades (sun_shadow.rs): which to redraw.
-        let scene_gen = self.static_gen;
+        let diagnostic_back = std::env::var_os("RUSTUDIO_CULL_BACK").is_some() || std::env::var_os("RUSTUDIO_CULL_SWITCH").is_some_and(|p| std::path::Path::new(&p).exists());
+        let scene_gen = self.static_gen.wrapping_add(if diagnostic_back { 1u64 << 63 } else { 0 });
+        static GRASS_SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let grass_shadows = *GRASS_SHADOWS.get_or_init(|| std::env::var_os("RUSTUDIO_NO_GRASS_SHADOW").is_none());
         let sun_due = if frame.shadows {
             self.sun.upload(queue, &frame.sun_cascades);
-            self.sun.plan(&frame.sun_cascades, scene_gen, !opaque_runs.is_empty())
+            self.sun.plan(&frame.sun_cascades, scene_gen, !opaque_runs.is_empty() || !self.terrain_grass.is_empty())
         } else {
             self.sun.forget();
             [false; crate::sun_shadow::CASCADES]
@@ -3149,6 +3575,19 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("viewport"),
         });
+        match frame.clouds.as_ref().filter(|_| frame.sky) {
+            Some(look) => {
+                let clouds = self.clouds.get_or_insert_with(|| {
+                    crate::clouds::CloudsGpu::new(device, queue, &self.globals_layout, &shader_source(), HDR_FORMAT)
+                });
+                clouds.encode(device, queue, &mut encoder, &self.globals_bg, look, -frame.globals.sun_dir[1], target.size);
+            }
+            None => {
+                if let Some(c) = self.clouds.as_mut() {
+                    c.idle();
+                }
+            }
+        }
         for (ci, cascade) in frame.sun_cascades.iter().enumerate() {
             if !sun_due[ci] {
                 continue;
@@ -3210,13 +3649,35 @@ impl Renderer {
                 for r in &opaque_runs {
                     cast(&mut pass, r.0, r.1..r.2);
                 }
-                if !self.terrain_chunks.is_empty() {
+                if !self.terrain_chunks.is_empty() || !self.terrain_grass.is_empty() {
+                    // Grass remains two-sided, including in the opt-in solid
+                    // terrain BACK-culling attribution capture.
                     pass.set_pipeline(&self.terrain_shadow);
-                    for c in self.terrain_chunks.values() {
+                    if let Some(dir) = std::env::var_os("RUSTUDIO_CULL_EXPORT") {
+                        let dir = std::path::PathBuf::from(dir);
+                        std::fs::create_dir_all(&dir).unwrap();
+                        let vp = cascade.view_proj();
+                        let mut clip = Vec::<[f32;4]>::new();
+                        let mut chunks = Vec::new();
+                        for (key,c) in &self.terrain_chunks {
+                            if box_visible(&sp,c.lo,c.hi) {
+                                chunks.push((*key,c.count));
+                                clip.extend(c.diagnostic_positions.iter().map(|p| (vp * Vec3::from(*p).extend(1.0)).to_array()));
+                            }
+                        }
+                        std::fs::write(dir.join(format!("cascade{ci}-clip.bin")),bytemuck::cast_slice(&clip)).unwrap();
+                        std::fs::write(dir.join(format!("cascade{ci}.json")),serde_json::to_vec_pretty(&serde_json::json!({"vp":vp.to_cols_array(),"tile":cascade.tile,"chunks":chunks,"vertices":clip.len()})).unwrap()).unwrap();
+                    }
+                    for (solid,c) in self.terrain_chunks.values().map(|c|(true,c)).chain(self.terrain_grass.values().filter(|_| grass_shadows).map(|c|(false,c))) {
+                        pass.set_pipeline(if solid && diagnostic_back { &self.terrain_shadow_back } else { &self.terrain_shadow });
                         if box_visible(&sp, c.lo, c.hi) {
                             crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SHADOW, 1, (c.count / 3) as u64);
                             pass.set_vertex_buffer(0, c.vbuf.slice(..));
-                            pass.draw(0..c.count, 0..1);
+                            if c.grass_ranges.is_empty() { pass.draw(0..c.count, 0..1); }
+                        else { for range in &c.grass_ranges {
+                            let camera = Vec3::new(frame.globals.cam_pos[0], frame.globals.cam_pos[1], frame.globals.cam_pos[2]);
+                            pass.draw(range.start..range.start + range.count(camera), 0..1);
+                        }}
                         }
                     }
                 }
@@ -3324,7 +3785,10 @@ impl Renderer {
         // the opaque scene; then (after copying its colour) the water,
         // which looks through it; then decals and see-through parts.
         let has_glass = blended.iter().any(|e| (e.2.extra[0] as u32 & 7) == 3);
-        let split = !water_runs.is_empty() || has_glass;
+        // See-through Neon blends against the opaque snapshot too
+        // (shader.wgsl neon_over_scene).
+        let has_neon = blended.iter().any(|e| (e.2.extra[0] as u32 & 7) == 1);
+        let split = !water_runs.is_empty() || has_glass || has_neon;
         let mut calls = 0usize;
         // One instanced draw per run of (mesh, texture).
         let draw = |pass: &mut wgpu::RenderPass,
@@ -3340,6 +3804,77 @@ impl Renderer {
             pass.draw(0..mesh.count, range);
             *calls += 1;
         };
+        // Scene environment probe work (env_probe.rs): Studio draws one cube
+        // face a frame at the probe box's centre (Studio; 90 degrees,
+        // far 3000), the opaque scene without the sky, then builds the
+        // pyramid and convolves mips 1 and 2.
+        if let Some(pf) = frame.probe.as_ref() {
+            for task in &pf.tasks {
+                if let crate::env_probe::Task::Face(f) = *task {
+                    let (fwd, up) = crate::env_probe::face_basis(f);
+                    let centre = pf.centre;
+                    let fov = std::f32::consts::FRAC_PI_2;
+                    let reverse = Mat4::perspective_rh(fov, 1.0, crate::env_probe::FAR, crate::mech::NEAR);
+                    let ordinary = Mat4::perspective_rh(fov, 1.0, crate::mech::NEAR, crate::env_probe::FAR);
+                    let view = Mat4::look_to_rh(centre, fwd, up);
+                    let view_rel = Mat4::look_to_rh(Vec3::ZERO, fwd, up);
+                    let mut pg = globals;
+                    pg.view_proj = (reverse * view).to_cols_array_2d();
+                    pg.inv_view_proj = (ordinary.as_dmat4() * view_rel.as_dmat4()).inverse().as_mat4().to_cols_array_2d();
+                    pg.cam_pos = [centre.x, centre.y, centre.z, globals.cam_pos[3]];
+                    pg.env_spec[3] = 0.0;
+                    queue.write_buffer(&self.probe.globals_buf, 0, bytemuck::bytes_of(&pg));
+                    let face_planes = frustum(ordinary * view);
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("env probe face"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &self.probe.face_msaa,
+                                depth_slice: None,
+                                resolve_target: Some(self.probe.face_resolve()),
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Discard },
+                            })],
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: &self.probe.face_depth,
+                                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
+                                stencil_ops: None,
+                            }),
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        pass.set_bind_group(0, &self.probe_globals_bg, &[]);
+                        pass.set_bind_group(2, &target.glass_bg, &[]);
+                        pass.set_vertex_buffer(1, self.static_buf.slice(..));
+                        for b in self.st.batches.iter().filter(|b| b.pass == Pass::Opaque) {
+                            if !box_visible(&face_planes, b.lo, b.hi) {
+                                continue;
+                            }
+                            pass.set_pipeline(if self.culls_back(b.key.0) { &self.opaque } else { &self.opaque_two_sided });
+                            draw(&mut pass, b.key, b.start..b.start + b.count, &mut calls);
+                        }
+                        pass.set_vertex_buffer(1, self.instance_buf.slice(..));
+                        for r in &opaque_runs {
+                            pass.set_pipeline(if self.culls_back(r.0.0) { &self.opaque } else { &self.opaque_two_sided });
+                            draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                        }
+                        if !self.terrain_chunks.is_empty() {
+                            pass.set_pipeline(&self.terrain);
+                            pass.set_bind_group(1, &self.terrain_bg, &[]);
+                            for c in self.terrain_chunks.values() {
+                                if box_visible(&face_planes, c.lo, c.hi) {
+                                    pass.set_vertex_buffer(0, c.vbuf.slice(..));
+                                    pass.draw(0..c.count, 0..1);
+                                }
+                            }
+                        }
+                    }
+                    self.probe.store_face(device, &mut encoder, f);
+                } else {
+                    self.probe.encode(device, &mut encoder, *task);
+                }
+            }
+        }
         // Decals, then see-through parts back to front, then the hover overlay.
         let see_through = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
             pass.set_bind_group(2, &target.glass_bg, &[]);
@@ -3354,8 +3889,8 @@ impl Renderer {
             }
             for r in &blend_runs {
                 pass.set_pipeline(if r.1 < glass_end {
-                    if r.0 .0 < BUILTIN_MESHES { &self.glass_culled } else { &self.glass }
-                } else if r.0 .0 < BUILTIN_MESHES {
+                    if self.culls_back(r.0 .0) { &self.glass_culled } else { &self.glass }
+                } else if self.culls_back(r.0 .0) {
                     &self.transparent_culled
                 } else {
                     &self.transparent
@@ -3406,9 +3941,10 @@ impl Renderer {
                 pass.draw(0..3, 0..1);
             }
 
-            // Loaded meshes may wind either way: draw them two-sided.
+            // Loaded meshes are two-sided unless set_mesh_cull culls them
+            // (file meshes, unless a MeshPart is DoubleSided: as Studio).
             let opaque_pipe = |key: (usize, usize)| {
-                if key.0 < BUILTIN_MESHES {
+                if self.culls_back(key.0) {
                     &self.opaque
                 } else {
                     &self.opaque_two_sided
@@ -3425,6 +3961,14 @@ impl Renderer {
                 pass.set_pipeline(opaque_pipe(r.0));
                 draw(&mut pass, r.0, r.1..r.2, &mut calls);
             }
+            // Only opaque authored decal texels contribute scene depth. The
+            // shader rejects other blended materials and fractional coverage;
+            // the invisible host never enters this pass. Keep the ordinary
+            // sorted color pass for layer order and semitransparent edges.
+            pass.set_pipeline(&self.decal_depth);
+            for r in surface_decal_runs.iter().chain(&blend_runs) {
+                draw(&mut pass, r.0, r.1..r.2, &mut calls);
+            }
             // Terrain chunks in view.
             if !self.terrain_chunks.is_empty() {
                 pass.set_pipeline(&self.terrain);
@@ -3433,8 +3977,20 @@ impl Renderer {
                     if box_visible(&planes, c.lo, c.hi) {
                         crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SCENE, 1, (c.count / 3) as u64);
                         pass.set_vertex_buffer(0, c.vbuf.slice(..));
-                        pass.draw(0..c.count, 0..1);
+                        if c.grass_ranges.is_empty() { pass.draw(0..c.count, 0..1); }
+                        else { for range in &c.grass_ranges {
+                            let camera = Vec3::new(frame.globals.cam_pos[0], frame.globals.cam_pos[1], frame.globals.cam_pos[2]);
+                            pass.draw(range.start..range.start + range.count(camera), 0..1);
+                        }}
                     }
+                }
+                pass.set_bind_group(1, &self.textures[0], &[]);
+            }
+            if !surface_decal_runs.is_empty() {
+                pass.set_pipeline(&self.transparent);
+                pass.set_vertex_buffer(1, self.instance_buf.slice(..));
+                for r in &surface_decal_runs {
+                    draw(&mut pass, r.0, r.1..r.2, &mut calls);
                 }
                 pass.set_bind_group(1, &self.textures[0], &[]);
             }
@@ -3473,7 +4029,14 @@ impl Renderer {
                             store: wgpu::StoreOp::Store,
                         },
                     })],
-                    depth_stencil_attachment: None,
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &target.water_depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
                     multiview_mask: None,
@@ -3505,8 +4068,11 @@ impl Renderer {
             see_through(&mut pass, &mut calls);
         }
         stats.draw_calls = calls;
+        // Scene colour snapshot (water/glass reads are complete).
+        encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
+            wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
         // Bloom: bright pass, blur across, blur down (half resolution).
-        // SSAO (Studio's passes), then its multiply into the scene.
+        // SSAO, then its multiply into the scene.
         {
             let steps: [(&str, &wgpu::RenderPipeline, usize, &wgpu::TextureView, bool); 5] = [
                 ("ssao depth", &self.ssao_down, 0, &target.ssao_depth_view, true),
@@ -3516,6 +4082,7 @@ impl Renderer {
                 ("ssao apply", &self.ssao_apply, 2, &target.hdr_view, false),
             ];
             for (label, pipeline, bg, view, clear) in steps {
+                if label == "ssao apply" && (std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_NO_AO").is_some() || std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some()) { continue; }
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some(label),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3537,6 +4104,12 @@ impl Renderer {
                 pass.set_bind_group(1, &target.ssao_bgs[bg], &[]);
                 pass.draw(0..3, 0..1);
             }
+        }
+        // Terrain.Clouds over the sky (Studio composes them after SSAO).
+        if let Some(c) = self.clouds.as_mut() {
+            encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
+                wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
+            c.composite(device, &mut encoder, &self.globals_bg, &target.hdr_view, &target.scene_copy_view, &target.depth);
         }
         self.encode_bloom(&mut encoder, target, globals.bloom[1]);
         let mut fullscreen = |label: &str,
@@ -3568,12 +4141,13 @@ impl Renderer {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, bg, &[]);
-            if label == "dof across" { pass.set_bind_group(2, &target.ssao_bgs[0], &[]); }
+            if label == "dof across" || label == "dof near" { pass.set_bind_group(2, &target.ssao_bgs[0], &[]); }
             pass.draw(0..3, 0..1);
         };
         if globals.dof[2] > 0.0 || globals.dof[3] > 0.0 {
             fullscreen("dof across", &self.dof_h, &target.dof_bgs[0], &[&target.dof_views[0]]);
             fullscreen("dof down", &self.dof_v, &target.dof_bgs[1], &[&target.dof_views[1]]);
+            if globals.dof[2] > 0.0 { for i in 0..11 { fullscreen("dof near", &self.near_pipelines[i], &target.near_bgs[i], &[&target.near_views[i]]); } }
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3595,10 +4169,14 @@ impl Renderer {
             pass.set_pipeline(&self.post);
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, &target.hdr_bg, &[]);
-            pass.set_bind_group(2, &target.ssao_bgs[0], &[]);
+            pass.set_bind_group(2, &target.post_depth_bg, &[]);
             pass.draw(0..3, 0..1);
         }
+        self.probe.flush(queue);
         queue.submit([encoder.finish()]);
+        if let Some(c) = self.clouds.as_mut() {
+            c.after_submit();
+        }
         self.stats = stats;
         crate::runtime::domains::services::perf::end_frame(svc_t0.elapsed().as_secs_f64(), 0.0);
         self.texture_id
@@ -3606,6 +4184,21 @@ impl Renderer {
 }
 
 const BUILTIN_MESHES: usize = 5;
+
+impl Renderer {
+    /// Draws a loaded mesh single-sided (back faces culled) or two-sided.
+    pub fn set_mesh_cull(&mut self, index: u32, cull_back: bool) {
+        if let Some(m) = self.meshes.get_mut(index as usize + BUILTIN_MESHES) {
+            m.cull_back = cull_back;
+        }
+    }
+
+    /// Whether the mesh at this slot is drawn with back faces culled:
+    /// built-in shapes always, loaded meshes when set_mesh_cull says so.
+    fn culls_back(&self, slot: usize) -> bool {
+        slot < BUILTIN_MESHES || self.meshes.get(slot).is_some_and(|m| m.cull_back)
+    }
+}
 
 /// Index into `Renderer::meshes`: built-in shapes first, then loaded meshes.
 fn mesh_slot(p: &PartDraw) -> usize {
@@ -3664,6 +4257,7 @@ impl Renderer {
         self.meshes.push(Mesh {
             vbuf,
             count: verts.len() as u32,
+            cull_back: false,
         });
         (self.meshes.len() - 1 - BUILTIN_MESHES) as u32
     }
@@ -3730,7 +4324,10 @@ impl Renderer {
         let identity = u64::from_str_radix(&r.to_string()[16..], 16).unwrap_or(0);
         for d in &mut draws {
             if d.mat_layer >= 0 && d.custom_mesh.is_none() && d.tex_mode == TexMode::None {
-                let off = crate::matpack::uv_offset(d.size, d.material_id, identity);
+                // Studio returns no offset for a MaterialVariant.
+                let variant = self.materials.cpu.get(d.mat_layer as usize)
+                    .is_some_and(|m| crate::matpack::is_variant_pack(m.pack));
+                let off = if variant { [0.0; 2] } else { crate::matpack::uv_offset(d.size, d.material_id, identity) };
                 d.uvt[2] = off[0];
                 d.uvt[3] = off[1];
             }
@@ -4037,10 +4634,11 @@ fn to_raw(p: &PartDraw, bias: f32) -> InstanceRaw {
 
 /// shader.wgsl with the measured constants from mech.rs put in front.
 fn shader_source() -> String {
+    let grass = format!("const GRASS_RADIUS: f32 = {:?};\nconst GRASS_FADE_LEN: f32 = {:?};\nconst GRASS_NEAR_RADIUS: f32 = {:?};\nconst GRASS_NEAR_FADE_LEN: f32 = {:?};\n", crate::mech::GRASS_RADIUS, crate::mech::GRASS_FADE_LEN, crate::mech::GRASS_NEAR_RADIUS, crate::mech::GRASS_NEAR_FADE_LEN);
     use crate::mech as m;
     let [a, b, c, d, e] = m::TONE_CURVE;
     format!(
-        "const SUN_DIST: f32 = {:?};\nconst HYBRID_LERP_SLOPE: f32 = {:?};\nconst TONE_A: f32 = {a:?};\nconst TONE_B: f32 = {b:?};\nconst TONE_C: f32 = {c:?};\nconst TONE_D: f32 = {d:?};\nconst TONE_E: f32 = {e:?};\nconst BLOOM_SIGMA_NARROW: f32 = {:?};\nconst BLOOM_SIGMA_WIDE: f32 = {:?};\nconst BLOOM_WIDE_SHARE: f32 = {:?};\nconst BLOOM_GAIN: f32 = {:?};\nconst BLOOM_MAX_RADIUS: i32 = {};\nconst ATMOS_BAND_DEG: f32 = {:?};\nconst ATMOS_BAND_POW: f32 = {:?};\nconst ATMOS_BAND_FLOOR: f32 = {:?};\nconst ENV_SPEC_LOD_SPAN: f32 = {:?};\nconst LIGHTGRID_BORDER: f32 = {:?};\nconst LIGHTOCC_DENSITY: f32 = {:?};\nconst LIGHTOCC_START_VOXELS: f32 = {:?};\nconst LIGHTOCC_LIGHT_SKIP_VOXELS: f32 = {:?};\nconst LIGHTOCC_MAX_STEPS: f32 = {:?};\nconst NEON_SEE_THROUGH_CUT: f32 = {:?};\nconst NEON_SEE_THROUGH_MAX: f32 = {:?};\nconst ATMOS_T_EPS: f32 = {:?};\nconst ATMOS_FOG_MIP: f32 = {:?};\nconst ATMOS_ENV_CUBE_LEVELS: f32 = {:?};\nconst ENV_SPEC_FADE: f32 = {:?};\nconst ENV_ROUGH_BASE: f32 = {:?};\nconst ENV_ROUGH_SCALE: f32 = {:?};\nconst ENV_SPEC_MIP_PER_ROUGHNESS: f32 = {:?};\nconst ENV_REFLECT_UP_GAIN: f32 = {:?};\nconst SSAO_DEPTH_SCALE: f32 = {:?};\nconst SSAO_DEPTH_MAX: f32 = {:?};\nconst SSAO_RADIUS_K: f32 = {:?};\nconst SSAO_RADIUS_MIN_TEXELS: f32 = {:?};\nconst SSAO_RADIUS_MAX_TEXELS: f32 = {:?};\nconst SSAO_SAMPLES: u32 = {}u;\nconst SSAO_DEPTH_GAIN: f32 = {:?};\nconst SSAO_BLUR_K: f32 = {:?};\nconst SSAO_BLUR_DEPTH: f32 = {:?};\nconst SSAO_BLUR_DEPTH_MIN: f32 = {:?};\nconst SSAO_BLUR_DEPTH_MAX: f32 = {:?};\nconst SSAO_UPSAMPLE_DEPTH: f32 = {:?};\nconst EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\nconst EVSM_SHADOW_BIAS: f32 = {:?};\nconst EVSM_BLEED_CUT: f32 = {:?};\nconst LSHADOW_COLS: u32 = {}u;\nconst LSHADOW_CELL: f32 = {:?};\n{}",
+        "const SUN_DIST: f32 = {:?};\nconst HYBRID_LERP_SLOPE: f32 = {:?};\nconst TONE_A: f32 = {a:?};\nconst TONE_B: f32 = {b:?};\nconst TONE_C: f32 = {c:?};\nconst TONE_D: f32 = {d:?};\nconst TONE_E: f32 = {e:?};\nconst BLOOM_SIGMA_NARROW: f32 = {:?};\nconst BLOOM_SIGMA_WIDE: f32 = {:?};\nconst BLOOM_WIDE_SHARE: f32 = {:?};\nconst BLOOM_GAIN: f32 = {:?};\nconst BLOOM_MAX_RADIUS: i32 = {};\nconst ATMOS_BAND_DEG: f32 = {:?};\nconst ATMOS_BAND_POW: f32 = {:?};\nconst ATMOS_BAND_FLOOR: f32 = {:?};\nconst ENV_SPEC_LOD_SPAN: f32 = {:?};\nconst LIGHTGRID_BORDER: f32 = {:?};\nconst LIGHTOCC_DENSITY: f32 = {:?};\nconst LIGHTOCC_START_VOXELS: f32 = {:?};\nconst LIGHTOCC_LIGHT_SKIP_VOXELS: f32 = {:?};\nconst LIGHTOCC_MAX_STEPS: f32 = {:?};\nconst ATMOS_T_EPS: f32 = {:?};\nconst ATMOS_FOG_MIP: f32 = {:?};\nconst ATMOS_ENV_CUBE_LEVELS: f32 = {:?};\nconst ENV_SPEC_FADE: f32 = {:?};\nconst ENV_ROUGH_BASE: f32 = {:?};\nconst ENV_ROUGH_SCALE: f32 = {:?};\nconst ENV_SPEC_MIP_PER_ROUGHNESS: f32 = {:?};\nconst ENV_REFLECT_UP_GAIN: f32 = {:?};\nconst SSAO_DEPTH_SCALE: f32 = {:?};\nconst SSAO_DEPTH_MAX: f32 = {:?};\nconst SSAO_RADIUS_K: f32 = {:?};\nconst SSAO_RADIUS_MIN_TEXELS: f32 = {:?};\nconst SSAO_RADIUS_MAX_TEXELS: f32 = {:?};\nconst SSAO_SAMPLES: u32 = {}u;\nconst SSAO_DEPTH_GAIN: f32 = {:?};\nconst SSAO_BLUR_K: f32 = {:?};\nconst SSAO_BLUR_DEPTH: f32 = {:?};\nconst SSAO_BLUR_DEPTH_MIN: f32 = {:?};\nconst SSAO_BLUR_DEPTH_MAX: f32 = {:?};\nconst SSAO_UPSAMPLE_DEPTH: f32 = {:?};\nconst EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\nconst EVSM_SHADOW_BIAS: f32 = {:?};\nconst EVSM_BLEED_CUT: f32 = {:?};\nconst LSHADOW_COLS: u32 = {}u;\nconst LSHADOW_CELL: f32 = {:?};\n{}",
         m::SUN_DIST,
         m::HYBRID_LERP_SLOPE,
         m::BLOOM_SIGMAS_PX[0],
@@ -4057,8 +4655,6 @@ fn shader_source() -> String {
         m::LIGHTOCC_START_VOXELS,
         m::LIGHTOCC_LIGHT_SKIP_VOXELS,
         m::LIGHTOCC_MAX_STEPS,
-        m::NEON_SEE_THROUGH_CUT,
-        m::NEON_SEE_THROUGH_MAX,
         m::ATMOS_T_EPS,
         m::ATMOS_FOG_MIP,
         m::ATMOS_ENV_CUBE_LEVELS,
@@ -4085,7 +4681,7 @@ fn shader_source() -> String {
         m::EVSM_BLEED_CUT,
         m::LSHADOW_ATLAS / m::LSHADOW_FACE,
         m::LSHADOW_FACE as f32 / m::LSHADOW_ATLAS as f32,
-        format!("const DETILE_LEVELS: f32 = {:?};\nconst WANG_CELLS: f32 = {:?};\nconst MATERIAL_DIFFUSE_FADE_DEPTH: f32 = {:?};\nconst MATERIAL_LQ_DIFFUSE_CUTOFF: f32 = {:?};\n{}", m::DETILE_LEVELS, m::WANG_CELLS, m::MATERIAL_DIFFUSE_FADE_DEPTH, m::MATERIAL_LQ_DIFFUSE_CUTOFF, include_str!("shader.wgsl"))
+        format!("const TERRAIN_CAPTURE_ID: bool = {};\nconst TERRAIN_CAPTURE_NO_AO: bool = {};\nconst DETILE_LEVELS: f32 = {:?};\nconst WANG_CELLS: f32 = {:?};\nconst MATERIAL_DIFFUSE_FADE_DEPTH: f32 = {:?};\nconst MATERIAL_LQ_DIFFUSE_CUTOFF: f32 = {:?};\n{}", std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some(), std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_NO_AO").is_some(), m::DETILE_LEVELS, m::WANG_CELLS, m::MATERIAL_DIFFUSE_FADE_DEPTH, m::MATERIAL_LQ_DIFFUSE_CUTOFF, format!("{grass}{}", include_str!("shader.wgsl")))
     )
 }
 
@@ -4389,6 +4985,22 @@ impl MeshBuilder {
     }
 }
 
+/// Selection uses the same tessellation and size transform as the visible ball.
+pub(crate) fn ball_outline_points() -> impl Iterator<Item = Vec3> {
+    (0..=18).flat_map(|i| (0..32).map(move |j| {
+        let th = std::f32::consts::PI * i as f32 / 18.0;
+        let ph = std::f32::consts::TAU * j as f32 / 32.0;
+        Vec3::new(th.sin() * ph.cos(), th.cos(), th.sin() * ph.sin()) * 0.5
+    }))
+}
+
+pub(crate) fn outline_triangles(kind: MeshKind) -> &'static [[Vec3; 3]] {
+    static TRIANGLES: std::sync::OnceLock<Vec<Vec<[Vec3; 3]>>> = std::sync::OnceLock::new();
+    &TRIANGLES.get_or_init(|| build_meshes().iter().map(|vertices|
+        vertices.chunks_exact(3).map(|t| [Vec3::from(t[0].pos), Vec3::from(t[1].pos), Vec3::from(t[2].pos)]).collect()
+    ).collect())[kind as usize]
+}
+
 fn build_meshes() -> Vec<Vec<Vertex>> {
     let h = 0.5;
     let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
@@ -4483,6 +5095,16 @@ fn build_meshes() -> Vec<Vec<Vertex>> {
     corner.flat(&[apex, b2, b3]);
     corner.flat(&[apex, b3, b0]);
 
+    // Explicitly mark only flat oblique primitive faces. Curved normals and
+    // authored union projection tags retain their existing material mapping.
+    for mesh in [&mut wedge, &mut corner] {
+        for vertex in &mut mesh.verts {
+            let n = Vec3::from_array(vertex.normal).abs();
+            if n.y > 0.0001 && (n.x > 0.0001 || n.z > 0.0001) {
+                vertex.projection[0] = -99.0;
+            }
+        }
+    }
     vec![
         block.verts,
         ball.verts,
@@ -4490,6 +5112,46 @@ fn build_meshes() -> Vec<Vec<Vertex>> {
         wedge.verts,
         corner.verts,
     ]
+}
+
+/// The triangles of a built-in Wedge / CornerWedge in unit-part space (the
+/// same shapes the meshes above draw); None for other kinds. Decals and
+/// Textures are projected onto them (viewport.rs), as Studio clips a
+/// Texture on a wedge's Front or Top to its slope.
+pub fn shape_triangles(kind: MeshKind) -> Option<Vec<[Vec3; 3]>> {
+    let h = 0.5;
+    let v = Vec3::new;
+    let quad = |q: [Vec3; 4]| [[q[0], q[1], q[2]], [q[0], q[2], q[3]]];
+    let mut out = Vec::new();
+    match kind {
+        MeshKind::Wedge => {
+            out.extend(quad([v(-h, -h, -h), v(h, -h, -h), v(h, -h, h), v(-h, -h, h)]));
+            out.extend(quad([v(-h, -h, h), v(h, -h, h), v(h, h, h), v(-h, h, h)]));
+            out.extend(quad([v(-h, -h, -h), v(h, -h, -h), v(h, h, h), v(-h, h, h)]));
+            out.push([v(-h, -h, -h), v(-h, -h, h), v(-h, h, h)]);
+            out.push([v(h, -h, -h), v(h, -h, h), v(h, h, h)]);
+        }
+        MeshKind::CornerWedge => {
+            let apex = v(h, h, -h);
+            let (b0, b1, b2, b3) = (v(-h, -h, -h), v(h, -h, -h), v(h, -h, h), v(-h, -h, h));
+            out.extend(quad([b0, b1, b2, b3]));
+            out.push([apex, b1, b2]);
+            out.push([apex, b0, b1]);
+            out.push([apex, b2, b3]);
+            out.push([apex, b3, b0]);
+        }
+        _ => return None,
+    }
+    // Winding doesn't matter here: the projection keeps triangles by the
+    // normal's side, so orient each one away from the shape's centre.
+    let centre = if kind == MeshKind::Wedge { v(0.0, -0.2, 0.2) } else { v(0.25, -0.3, -0.25) };
+    for tri in &mut out {
+        let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
+        if n.dot((tri[0] + tri[1] + tri[2]) / 3.0 - centre) < 0.0 {
+            tri.swap(1, 2);
+        }
+    }
+    Some(out)
 }
 
 thread_local! {

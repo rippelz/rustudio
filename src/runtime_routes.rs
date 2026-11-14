@@ -251,7 +251,11 @@ fn compute(class: rbx_dom_weak::Ustr, key: &str) -> Route {
         ni_domains,
         ni_ext,
         set_attachment: doc::is_a(c, "Attachment")
-            && matches!(key, "WorldCFrame" | "WorldPosition" | "WorldOrientation" | "Position" | "Orientation"),
+            && matches!(
+                key,
+                "WorldCFrame" | "WorldPosition" | "WorldOrientation" | "Position" | "Orientation"
+                    | "Axis" | "SecondaryAxis" | "WorldAxis" | "WorldSecondaryAxis"
+            ),
         set_part: doc::is_a(c, "BasePart")
             && matches!(key, "Position" | "Orientation" | "Rotation" | "BrickColor" | "AssemblyLinearVelocity" | "Velocity"),
         set,

@@ -1,0 +1,4 @@
+Studio bundled dark-theme artwork from content/studio_svg_textures/Shared.
+WedgePart, CornerWedgePart, TrussPart: InsertableObjects/Dark/Standard, @3x.
+Sphere, Cylinder: Ribbon/Dark/Medium/RibbonPart_<shape>, @3x.
+Embedded locally; no installed Studio dependency at runtime.

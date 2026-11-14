@@ -101,13 +101,16 @@ impl SelfTest {
                         let ch = d
                             .workspace()
                             .and_then(|ws| child(d, ws, &ed.player_name()));
-                        (
-                            names(
-                                ps,
-                                &["PlayerModule", "PlayerScriptsLoader", "RbxCharacterSounds"],
-                            ),
-                            names(ch, &["Animate", "Health"]),
-                        )
+                        // Studio's current layout (0.747): the PlayerModule
+                        // (with its PlayerScriptsLoader) in StarterPlayer,
+                        // RbxCharacterSounds alone in PlayerScripts; the
+                        // older one has all three in PlayerScripts.
+                        let sp = d.find_child(root, "StarterPlayer");
+                        let pm = sp.and_then(|sp| child(d, sp, "PlayerModule"));
+                        let current = names(pm, &["PlayerScriptsLoader", "CameraModule", "ControlModule", "InputContexts"])
+                            && names(ps, &["RbxCharacterSounds"]);
+                        let older = names(ps, &["PlayerModule", "PlayerScriptsLoader", "RbxCharacterSounds"]);
+                        (current || older, names(ch, &["Animate", "Health"]))
                     }
                     None => (false, false),
                 };
@@ -120,7 +123,7 @@ impl SelfTest {
                 let start_ok = cam.is_some_and(|(d, _)| (d - 12.5).abs() < 0.1);
                 self.pm.ok &= (!installed || (scripts && char_scripts)) && start_ok;
                 self.pm.notes.push(format!(
-                    "PlayerModule, PlayerScriptsLoader, RbxCharacterSounds in PlayerScripts: {scripts}; Animate, Health in the character: {char_scripts} (Studio install found: {installed}); camera starts {:.2} studs from its focus (Studio: 12.5); {errors} errors",
+                    "PlayerModule (StarterPlayer, or PlayerScripts in the older layout), PlayerScriptsLoader, RbxCharacterSounds: {scripts}; Animate, Health in the character: {char_scripts} (Studio install found: {installed}); camera starts {:.2} studs from its focus (Studio: 12.5); {errors} errors",
                     cam.map(|c| c.0).unwrap_or(0.0)
                 ));
                 self.pm.start = character_pos(ed);
@@ -204,10 +207,13 @@ impl SelfTest {
             65 if t >= 30 => {
                 let (_, yaw) = client_camera(ed).unwrap_or((0.0, 0.0));
                 let turned = (yaw - self.pm.yaw0 + 540.0).rem_euclid(360.0) - 180.0;
-                // CameraInput: 0.5° per pixel of mouse motion.
-                self.pm.ok &= (turned + 100.0).abs() < 2.0;
+                // CameraInput: 0.5° per pixel of mouse motion × the
+                // MouseSensitivity setting (0.52 by default): Studio 0.747
+                // turns 0.04538 rad for 10 px
+                // (checks/humanoid-physics/feel/traces/studio-ias.log).
+                self.pm.ok &= (turned + 52.0).abs() < 2.0;
                 self.pm.notes.push(format!(
-                    "right-drag 200 px turned the camera {turned:.1}° (CameraInput: −100°)"
+                    "right-drag 200 px turned the camera {turned:.1}° (Studio: −52° at MouseSensitivity 0.52)"
                 ));
                 // A tap that comes and goes inside one frame (a quick press,
                 // or any press during a hitch): the frame's modifier state

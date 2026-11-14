@@ -888,6 +888,12 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
             Value::Nil => return Ok(None),
             v => v,
         },
+        // settings().Studio / Physics / Rendering / Network / Diagnostics:
+        // the Studio Settings dialog's values (src/studio_settings.rs).
+        _ if crate::studio_settings::is_item_class(class) => match crate::studio_settings::lua_get(lua, class, key)? {
+            Some(v) => v,
+            None => return Ok(None),
+        },
         "ConnectionState" if class == "WebSocketClient" => enum_val(lua, "WebSocketState", 3)?,
         "ConnectionState" if class == "WebStreamClient" => enum_val(lua, "WebStreamClientState", 3)?,
         "SchedulerDutyCycle" | "SchedulerRate" if class == "TaskScheduler" => Value::Number(0.0),
@@ -1135,6 +1141,22 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
             });
             Ok(true)
         }
+        // The Studio Settings store (see prop_get): Changed fires as for any
+        // property; the identity check already ran.
+        _ if crate::studio_settings::is_item_class(class) => {
+            let before = crate::studio_settings::get(class, key);
+            match crate::studio_settings::lua_set(class, key, value)? {
+                Some(_) => {
+                    if crate::studio_settings::get(class, key) != before {
+                        let mut w = world(lua)?;
+                        w.fire(r, "Changed", vec![Value::String(lua.create_string(key)?)]);
+                        w.fire(r, &format!("Changed:{key}"), vec![]);
+                    }
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
         // Kept in library.luau's table (see prop_get); the normal write
         // follows (type check, Changed).
         _ if class == "UserGameSettings" => {
@@ -1222,6 +1244,7 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
 
 pub fn write_acts(class: &str, key: &str) -> bool {
     matches!((class, key), ("CustomEventReceiver", "Source")) || class == "UserGameSettings"
+        || crate::studio_settings::is_item_class(class)
         || key == "Sandboxed"
 }
 

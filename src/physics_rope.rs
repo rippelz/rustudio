@@ -3,12 +3,22 @@
 use super::*;
 
 impl Physics {
-    fn rope_endpoint(&self, doc: &Document, att: Ref) -> Option<(Option<rp::RigidBodyHandle>, Vec3)> {
+    /// The part an attachment sits in (its nearest BasePart ancestor).
+    fn attachment_part(doc: &Document, att: Ref) -> Option<Ref> {
         let mut part = doc.dom.get_by_ref(att)?.parent();
         while let Some(i) = doc.dom.get_by_ref(part) {
             if doc::is_a(&i.class, "BasePart") { break; }
             part = i.parent();
         }
+        Some(part)
+    }
+
+    fn attachment_body(&self, doc: &Document, att: Ref) -> Option<rp::RigidBodyHandle> {
+        Self::attachment_part(doc, att).and_then(|p| self.body_of(p))
+    }
+
+    fn rope_endpoint(&self, doc: &Document, att: Ref) -> Option<(Option<rp::RigidBodyHandle>, Vec3)> {
+        let part = Self::attachment_part(doc, att)?;
         let world = crate::attachment::world(doc, att, false)?.pos;
         let local = xform_of(doc, part).map(|xf| xf.rot.transpose() * (world - xf.pos));
         let point = match (local, self.part_xform(doc, part)) {
@@ -18,10 +28,12 @@ impl Physics {
         Some((self.body_of(part), point))
     }
 
-    pub(super) fn apply_ropes(&mut self, doc: &Document, dt: f32) {
+    /// Drops ropes destroyed or moved out of Workspace since they were seen.
+    /// Once per frame (Physics::step): the document doesn't change between
+    /// the frame's world steps.
+    pub(super) fn prune_ropes(&mut self, doc: &Document) {
         if self.ropes.is_empty() { return; }
         let Some(ws) = doc.workspace() else { return; };
-        // Drop ropes destroyed or moved out of Workspace since they were seen.
         self.ropes.retain(|&r| {
             let Some(i) = doc.dom.get_by_ref(r) else { return false };
             if i.class != "RopeConstraint" && i.class != "RodConstraint" { return false; }
@@ -32,20 +44,26 @@ impl Physics {
             }
             false
         });
+    }
+
+    pub(super) fn apply_ropes(&mut self, doc: &Document, dt: f32) {
+        if self.ropes.is_empty() { return; }
         let ropes: Vec<Ref> = self.ropes.iter().copied().collect();
         for r in ropes {
             if matches!(doc.prop(r, "Enabled"), Some(Variant::Bool(false))) { continue; }
             let get = |key| match doc.prop(r, key) { Some(Variant::Ref(a)) => Some(a), _ => None };
-            let Some((h0, p0)) = get("Attachment0").and_then(|a| self.rope_endpoint(doc, a)) else { continue; };
-            let Some((h1, p1)) = get("Attachment1").and_then(|a| self.rope_endpoint(doc, a)) else { continue; };
-            if h0 == h1 { continue; }
+            let (Some(a0), Some(a1)) = (get("Attachment0"), get("Attachment1")) else { continue; };
             // A body asleep on its rope has no gravity to hold: leave it
             // asleep (a taut rope's impulse woke it every step, so nothing
-            // hanging on a rope ever slept).
+            // hanging on a rope ever slept). Checked before the endpoints'
+            // world positions: most ropes in a big place hang asleep.
             let awake = |h: Option<rp::RigidBodyHandle>| {
                 h.and_then(|h| self.world.bodies.get(h)).is_some_and(|b| b.is_dynamic() && !b.is_sleeping())
             };
-            if !awake(h0) && !awake(h1) { continue; }
+            if !awake(self.attachment_body(doc, a0)) && !awake(self.attachment_body(doc, a1)) { continue; }
+            let Some((h0, p0)) = self.rope_endpoint(doc, a0) else { continue; };
+            let Some((h1, p1)) = self.rope_endpoint(doc, a1) else { continue; };
+            if h0 == h1 { continue; }
             let delta = p1 - p0;
             let distance = delta.length();
             if distance < 1e-6 { continue; }

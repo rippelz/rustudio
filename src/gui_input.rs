@@ -6,7 +6,7 @@ use egui::epaint::{TessellationOptions, Tessellator};
 use egui::Shape;
 use glam::Mat3;
 
-use super::walk::{Aff, Down, Walk};
+use super::walk::{padded, Aff, Down, Walk};
 use super::*;
 use crate::math::Xform;
 use crate::mech;
@@ -495,9 +495,9 @@ impl Gui {
                 }
                 match class.as_str() {
                     "ScreenGui" => {
-                        // IgnoreGuiInset, or ScreenInsets None / DeviceSafeInsets: the whole view.
-                        let ignore = boolp(d, g, "IgnoreGuiInset", false)
-                            || matches!(enum_u32(d.prop(g, "ScreenInsets")), Some(0) | Some(1));
+                        // ScreenInsets None / DeviceSafeInsets (IgnoreGuiInset, which
+                        // doc.rs derives from it both ways): the whole view.
+                        let ignore = matches!(enum_u32(d.prop(g, "ScreenInsets")), Some(0) | Some(1));
                         let inset = if ignore { 0.0 } else { mech::GUI_TOP_INSET };
                         roots.push(Root {
                             on_top: true,
@@ -791,15 +791,19 @@ impl Gui {
                         rec: Vec::new(),
                         replaying: 0,
                     };
+                    // A UIScale under the GUI itself scales offsets and text, not
+                    // the canvas (Studio: RoundResultsGui at 1.5 keeps its
+                    // full-screen Background, labels 1.5x, still centred).
+                    let root_scale = root_ui_scale(d, g);
                     w.children(
                         g,
-                        canvas_rect,
+                        padded(d, g, canvas_rect, root_scale),
                         Down {
                             aff: Aff::ID,
                             clip,
                             alpha: 1.0,
                             tint: [1.0, 1.0, 1.0],
-                            scale: 1.0,
+                            scale: root_scale,
                             z: 0,
                         },
                     );
@@ -830,7 +834,7 @@ impl Gui {
                             rec: Vec::new(),
                             replaying: 0,
                         };
-                        w.children(g, canvas_rect, Down { aff: Aff::ID, clip, alpha: 1.0, tint: [1.0, 1.0, 1.0], scale: 1.0, z: 0 });
+                        w.children(g, padded(d, g, canvas_rect, root_ui_scale(d, g)), Down { aff: Aff::ID, clip, alpha: 1.0, tint: [1.0, 1.0, 1.0], scale: root_ui_scale(d, g), z: 0 });
                         let (items2, hits2, boxes2) = (std::mem::take(&mut w.items), std::mem::take(&mut w.hits), std::mem::take(&mut w.boxes));
                         self.memo_off = false;
                         self.no_cache = saved.0;
@@ -1701,4 +1705,9 @@ pub(crate) fn scene_light(d: &Document, normal: Option<Vec3>) -> f32 {
         0.0
     };
     (ambient + sun_light).max(0.0)
+}
+
+/// The Scale of a UIScale directly under a LayerCollector (1 without one).
+fn root_ui_scale(d: &Document, g: Ref) -> f32 {
+    child_of_class(d, g, "UIScale").map_or(1.0, |s| num(d, s, "Scale", 1.0))
 }

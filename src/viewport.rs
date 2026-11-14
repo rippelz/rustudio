@@ -377,8 +377,21 @@ impl Editor {
         }
         // Roblox reports mouse motion deltas only while the cursor is locked;
         // otherwise InputChanged carries the new position with a zero Delta.
-        let d = if grabbed {
-            raw_mouse_delta(ctx).unwrap_or(pointer_delta)
+        // (Without raw motion, egui's pointer delta stands in, but only for
+        // frames where the pointer really moved: a button press alone can
+        // carry the first known position, which would read as one huge
+        // flick and throw a first-person camera at the floor.)
+        let pointer_moved = ctx.input(|i| {
+            i.raw.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_)))
+        });
+        // The frame the grab begins carries the pointer's travel into the
+        // view (or, with no position known before, its whole position): no
+        // look motion from that either.
+        let first = self.game_grab.as_ref().is_some_and(|g| g.frames <= 1);
+        let d = if grabbed && first {
+            Vec2::ZERO
+        } else if grabbed {
+            raw_mouse_delta(ctx).unwrap_or(if pointer_moved { pointer_delta } else { Vec2::ZERO })
         } else {
             Vec2::ZERO
         };
@@ -473,7 +486,7 @@ impl Editor {
         use crate::assets::{clothing_role, composite_over, template_box, ClothingLayer};
         use crate::render::{PartDraw, TexMode};
         let changes = self.scene.take_changes();
-        if changes.full || !changes.changed.is_empty() || !changes.removed.is_empty() {
+        if changes.full || !changes.changed.is_empty() || !changes.removed.is_empty() || !changes.restyled.is_empty() {
             self.lighting.lightgrid_dirty = true;
             self.lighting.lightocc_dirty = true;
         } else if !changes.moved.is_empty() {
@@ -490,6 +503,7 @@ impl Editor {
             && changes.changed.is_empty()
             && changes.removed.is_empty()
             && changes.moved.is_empty()
+            && changes.restyled.is_empty()
             && !regen
         {
             return;
@@ -556,13 +570,56 @@ impl Editor {
             draw_cache.xf.insert(*r, sp.xf);
             renderer.set_item(*r, moved);
         }
+        // Restyled parts (Transparency, Color, Reflectance, CastShadow):
+        // their one draw is patched in place, as Studio updates a part's
+        // instance data; anything more involved is resolved again below.
+        let mut restyle_full = Vec::new();
+        if !changes.full {
+            let _s = crate::bench::scope("sd_restyle");
+            for r in &changes.restyled {
+                let patched = match (scene.get(*r), draw_cache.style.get(r), renderer.item_draws(*r)) {
+                    (Some(sp), Some(&(mul, alpha_forced)), Some([old])) => {
+                        let mut d = *old;
+                        d.color = [0, 1, 2].map(|c| sp.draw.color[c] * mul[c]);
+                        if !alpha_forced {
+                            d.alpha = sp.draw.alpha;
+                        }
+                        d.reflectance = sp.draw.reflectance;
+                        d.cast_shadow = sp.draw.cast_shadow;
+                        Some(d)
+                    }
+                    _ => None,
+                };
+                match patched {
+                    Some(d) => renderer.set_item(*r, vec![d]),
+                    None => restyle_full.push(*r),
+                }
+            }
+        }
         let mut todo: Vec<Ref> = if changes.full {
             scene.parts.iter().map(|p| p.r).collect()
         } else {
             changes.changed
         };
+        todo.extend(restyle_full);
         if regen {
-            todo.extend(draw_cache.waiting.drain());
+            // A part waiting only on textures is redone when one of them can
+            // get further (downloaded, decoded or failed), not each time any
+            // asset arrives: Place B's first minute re-resolved ~150 parts a
+            // frame that way while its textures streamed in.
+            let ready: Vec<Ref> = draw_cache
+                .waiting
+                .iter()
+                .copied()
+                .filter(|r| match draw_cache.wait_tex.get(r) {
+                    Some(ids) => ids.iter().any(|id| textures.can_progress(id, assets)),
+                    None => true,
+                })
+                .collect();
+            for r in &ready {
+                draw_cache.waiting.remove(r);
+            }
+            todo.extend(ready);
         }
         let mut seen = std::collections::HashSet::new();
         todo.retain(|r| seen.insert(*r));
@@ -576,12 +633,21 @@ impl Editor {
             let mut d = sp.draw;
             let mut extra = Vec::new();
             let mut waiting = false;
+            // How the drawn colour relates to the part's (material packs
+            // divide out their fallback albedo) and whether its opacity is
+            // the part's own: what a restyle patches with.
+            let mut color_mul = [1.0f32; 3];
+            let mut alpha_forced = false;
+            // Textures still on their way (the part is redone when one can
+            // get further); `waiting` is for everything else.
+            let mut tex_wait: Vec<String> = Vec::new();
             // A file mesh with no mesh id (an empty SpecialMesh FileMesh or
             // MeshPart): nothing to draw, as in Studio (Place B's striped
             // ground cover, round 23).
             if d.placeholder && sp.mesh_asset.is_none() {
                 d.alpha = 0.0;
                 d.placeholder = false;
+                alpha_forced = true;
             }
             if let Some(asset) = &sp.mesh_asset {
                 waiting = true;
@@ -640,6 +706,7 @@ impl Editor {
                     }
                     d.alpha = 0.0;
                     d.placeholder = false;
+                    alpha_forced = true;
                 }
             }
             let sd_tex = crate::bench::scope("sd_texture");
@@ -659,7 +726,7 @@ impl Editor {
                                     renderer.add_texture(&device, &queue, img.width, img.height, &img.pixels)
                                 })));
                             }
-                            waiting |= ids.iter().zip(&maps).any(|(id, im)| id.is_some() && im.is_none());
+                            waiting |= ids.iter().zip(&maps).any(|(id, im)| id.as_ref().is_some_and(|id| !textures.failed(id)) && im.is_none());
                             let key = format!("surface|{tid}|{ids:?}");
                             let (w, h) = (t.image.width.max(2), t.image.height.max(2));
                             if !waiting {
@@ -717,11 +784,19 @@ impl Editor {
                                         d.emissive = *strength;
                                     }
                                 }
-                                None => waiting = true,
+                                None => {
+                                    if !textures.failed(mask_id) {
+                                        tex_wait.push(mask_id.clone());
+                                    }
+                                }
                             }
                         }
                     }
-                    None => waiting = true,
+                    None => {
+                        if !textures.failed(tid) {
+                            tex_wait.push(tid.clone());
+                        }
+                    }
                 }
             }
             drop(sd_tex);
@@ -737,7 +812,30 @@ impl Editor {
                         renderer.add_mesh(&device, &p, &n, &u)
                     });
                     let mut mesh = (!has_mesh).then_some(box_mesh);
-                    if let (true, Some(asset)) = (has_mesh, &sp.mesh_asset) {
+                    // R15 body MeshParts: their own UVs into their cell of
+                    // the composited atlas (assets::r15_composite), as Studio.
+                    let r15 = sp.r15_look.filter(|_| has_mesh);
+                    if let (Some(_), Some(asset)) = (r15, &sp.mesh_asset) {
+                        let key = format!("r15-clothing|{name}|{}", asset.id);
+                        mesh = match clothing_meshes.get(&key) {
+                            Some(i) => Some(*i),
+                            None => match assets.content(&asset.id, dir) {
+                                crate::assets::Fetch::Ready(bytes) => {
+                                    let made = crate::assets::mesh_for_upload(&bytes).and_then(|(p, n, uv)| {
+                                        let uv = crate::assets::r15_atlas_uvs(name, &uv)?;
+                                        Some(renderer.add_mesh(&device, &p, &n, &uv))
+                                    });
+                                    let i = made.unwrap_or(box_mesh);
+                                    clothing_meshes.insert(key, i);
+                                    Some(i)
+                                }
+                                _ => {
+                                    waiting = true;
+                                    None
+                                }
+                            },
+                        };
+                    } else if let (true, Some(asset)) = (has_mesh, &sp.mesh_asset) {
                         let key = format!("body-clothing|{name}|{}", asset.id);
                         mesh = match clothing_meshes.get(&key) {
                             Some(i) => Some(*i),
@@ -768,7 +866,19 @@ impl Editor {
                         })
                     };
                     let (s, p) = (img(shirt), img(pants));
-                    let tex = match role.layer {
+                    let r15_tex = r15.and_then(|look| {
+                        // Both images settled (loaded, or absent) first.
+                        if (shirt.is_some() && s.is_none()) || (pants.is_some() && p.is_none()) {
+                            return None;
+                        }
+                        let key = format!("r15|{shirt:?}|{pants:?}|{}", look.key());
+                        textures.composite(
+                            &key,
+                            || crate::assets::r15_composite(&look, s.as_ref().map(|t| &*t.image), p.as_ref().map(|t| &*t.image)),
+                            &mut |im| renderer.add_texture(&device, &queue, im.width, im.height, &im.pixels),
+                        )
+                    });
+                    let tex = if r15.is_some() { r15_tex } else { match role.layer {
                         ClothingLayer::Shirt => s.as_ref().map(|t| t.index),
                         ClothingLayer::Pants => p.as_ref().map(|t| t.index),
                         ClothingLayer::Torso => {
@@ -788,7 +898,7 @@ impl Editor {
                                 },
                             )
                         }
-                    };
+                    } };
                     if tex.is_none() {
                         waiting = true;
                     }
@@ -802,11 +912,49 @@ impl Editor {
                     }
                 }
             }
+            // A MeshPart draws single-sided unless DoubleSided, as Studio:
+            // the Moon Phases Waist Display's inverted-hull outline shells
+            // show in Studio only as dark rims around their spheres.
+            // File meshes (MeshPart, SpecialMesh FileMesh) draw single-sided,
+            // as Studio, unless a MeshPart is DoubleSided: the Moon Phases
+            // Waist Display's inverted-hull outline shells show in Studio only
+            // as dark rims around their spheres. CSG keeps two-sided.
+            if let (Some(i), Some(_)) = (d.custom_mesh, &sp.mesh_asset) {
+                let class = self.doc.class_of(sp.r);
+                let csg = class.as_ref().is_some_and(|c| matches!(c.as_str(), "UnionOperation" | "NegateOperation" | "IntersectOperation"));
+                if !csg {
+                    let double = class.as_ref().is_some_and(|c| c == "MeshPart")
+                        && matches!(self.doc.prop(sp.r, "DoubleSided"), Some(rbx_dom_weak::types::Variant::Bool(true)));
+                    renderer.set_mesh_cull(i, !double);
+                }
+            }
+            // A MaterialVariant draws through the part material shader, like
+            // Studio (per-face UVs, slopes included; normal / roughness /
+            // metalness maps). Its six ColorMap decals stay only as the
+            // fallback when the pack can't be built.
+            let variant_maps = match sp.variant_pack {
+                Some((pack, _)) if d.texture.is_none() && !d.placeholder && d.material < 0.5 => {
+                    match crate::matpack::pack_maps(pack, 0xffff_ffff) {
+                        crate::matpack::Lookup::Ready(m) => Some(Some(m)),
+                        crate::matpack::Lookup::Pending => {
+                            waiting = true;
+                            Some(None)
+                        }
+                        crate::matpack::Lookup::Unavailable(_) => None,
+                    }
+                }
+                _ => None,
+            };
             for dec in &sp.decals {
+                if dec.base_surface && variant_maps.is_some() {
+                    continue;
+                }
                 let Some(t) = textures.image(&dec.id, dir, assets, &mut |img| {
                     renderer.add_texture(&device, &queue, img.width, img.height, &img.pixels)
                 }) else {
-                    waiting = true;
+                    if !textures.failed(&dec.id) {
+                        tex_wait.push(dec.id.clone());
+                    }
                     continue;
                 };
                 let (axis, sign) = match dec.face {
@@ -818,50 +966,90 @@ impl Editor {
                     _ => (2, -1.0),
                 };
                 // Project onto the actual front-facing mesh triangles rather than
-                // drawing a closed slab in front of the head.
-                if dec.tiling.is_none() {
-                    if let Some(asset) = &sp.mesh_asset {
-                        if let Some(tris) = crate::assets::mesh_triangles(&asset.id) {
-                            let key = format!("decal-projection|{}|{}", asset.id, dec.face);
-                            let index = *clothing_meshes.entry(key).or_insert_with(|| {
-                                let mut positions = Vec::new();
-                                let mut normals = Vec::new();
-                                let mut uvs = Vec::new();
-                                for tri in tris.iter() {
-                                    let normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
-                                    if normal[axis] * sign <= 0.01 { continue; }
-                                    for v in tri {
-                                        positions.push(*v + normal * 0.0005);
-                                        normals.push(normal);
-                                        let uv = match dec.face {
-                                            0 => glam::Vec2::new(0.5 - v.z, 0.5 - v.y),
-                                            1 => glam::Vec2::new(v.x + 0.5, v.z + 0.5),
-                                            2 => glam::Vec2::new(0.5 - v.x, 0.5 - v.y),
-                                            3 => glam::Vec2::new(v.z + 0.5, 0.5 - v.y),
-                                            4 => glam::Vec2::new(v.x + 0.5, 0.5 - v.z),
-                                            _ => glam::Vec2::new(v.x + 0.5, 0.5 - v.y),
-                                        };
-                                        uvs.push(uv);
+                // drawing a closed slab in front of the head. Built-in wedges
+                // too: Studio clips a wedge's Front / Top Texture to its slope
+                // and a Right / Left one to the triangle (Pirate Island's bow).
+                let shape = (sp.mesh_asset.is_none() && d.custom_mesh.is_none())
+                    .then(|| crate::render::shape_triangles(sp.draw.mesh).map(|t| (format!("{:?}", sp.draw.mesh), std::sync::Arc::new(t))))
+                    .flatten();
+                let is_shape = shape.is_some();
+                let tris = shape.or_else(|| {
+                    dec.tiling.is_none().then(|| {
+                        sp.mesh_asset.as_ref().and_then(|a| crate::assets::mesh_triangles(&a.id).map(|t| (a.id.clone(), t)))
+                    }).flatten()
+                });
+                if let Some((source, tris)) = tris {
+                    let key = format!("decal-projection|{}|{}", source, dec.face);
+                    let index = *clothing_meshes.entry(key).or_insert_with(|| {
+                        let mut positions = Vec::new();
+                        let mut normals = Vec::new();
+                        let mut uvs = Vec::new();
+                        for tri in tris.iter() {
+                            let normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
+                            if normal[axis] * sign <= 0.01 { continue; }
+                            for v in tri {
+                                positions.push(*v + normal * 0.0005);
+                                normals.push(normal);
+                                // A wedge's slope takes its Front or Top image in
+                                // its own frame, the same for both (measured against
+                                // Studio with a Texture on each face of a WedgePart).
+                                let slope = is_shape && normal.y > 0.01 && normal.z < -0.01;
+                                let uv = if slope {
+                                    glam::Vec2::new(0.5 - v.x, 0.5 - v.z)
+                                } else {
+                                    match dec.face {
+                                        0 => glam::Vec2::new(0.5 - v.z, 0.5 - v.y),
+                                        1 => glam::Vec2::new(v.x + 0.5, v.z + 0.5),
+                                        2 => glam::Vec2::new(0.5 - v.x, 0.5 - v.y),
+                                        3 => glam::Vec2::new(v.z + 0.5, 0.5 - v.y),
+                                        4 => glam::Vec2::new(v.x + 0.5, 0.5 - v.z),
+                                        _ => glam::Vec2::new(v.x + 0.5, 0.5 - v.y),
                                     }
-                                }
-                                renderer.add_mesh(&device, &positions, &normals, &uvs)
-                            });
-                            extra.push(PartDraw {
-                                custom_mesh: Some(index), texture: Some(t.index),
-                                tex_mode: TexMode::Decal, color: dec.color,
-                                alpha: ((1.0 - dec.transparency) * if dec.base_surface { d.alpha } else { 1.0 }).min(0.998),
-                                material: 0.0, material_id: 256, mat_layer: -1,
-                                surfaces: 0, cast_shadow: false, uvt: PartDraw::NO_UVT,
-                                emissive: [0.0; 3], reflectance: 0.0,
-                                ..d
-                            });
-                            continue;
+                                };
+                                uvs.push(uv);
+                            }
                         }
-                    }
+                        renderer.add_mesh(&device, &positions, &normals, &uvs)
+                    });
+                    let s = sp.decal_size;
+                    let (w, h) = match axis {
+                        0 => (s.z, s.y),
+                        1 => (s.x, s.z),
+                        _ => (s.x, s.y),
+                    };
+                    let uvt = match dec.tiling {
+                        // Offsets wrapped into one tile: a negative uvt.w means
+                        // mesh-projected UVs to the shader (part_out).
+                        Some([su, sv, ou, ov]) => [w / su.max(0.01), h / sv.max(0.01), (ou / su.max(0.01)).rem_euclid(1.0), (ov / sv.max(0.01)).rem_euclid(1.0)],
+                        None => PartDraw::NO_UVT,
+                    };
+                    extra.push(PartDraw {
+                        custom_mesh: Some(index), texture: Some(t.index),
+                        tex_mode: TexMode::Decal, color: dec.color,
+                        alpha: ((1.0 - dec.transparency) * if dec.base_surface { d.alpha } else { 1.0 }).clamp(0.0, 1.0),
+                        material: 0.0, material_id: 256, mat_layer: -1,
+                        surfaces: 0, cast_shadow: false, uvt,
+                        emissive: [0.0; 3], reflectance: 0.0,
+                        ..d
+                    });
+                    continue;
                 }
-                let s = sp.decal_size;
+                let mut s = sp.decal_size;
                 let mut n = Vec3::ZERO;
                 n[axis] = sign;
+                // The plane floats DECAL_LIFT off its face, so at an outside
+                // edge two Textures' planes leave a sliver where the part's
+                // own colour shows (Pirate Island's hull: white seams on parts
+                // Color 248,248,248). Studio draws Textures on the face itself:
+                // widen a Texture's plane by the lift so neighbours meet at
+                // the corner, keeping its tiling where it was.
+                const DECAL_LIFT: f32 = 0.012;
+                let grow = if dec.tiling.is_some() { DECAL_LIFT } else { 0.0 };
+                for k in 0..3 {
+                    if k != axis {
+                        s[k] += 2.0 * grow;
+                    }
+                }
                 let (w, h) = match axis {
                     0 => (s.z, s.y),
                     1 => (s.x, s.z),
@@ -871,8 +1059,11 @@ impl Editor {
                     Some([su, sv, ou, ov]) => [
                         w / su.max(0.01),
                         h / sv.max(0.01),
-                        ou / su.max(0.01),
-                        ov / sv.max(0.01),
+                        // Wrapped into one tile (the image repeats): a negative
+                        // uvt.w tells the shader to project mesh UVs instead
+                        // (part_out), which squeezed the bow rail's planks.
+                        ((ou - grow) / su.max(0.01)).rem_euclid(1.0),
+                        ((ov - grow) / sv.max(0.01)).rem_euclid(1.0),
                     ],
                     None => PartDraw::NO_UVT,
                 };
@@ -897,12 +1088,12 @@ impl Editor {
                 let xf = sp.xf;
                 extra.push(PartDraw {
                     xf: Xform {
-                        pos: xf.pos + xf.rot * (n * (s[axis] * 0.5 + 0.012)),
+                        pos: xf.pos + xf.rot * (sp.decal_offset + n * (s[axis] * 0.5 + DECAL_LIFT)),
                         rot: xf.rot,
                     },
                     size: s,
                     color: dec.color,
-                    alpha: ((1.0 - dec.transparency) * if dec.base_surface { sp.draw.alpha } else { 1.0 }).min(0.998),
+                    alpha: ((1.0 - dec.transparency) * if dec.base_surface { sp.draw.alpha } else { 1.0 }).clamp(0.0, 1.0),
                     mesh: crate::render::MeshKind::Block,
                     material: 0.0,
                     placeholder: false,
@@ -989,7 +1180,7 @@ impl Editor {
                                         g.texture = Some(t.index);
                                         g.tex_mode = hsp.tex_kind;
                                     }
-                                    None => waiting = true,
+                                    None => waiting |= !textures.failed(tid),
                                 }
                             }
                             extra.push(g);
@@ -1006,6 +1197,32 @@ impl Editor {
                     crate::wrap::Lookup::None => {}
                 }
             }
+            if let (Some(Some(m)), Some((_, studs))) = (&variant_maps, sp.variant_pack) {
+                d.mat_layer = renderer.material_layer(&device, &queue, m);
+                // The variant's ColorMap × Color (the table albedo is not applied).
+                let fb = crate::matpack::fallback_albedo(d.material_id, use2022);
+                for c in 0..3 {
+                    if fb[c] > 0.0 {
+                        d.color[c] /= fb[c];
+                        color_mul[c] /= fb[c];
+                    }
+                }
+                d.tex_albedo = 1.0;
+                // Studio: a variant's uv scale is 1 / StudsPerTile on
+                // every shape; render.rs leaves its uvOffset at zero.
+                let k = 1.0 / studs.max(0.01);
+                let union_projection = self.doc.class_of(sp.r).is_some_and(|c|
+                    matches!(c.as_str(), "UnionOperation" | "NegateOperation" | "PartOperation"));
+                let meshpart_projection = d.custom_mesh.is_some() && self.doc.class_of(sp.r).is_some_and(|c| c == "MeshPart");
+                let union_authored = union_projection && match self.doc.prop(sp.r, "InitialSize") {
+                    Some(rbx_dom_weak::types::Variant::Vector3(v)) =>
+                        d.size == glam::Vec3::new(v.x, v.y, v.z),
+                    _ => false,
+                };
+                d.uvt = [k, k, 0.0, if union_authored { -3.0 } else if meshpart_projection { -2.0 } else if union_projection { -1.0 } else { 0.0 }];
+                // Plain Tiled shader, textureTiling 1, no detail pack or detiling.
+                renderer.set_material_params(&queue, d.mat_layer, [[-1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 0.0]]);
+            }
             // Material texture packs (matpack.rs) on untextured parts.
             if d.texture.is_none() && !d.placeholder && !sp.variant && d.material < 0.5 {
                 if let Some(e) = crate::matpack::entry(d.material_id, use2022) {
@@ -1017,14 +1234,23 @@ impl Editor {
                             for c in 0..3 {
                                 if fb[c] > 0.0 {
                                     d.color[c] /= fb[c];
+                                    color_mul[c] /= fb[c];
                                 }
                             }
                             d.tex_albedo = 1.0;
                             // Box faces: one repeat per the material's studs
                             // per tile (Studio's uvScale). Untextured MeshParts use studs too.
                             let c = crate::matpack::consts(d.material_id, use2022);
-                            let union_projection = sp.mesh_asset.as_ref().is_some_and(|a| a.id.starts_with("rbxtemp://rustudio/union/"));
+                            let union_projection = self.doc.class_of(sp.r).is_some_and(|c|
+                                matches!(c.as_str(), "UnionOperation" | "NegateOperation" | "PartOperation"));
                             let meshpart_projection = d.custom_mesh.is_some() && self.doc.class_of(sp.r).is_some_and(|c| c == "MeshPart");
+                            // Studio only regenerates CSG UVs when Size
+                            // differs from InitialSize; unchanged unions retain authored UVs.
+                            let union_authored = union_projection && match self.doc.prop(sp.r, "InitialSize") {
+                                Some(rbx_dom_weak::types::Variant::Vector3(v)) =>
+                                    d.size == glam::Vec3::new(v.x, v.y, v.z),
+                                _ => false,
+                            };
                             let stud_projection = union_projection || meshpart_projection;
                             let k = if d.custom_mesh.is_some() && !stud_projection {
                                 m.tiling
@@ -1032,7 +1258,7 @@ impl Editor {
                                 m.tiling / c[5]
                             };
                             // Negative w selects shared mesh stud-space projection in the vertex shader.
-                            d.uvt = [k, k, 0.0, if meshpart_projection { -2.0 } else if union_projection { -1.0 } else { 0.0 }];
+                            d.uvt = [k, k, 0.0, if union_authored { -3.0 } else if meshpart_projection { -2.0 } else if union_projection { -1.0 } else { 0.0 }];
                             if meshpart_projection && std::env::var_os("RUSTUDIO_MESH_DENSITY_TRACE").is_some() {
                                 static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
                                 if SEEN.get_or_init(Default::default).lock().unwrap().insert(format!("{:?}", sp.r)) {
@@ -1077,7 +1303,18 @@ impl Editor {
                 extra.len() as u32,
                 (sp.clothing.is_some() && d.texture.is_some()) as u32,
             ];
-            draw_cache.set(r, sp.xf, flags, waiting);
+            draw_cache.set(r, sp.xf, flags, waiting || !tex_wait.is_empty());
+            let tex_only = !waiting && !tex_wait.is_empty();
+            if tex_only {
+                draw_cache.wait_tex.insert(r, tex_wait);
+            } else {
+                draw_cache.wait_tex.remove(&r);
+            }
+            if extra.is_empty() && !waiting && !tex_only && sp.clothing.is_none() {
+                draw_cache.style.insert(r, (color_mul, alpha_forced));
+            } else {
+                draw_cache.style.remove(&r);
+            }
             let mut all = Vec::with_capacity(1 + extra.len());
             all.push(d);
             all.extend(extra);
@@ -1200,21 +1437,40 @@ impl Editor {
                 if m.indices.is_empty() {
                     continue;
                 }
+                // Studio draws the water where its rays meet it, half a voxel
+                // under the surface-nets mesh (WATER_RAY_DROP): plates at
+                // 14.25 / 14.75 by Pirate Island's dock (water voxel 62 %
+                // full, mesh at 16.48) sit under / over Studio's water, and
+                // its dock (15.5–16.5) stays dry.
+                let drop = Vec3::Y * crate::terrain::WATER_RAY_DROP;
+                let m_pos: Vec<Vec3> = m.positions.iter().map(|p| Vec3::from(*p) - drop).collect();
                 // Fit the mesh into the unit box the renderer instances.
                 let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-                for p in &m.positions {
-                    lo = lo.min(Vec3::from(*p));
-                    hi = hi.max(Vec3::from(*p));
+                for p in &m_pos {
+                    lo = lo.min(*p);
+                    hi = hi.max(*p);
                 }
                 let center = (lo + hi) * 0.5;
                 let extent = (hi - lo).max(Vec3::splat(0.01));
                 let mut pos = Vec::with_capacity(m.indices.len());
                 let mut nrm = Vec::with_capacity(m.indices.len());
                 for i in &m.indices {
-                    pos.push((Vec3::from(m.positions[*i as usize]) - center) / extent);
+                    pos.push((m_pos[*i as usize] - center) / extent);
                     nrm.push(Vec3::from(m.normals[*i as usize]) * extent);
                 }
-                let uvs = vec![glam::Vec2::ZERO; pos.len()];
+                // Per triangle: its three corners' random bytes and which
+                // corner each vertex is, packed into the UVs (fs_water:
+                // x = 4·(r0 + 256·r1) + [corner 0], y = 4·r2 + [corner 1];
+                // the interpolated fractions are the barycentric weights).
+                let uvs: Vec<glam::Vec2> = m
+                    .indices
+                    .chunks_exact(3)
+                    .flat_map(|t| {
+                        let r = [t[0], t[1], t[2]].map(|i| m.rand.get(i as usize).copied().unwrap_or(0) as f32);
+                        let base = glam::Vec2::new(4.0 * (r[0] + 256.0 * r[1]), 4.0 * r[2]);
+                        [base + glam::Vec2::X, base + glam::Vec2::Y, base]
+                    })
+                    .collect();
                 let mesh = renderer.add_mesh(&device, &pos, &nrm, &uvs);
                 let rgb = water_rgb;
                 draws.push(crate::render::PartDraw {
@@ -1279,12 +1535,18 @@ impl Editor {
             Some(Variant::Float32(f)) => f,
             _ => mech::GRASS_LENGTH_DEFAULT,
         };
+        // Explicit generation-job diagnostics, matching the native injected
+        // job boundary. These do not imply a public Terrain property route.
+        let length = std::env::var("RUSTUDIO_GRASS_JOB_LENGTH").ok()
+            .and_then(|s| s.parse::<f32>().ok()).filter(|v| v.is_finite()).unwrap_or(length);
+        let density = std::env::var("RUSTUDIO_GRASS_JOB_DENSITY").ok()
+            .and_then(|s| s.parse::<f32>().ok()).filter(|v| v.is_finite()).unwrap_or(1.0).clamp(0.0, 1.0);
         let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref())
         else {
             return;
         };
         let device = rs.device.clone();
-        if !on || (length - self.terrain_grass_length).abs() > 1e-4 {
+        if !on || length.to_bits() != self.terrain_grass_length.to_bits() {
             for k in self.terrain_grass_built.drain() {
                 renderer.set_terrain_grass(&device, k, &[]);
             }
@@ -1302,25 +1564,25 @@ impl Editor {
         let far: Vec<[i32; 3]> = self
             .terrain_grass_built
             .iter()
-            .filter(|k| !near(k, mech::GRASS_RADIUS * 1.25))
+            .filter(|k| !near(k, mech::GRASS_EVICTION_RADIUS))
             .copied()
             .collect();
         for k in far {
             self.terrain_grass_built.remove(&k);
             renderer.set_terrain_grass(&device, k, &[]);
         }
-        let next = self
+        let mut pending: Vec<_> = self
             .terrain_grass_chunks
             .iter()
             .filter(|k| !self.terrain_grass_built.contains(*k) && near(k, mech::GRASS_RADIUS))
-            .min_by_key(|k| {
-                let c = Vec3::new(k[0] as f32 + 0.5, k[1] as f32 + 0.5, k[2] as f32 + 0.5) * chunk;
-                (c - self.cam.pos).length() as i64
-            })
-            .copied();
-        if let Some(k) = next {
-            let blades = crate::terrain::grass_blades(voxels, k, length);
-            renderer.set_terrain_grass(&device, k, &blades);
+            .copied()
+            .collect();
+        // Complete the visible working set before drawing this camera. Building
+        // one chunk per frame leaves holes after a teleport or a length edit.
+        pending.sort_unstable();
+        for k in pending {
+            let blades = crate::terrain::grass_geometry_density(voxels, k, length, density);
+            renderer.set_terrain_grass_geometry(&device, k, blades);
             self.terrain_grass_built.insert(k);
         }
     }
@@ -1341,6 +1603,7 @@ impl Editor {
             Some(Variant::BinaryString(b)) if AsRef::<[u8]>::as_ref(&b).len() >= 69 => {
                 Some(AsRef::<[u8]>::as_ref(&b).to_vec())
             }
+            Some(Variant::MaterialColors(c)) => Some(c.encode()),
             _ => None,
         };
         let use2022 = scene::use_2022_materials(&self.doc);
@@ -1371,12 +1634,19 @@ impl Editor {
             for face in 0..3u8 {
                 let i = crate::terrain::palette(m, face) as usize * 4;
                 let mut layer = -1.0f32;
-                let tex = crate::terrain_mat::terrain_override(&self.doc, m, use2022)
-                    .or_else(|| t.faces[face as usize].clone()).unwrap_or_default();
+                // A MaterialService override's loaded ColorMap: its mean is
+                // the decoration grass blade base (matpack::mean_albedo).
+                let mut blade_base = None;
+                let ovr = crate::terrain_mat::terrain_override(&self.doc, m, use2022);
+                let is_override = ovr.is_some();
+                let tex = ovr.or_else(|| t.faces[face as usize].clone()).unwrap_or_default();
                 if self.terrain_present[m as usize] && tex.pack != 0 {
                     match crate::matpack::terrain_pack_maps(tex.pack, 0xff80_8080) {
                         crate::matpack::Lookup::Ready(maps) => {
                             layer = renderer.material_layer(&device, &queue, &maps) as f32;
+                            if is_override {
+                                blade_base = Some(crate::matpack::mean_albedo(&maps));
+                            }
                         }
                         crate::matpack::Lookup::Pending => waiting = true,
                         crate::matpack::Lookup::Unavailable(_) => {}
@@ -1395,9 +1665,17 @@ impl Editor {
                     .flatten();
                 let avg = if m >= 2 { unit(fallback.unwrap_or(t.avg_albedo)) } else { unit(rgb) };
                 params[i + 3] = [avg[0], avg[1], avg[2], 0.0];
+                if let Some(b) = blade_base {
+                    // Row 3 .w = 1: the shader's tint-form blades use .rgb as
+                    // their base instead of the built-in 2022 Grass base.
+                    params[i + 3] = [b[0], b[1], b[2], 1.0];
+                }
                 crate::terrain_mat::set_emissive(&mut params, i, m);
                 crate::terrain_mat::set_override_tint(&mut params, i, &self.doc, m, use2022, rgb);
             }
+        }
+        if std::env::var_os("RUSTUDIO_PALETTE_DEBUG").is_some() {
+            eprintln!("GRASS_PALETTE| modern={use2022} rows={:?}", &params[24..28]);
         }
         renderer.set_terrain_params(&queue, &params);
         self.terrain_params_dirty = waiting;
@@ -1408,6 +1686,7 @@ impl Editor {
     pub fn pick(&self, rect: Rect, p: Pos2, raw: bool) -> Option<Ref> {
         let ray = self.cam.ray(rect, p);
         let mut best: Option<(f32, Ref)> = None;
+        let mut invisible_host: Option<(f32, Ref)> = None;
         for (sp, b) in self.scene.parts.iter().zip(&self.scene.bounds) {
             // Cheap bounding-sphere test first.
             let oc = b.truncate() - ray.origin;
@@ -1415,16 +1694,25 @@ impl Editor {
             if oc.length_squared() - along * along > b.w * b.w || along < -b.w {
                 continue;
             }
-            if sp.draw.alpha < 0.02 || sp.locked {
+            if sp.locked {
                 continue;
             }
             if let Some(t) = ray.hit_obb(&sp.xf, sp.size) {
-                if best.is_none_or(|(bt, _)| t < bt) {
-                    best = Some((t, sp.r));
+                // Invisible FX volumes are editor targets, independent of physics.
+                // Prefer ordinary visible geometry so a large volume cannot
+                // intercept every click on the scene inside it.
+                let target = if sp.draw.alpha < 0.02 {
+                    if !crate::effects::is_emitter_host(&self.doc, sp.r) { continue; }
+                    &mut invisible_host
+                } else {
+                    &mut best
+                };
+                if target.is_none_or(|(bt, _)| t < bt) {
+                    *target = Some((t, sp.r));
                 }
             }
         }
-        let r = best?.1;
+        let r = best.or(invisible_host)?.1;
         Some(if raw { r } else { self.selection_target(r) })
     }
 
@@ -1703,9 +1991,15 @@ impl Editor {
     pub fn viewport_ui(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         self.viewport_rect = rect;
-        let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+        crate::grass_temporal::tick(&mut self.cam, ui.ctx());
+        let selector = Self::view_selector_rect(rect);
+        let over_selector = !self.is_playing() && ui.input(|i| i.pointer.hover_pos().is_some_and(|p| selector.contains(p)));
+        let resp = ui.allocate_rect(rect, if over_selector { Sense::hover() } else { Sense::click_and_drag() });
         let ctx = ui.ctx().clone();
+        let context_menu_open = resp.context_menu_opened();
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
+
+        if !self.is_playing() && self.cam.advance_view(dt) { ctx.request_repaint(); }
 
         // ---------------------------------------------------------- camera
         let (scroll, alt, ctrl, shift, delta) = ctx.input(|i| {
@@ -1741,7 +2035,7 @@ impl Editor {
         }
         if driving {
             self.update_game_mouse(&ctx, &resp, delta, notches);
-        } else if resp.hovered() && notches != 0.0 {
+        } else if !context_menu_open && !over_selector && resp.hovered() && notches != 0.0 {
             if let Some(p) = resp.hover_pos() {
                 let ray = self.cam.ray(rect, p);
                 let hit = self.ray_distance(&ray);
@@ -1749,7 +2043,7 @@ impl Editor {
                 self.last_zoom = Some((ray.dir, hit));
             }
         }
-        if !driving {
+        if !driving && !over_selector {
             let look = self.update_look_grab(&ctx, &resp, delta);
             if let Some(d) = look {
                 self.cam.rotate(d.x, d.y);
@@ -1765,6 +2059,7 @@ impl Editor {
         // while a text field or the script editor has the keyboard, a game
         // TextBox is focused, the game has the input (Play), or Ctrl is held.
         let keyboard_ok = !driving
+            && !context_menu_open
             && !ctx.egui_wants_keyboard_input()
             && self.gui.focus.is_none()
             && self.ui.insert_popup.is_none()
@@ -1831,6 +2126,7 @@ impl Editor {
             && self.drag.is_none()
             && self.marquee.is_none()
             && !in_play
+            && !self.clean_view
         {
             pointer.and_then(|p| self.pick(rect, p, alt))
         } else {
@@ -1846,6 +2142,10 @@ impl Editor {
         }
         self.sync_terrain_params();
         self.sync_terrain_grass();
+        // Decoration sways in Edit mode too, even when input is idle.
+        if !self.terrain_grass_built.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         // Hover: the hovered part (or model's parts) drawn again, highlighted.
         let mut overlay = Vec::new();
         if let (Some(h), Some(rend)) = (self.hover, self.renderer.as_ref()) {
@@ -1863,6 +2163,7 @@ impl Editor {
             && !self.is_playing()
             && self.doc.kind == crate::doc::DocKind::Place
             && std::env::var_os("RUSTUDIO_NO_GRID").is_none()
+            && !self.clean_view
         {
             scene::grid_lines(&mut lines, self.ui.grid_size);
         }
@@ -1886,6 +2187,17 @@ impl Editor {
             let _l = crate::bench::scope("lighting");
             self.frame_lighting(rrect)
         };
+        // Studio's scene environment probe (env_probe.rs): the PBR
+        // technologies' 128 px indoor reflection cube.
+        let probe = (globals.env_spec[2] > 0.5 && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none()).then(|| {
+            let _p = crate::bench::scope("env_probe");
+            let revision = self.renderer.as_ref().map_or(0, |r| r.static_gen());
+            let now = self.harness.started.elapsed().as_secs_f64();
+            let dt = ctx.input(|i| i.unstable_dt);
+            let (doc, scene) = (&self.doc, &self.scene);
+            let ray = |o: Vec3, d: Vec3, len: f32| crate::env_probe::world_ray(doc, scene, o, d, len);
+            self.env_probe.update(self.cam.pos, self.cam.forward(), dt, now, revision, &ray)
+        });
         let vp_render = crate::bench::scope("vp_render");
         let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
             (Some(r), Some(rs)) => r.render(
@@ -1902,9 +2214,11 @@ impl Editor {
                     lines: &lines,
                     sky: self.cam.ortho.is_none(),
                     water: crate::water::WaterLook {
-                        time: self.harness.started.elapsed().as_secs_f32(),
+                        time: std::env::var("RUSTUDIO_CAPTURE_WATER_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| self.harness.started.elapsed().as_secs_f32()),
                         ..self.water_waves
                     },
+                    clouds: crate::clouds::look(&self.doc),
+                    probe,
                 },
             ),
             _ => None,
@@ -2101,12 +2415,14 @@ impl Editor {
             }
         }
         // -------------------------------------------------- select & gizmo
-        let primary_drag = resp.dragged_by(PointerButton::Primary) && (!alt || self.drag.is_some()) && !in_game && !brushing;
-        if resp.drag_started_by(PointerButton::Primary) && self.tool != Tool::None && !alt && !in_game && !brushing {
+        let primary_drag = resp.dragged_by(PointerButton::Primary) && (!alt || self.drag.is_some() || self.part_drag.is_some()) && !in_game && !brushing;
+        if resp.drag_started_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !brushing {
             let start = ctx.input(|i| i.pointer.press_origin()).or(pointer);
             if let Some(p) = start {
+                // A handle takes the press even with Alt held (Alt = scale all axes).
                 if let Some(h) = self.handle_at(&handles, p) {
                     self.start_drag(rect, h, p);
+                } else if alt {
                 } else if matches!(self.tool, Tool::Select | Tool::Move | Tool::Scale | Tool::Rotate | Tool::Transform)
                     && self.start_part_drag(rect, p, ctrl || shift)
                 {
@@ -2124,6 +2440,8 @@ impl Editor {
                 } else if let Some(d) = self.part_drag.as_mut() {
                     // Shift held: no grid snapping (DraggerContext.shouldGridSnap).
                     d.shift = shift;
+                    // Alt held: keep the starting orientation (no Align Dragged Objects).
+                    d.alt = alt;
                     self.update_part_drag(rect, p);
                 } else if let Some(start) = self.marquee {
                     // Studio highlights what the box holds while it is dragged.
@@ -2150,7 +2468,7 @@ impl Editor {
                 }
             }
         }
-        if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !alt && !in_game && !brushing {
+        if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !brushing {
             if let Some(p) = pointer {
                 // A GUI object under the cursor is picked first, as in Studio.
                 let hit = self
@@ -2172,18 +2490,24 @@ impl Editor {
             }
         }
 
+        self.viewport_context_menu(ui, &resp);
+
         // ------------------------------------------------------- overlays
         self.scene.sync(&mut self.doc);
-        self.draw_selection(&painter, rect);
+        // Comparison captures show the scene alone (clean_view).
+        if !self.clean_view {
+            self.draw_selection(&painter, rect);
+        }
         // Studio's hover outline (DraggerService.HoverThickness); none while
         // dragging (only the Ready state renders hover).
-        if let Some(h) = self.hover.filter(|_| self.part_drag.is_none() && self.drag.is_none()) {
-            for r in std::iter::once(h).chain(self.doc.dom.descendants_of(h).map(|i| i.referent()))
-            {
-                if let Some(sp) = self.scene.get(r) {
-                    self.draw_outline(&painter, rect, sp, Stroke::new(mech::HOVER_OUTLINE_PX, theme::HOVER_3D));
-                }
-            }
+        // Studio Settings > Selection: Show Hover Over, Hover Over Color,
+        // Hover Line Thickness.
+        let show_hover = crate::studio_settings::flag("Studio", "Show Hover Over", true);
+        if let Some(h) = self.hover.filter(|_| show_hover && !self.clean_view && self.part_drag.is_none() && self.drag.is_none()) {
+            let refs: Vec<_> = std::iter::once(h)
+                .chain(self.doc.dom.descendants_of(h).map(|i| i.referent())).collect();
+            self.draw_outline_union(&painter, rect, &refs,
+                Stroke::new(crate::studio_settings::hover_outline_px(), crate::studio_settings::color("Studio", "Hover Over Color", theme::HOVER_3D)));
         }
         // A free drag hides the handles (Studio draws only the pivot then).
         let handles = if self.part_drag.is_some() { Vec::new() } else { self.handles(rect) };
@@ -2210,7 +2534,7 @@ impl Editor {
                 painter.with_clip_rect(rect).line_segment([a, b], Stroke::new(1.0, Color32::WHITE));
             }
         }
-        for (h, pts) in &handles {
+        for (h, pts) in handles.iter().filter(|_| !self.clean_view) {
             if moving.is_some_and(|(mh, ..)| mh != *h) {
                 continue;
             }
@@ -2265,7 +2589,7 @@ impl Editor {
                 painter.circle_filled(c, 2.5, Color32::WHITE);
             }
         }
-        if let (Some(start), Some(end)) = (self.marquee, pointer) {
+        if let (Some(start), Some(end), false) = (self.marquee, pointer, self.clean_view) {
             if (end - start).length() > mech::DRAG_SELECT_MIN_PX {
                 let r = Rect::from_two_pos(start, end);
                 painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(90, 170, 255, 30));
@@ -2279,8 +2603,8 @@ impl Editor {
         }
         // Studio's Play view shows the game alone: no tool readout, axis
         // compass or border (tools/fidelity side-by-side shots).
-        if !self.is_playing() {
-            self.draw_viewport_hud(&painter, rect);
+        if !self.is_playing() && !self.clean_view {
+            self.draw_viewport_hud(ui, rect);
             self.draw_drag_hotkeys(&painter, rect);
         }
     }
@@ -2302,94 +2626,31 @@ impl Editor {
         }
     }
 
-    /// Studio's selection look (Selection.RenderMode Outlines): a band
-    /// around the part's silhouette (the convex hull of its projected shape),
-    /// not its box edges. Behind the camera: the box edges instead.
     pub(crate) fn draw_outline(&self, painter: &egui::Painter, rect: Rect, sp: &ScenePart, stroke: Stroke) {
-        let solid = self.solid_of(sp);
-        let mut pts3: Vec<Vec3> = solid.geometry().verts;
-        if matches!(sp.draw.mesh, crate::render::MeshKind::Ball | crate::render::MeshKind::Cylinder) {
-            // Round shapes: their rims (a ball's three great circles, a
-            // cylinder's end circles about its X axis).
-            pts3.clear();
-            let h = sp.size * 0.5;
-            let (x, y, z) = (sp.xf.rot.col(0), sp.xf.rot.col(1), sp.xf.rot.col(2));
-            for i in 0..48 {
-                let a = i as f32 / 48.0 * std::f32::consts::TAU;
-                let (c, s) = (a.cos(), a.sin());
-                if sp.draw.mesh == crate::render::MeshKind::Ball {
-                    let r = h.min_element();
-                    pts3.extend([x * c * r + y * s * r, y * c * r + z * s * r, z * c * r + x * s * r].map(|v| sp.xf.pos + v));
-                } else {
-                    let r = h.y.min(h.z);
-                    for e in [-h.x, h.x] {
-                        pts3.push(sp.xf.pos + x * e + y * c * r + z * s * r);
-                    }
-                }
+        self.draw_outline_union(painter, rect, &[sp.r], stroke);
+    }
+
+    fn draw_outline_union(&self, painter: &egui::Painter, rect: Rect, refs: &[Ref], stroke: Stroke) {
+        let mut mask = SilhouetteMask::new(rect);
+        let vp = self.cam.view_proj(rect);
+        for r in refs {
+            let Some(sp) = self.scene.get(*r) else { continue };
+            let d = self.renderer.as_ref().and_then(|renderer| renderer.item_draws(*r))
+                .and_then(|draws| draws.first()).unwrap_or(&sp.draw);
+            let asset = sp.mesh_asset.as_ref().and_then(|asset| crate::assets::mesh_triangles(&asset.id));
+            let triangles = asset.as_deref().map(Vec::as_slice)
+                .unwrap_or_else(|| crate::render::outline_triangles(d.mesh));
+            for triangle in triangles {
+                mask.triangle(triangle.map(|p| vp * (d.xf.pos + d.xf.rot * (p * d.size)).extend(1.0)));
             }
         }
-        let pts: Option<Vec<Pos2>> = pts3.iter().map(|p| self.cam.project(rect, *p)).collect();
-        let Some(mut pts) = pts else {
-            self.draw_box(painter, rect, &sp.xf, sp.size, stroke);
-            return;
-        };
-        // Andrew's monotone chain.
-        pts.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
-        let cross = |o: Pos2, a: Pos2, b: Pos2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
-        let mut hull: Vec<Pos2> = Vec::new();
-        for pass in 0..2 {
-            let start = hull.len();
-            let iter: Vec<Pos2> = if pass == 0 { pts.clone() } else { pts.iter().rev().copied().collect() };
-            for p in iter {
-                while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
-                    hull.pop();
-                }
-                hull.push(p);
-            }
-            hull.pop();
-        }
-        if hull.len() >= 2 {
-            painter.add(egui::Shape::closed_line(hull, stroke));
-        }
+        for edge in mask.edges() { painter.line_segment(edge, stroke); }
     }
 
     fn draw_selection(&self, painter: &egui::Painter, rect: Rect) {
-        let stroke = Stroke::new(mech::SELECTION_OUTLINE_PX, theme::SELECT);
-        for r in self.selected_parts() {
-            if let Some(sp) = self.scene.get(r) {
-                self.draw_outline(painter, rect, sp, stroke);
-            }
-        }
-        // Models also get a dimmer box around everything they contain.
-        for &r in &self.doc.selection {
-            if self.scene.get(r).is_none()
-                && self
-                    .doc
-                    .dom
-                    .descendants_of(r)
-                    .any(|d| self.scene.get(d.referent()).is_some())
-            {
-                let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-                for d in self.doc.dom.descendants_of(r) {
-                    if let Some(sp) = self.scene.get(d.referent()) {
-                        let (a, b) = part_aabb(sp);
-                        mn = mn.min(a);
-                        mx = mx.max(b);
-                    }
-                }
-                let xf = Xform {
-                    pos: (mn + mx) * 0.5,
-                    rot: Mat3::IDENTITY,
-                };
-                self.draw_box(
-                    painter,
-                    rect,
-                    &xf,
-                    mx - mn,
-                    Stroke::new(1.0, theme::SELECT.gamma_multiply(0.6)),
-                );
-            }
-        }
+        // Studio Settings > Selection: Selection Color, Selection Line Thickness.
+        self.draw_outline_union(painter, rect, &self.selected_parts(),
+            Stroke::new(crate::studio_settings::selection_outline_px(), crate::studio_settings::color("Studio", "Select Color", theme::SELECT)));
     }
 
     /// Releasing the box keeps what it held (with Shift / Ctrl, added to
@@ -2450,51 +2711,145 @@ impl Editor {
         picked
     }
 
-    fn draw_viewport_hud(&self, painter: &egui::Painter, rect: Rect) {
-        // Tool / drag readout, top-left.
-        let mut text = format!(
-            "{}  ·  {}",
-            self.tool.label(),
-            if self.local_space { "Local" } else { "World" }
-        );
-        if let Some(d) = &self.drag {
-            let unit = if d.handle.tool == Tool::Rotate {
-                "°"
-            } else {
-                " studs"
-            };
-            text = format!("{}: {:+.2}{unit}", d.handle.tool.label(), d.amount);
-        }
-        let font = egui::FontId::proportional(13.0);
-        let galley = painter.layout_no_wrap(text, font, theme::TEXT);
-        let pos = rect.min + Vec2::new(10.0, 10.0);
-        painter.rect_filled(
-            Rect::from_min_size(pos - Vec2::splat(5.0), galley.size() + Vec2::splat(10.0)),
-            3.0,
-            Color32::from_black_alpha(140),
-        );
-        painter.galley(pos, galley, theme::TEXT);
-
-        // Axis compass, bottom-left.
-        let c = Pos2::new(rect.min.x + 42.0, rect.max.y - 42.0);
-        painter.circle_filled(c, 30.0, Color32::from_black_alpha(90));
-        let view = self.cam.view();
-        let mut axes: Vec<(usize, Vec3)> = (0..3)
-            .map(|i| (i, view.transform_vector3(Vec3::AXES[i])))
-            .collect();
-        axes.sort_by(|a, b| a.1.z.total_cmp(&b.1.z));
-        for (i, v) in axes {
-            let end = c + Vec2::new(v.x, -v.y) * 24.0;
-            painter.line_segment([c, end], Stroke::new(2.0, AXIS_COLORS[i]));
-            painter.text(
-                end,
-                egui::Align2::CENTER_CENTER,
-                ["X", "Y", "Z"][i],
-                egui::FontId::proportional(11.0),
-                AXIS_COLORS[i],
-            );
-        }
+    fn view_selector_rect(rect: Rect) -> Rect {
+        Rect::from_min_size(egui::pos2(rect.right() - 100.0, rect.top() + 8.0), Vec2::splat(92.0))
     }
+
+    fn draw_viewport_hud(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let area = Self::view_selector_rect(rect);
+        let p = ui.painter().clone();
+        if let Some(drag) = &self.drag {
+            let unit = if drag.handle.tool == Tool::Rotate { "°" } else { " studs" };
+            p.text(rect.min + Vec2::splat(10.0), egui::Align2::LEFT_TOP,
+                format!("{}: {:+.2}{unit}", drag.handle.tool.label(), drag.amount),
+                egui::FontId::proportional(13.0), theme::TEXT);
+        }
+        let view = self.cam.view();
+        let center = area.center() - Vec2::new(0.0, 5.0);
+        let project = |v: Vec3| { let v = view.transform_vector3(v); center + Vec2::new(v.x, -v.y) * 29.0 };
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let selector_resource = |id: &str| {
+            crate::assets::resolve(id, None).filter(|p| p.is_file()).or_else(|| {
+                let root = crate::assets::content_dir().canonicalize().ok()?;
+                let p = root.parent()?.join("StudioContent").join(id.strip_prefix("rbxasset://")?);
+                p.is_file().then_some(p)
+            })
+        };
+        // Axis.mesh is a 1.06-unit bar scaled by 0.9, centered at the
+        // model-relative positions recorded in ViewSelector.rbxm.
+        for (i, axis) in Vec3::AXES.iter().enumerate() {
+            let mid = [Vec3::new(0.01,-0.48,-0.48), Vec3::new(-0.48,-0.03,-0.48), Vec3::new(-0.48,-0.48,0.01)][i] / 0.475;
+            let half = *axis * (0.53*0.9/0.475);
+            let end = project(mid+half);
+            let color = [Color32::from_rgb(239,65,87),Color32::from_rgb(72,228,133),Color32::from_rgb(50,94,248)][i];
+            p.line_segment([project(mid-half),end], Stroke::new(0.76, color));
+            p.text(end, egui::Align2::CENTER_CENTER, ["X","Y","Z"][i], egui::FontId::proportional(9.0), color);
+        }
+        // Render the shipped rounded mesh once. Backface culling prevents
+        // translucent rear surfaces and overlapping guessed face fills.
+        static SELECTOR: std::sync::OnceLock<Option<crate::mesh::MeshData>> = std::sync::OnceLock::new();
+        if let Some(geometry) = SELECTOR.get_or_init(|| {
+            let path = selector_resource("rbxasset://models/ViewSelector/Basic.mesh")?;
+            crate::mesh::parse(&std::fs::read(path).ok()?).ok()
+        }) {
+            let mut mesh = egui::Mesh::default();
+            for (tri, normals) in geometry.positions.chunks_exact(3).zip(geometry.normals.chunks_exact(3)) {
+                if view.transform_vector3((normals[0]+normals[1]+normals[2])/3.0).z <= 0.0 { continue; }
+                let start = mesh.vertices.len() as u32;
+                for (pos,n) in tri.iter().zip(normals) {
+                    // Model: color (181,187,199), transparency .5; viewport
+                    // ambient 200/255, directional 140/255 along (-1,-1,-1).
+                    let light = (200.0/255.0 + 140.0/255.0*n.dot(Vec3::ONE.normalize()).max(0.0)).min(1.0);
+                    mesh.colored_vertex(project(*pos/25.0), Color32::from_rgba_unmultiplied(
+                        (181.0*light) as u8,(187.0*light) as u8,(199.0*light) as u8,128));
+                }
+                mesh.add_triangle(start,start+1,start+2);
+            }
+            p.add(egui::Shape::mesh(mesh));
+        }
+        let mut faces = Vec::new();
+        for (label, key, normal, u, v) in [
+            ("Right", "view.right", Vec3::X, -Vec3::Z, Vec3::Y),
+            ("Left", "view.left", -Vec3::X, Vec3::Z, Vec3::Y),
+            ("Top", "view.top", Vec3::Y, -Vec3::X, -Vec3::Z),
+            ("Bottom", "view.bottom", -Vec3::Y, -Vec3::X, -Vec3::Z),
+            ("Back", "view.back", Vec3::Z, Vec3::X, Vec3::Y),
+            ("Front", "view.front", -Vec3::Z, -Vec3::X, Vec3::Y),
+        ] {
+            let depth = view.transform_vector3(normal).z;
+            if depth <= 0.001 { continue; }
+
+            let points = [normal-u-v*0.65, normal-u*0.65-v, normal+u*0.65-v, normal+u-v*0.65, normal+u+v*0.65, normal+u*0.65+v, normal-u*0.65+v, normal-u+v*0.65].map(project);
+            faces.push((depth, label, key, normal, u, v, points));
+        }
+        faces.sort_by(|a,b| a.0.total_cmp(&b.0));
+        for (_depth, label, key, normal, u, v, points) in faces {
+            let bounds = Rect::from_points(&points);
+            self.ui_rects.insert(key, bounds);
+            let response = ui.interact(bounds, egui::Id::new(key), Sense::click());
+            let inside = pointer.is_some_and(|q| {
+                let mut sign = 0.0_f32;
+                for i in 0..points.len() {
+                    let a=points[i]; let b=points[(i+1)%points.len()];
+                    let cross=(b.x-a.x)*(q.y-a.y)-(b.y-a.y)*(q.x-a.x);
+                    if cross.abs()>0.01 { if sign*cross<0.0 { return false; } sign=cross; }
+                }
+                true
+            });
+            // Studio ships the face lettering as a decal, including its contour.
+            // Retain that rasterization instead of re-typesetting projected text.
+            let texture_key = egui::Id::new(("selector-decal", label, inside));
+            let texture = ui.ctx().data_mut(|d| d.get_temp::<egui::TextureHandle>(texture_key));
+            let texture = texture.or_else(|| {
+                let id = format!("rbxasset://textures/ViewSelector/{}{}.png", label.to_lowercase(), if inside { "_hover" } else { "" });
+                let bytes = std::fs::read(selector_resource(&id)?).ok()?;
+                let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+                let image = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize,img.height() as usize], img.as_raw());
+                let t = ui.ctx().load_texture(id, image, egui::TextureOptions::LINEAR);
+                ui.ctx().data_mut(|d| d.insert_temp(texture_key,t.clone()));
+                Some(t)
+            });
+            if let Some(texture) = texture {
+                let mut mesh = egui::Mesh::with_texture(texture.id());
+                if let Some(Some(geometry)) = SELECTOR.get() {
+                    for (tri, ns) in geometry.positions.chunks_exact(3).zip(geometry.normals.chunks_exact(3)) {
+                        let n = (ns[0]+ns[1]+ns[2]).normalize_or_zero();
+                        if n.dot(normal) < n.abs().max_element()-0.0001 || view.transform_vector3(n).z <= 0.0 { continue; }
+                        let start = mesh.vertices.len() as u32;
+                        for pos in tri {
+                            let q = *pos/25.0;
+                            mesh.vertices.push(egui::epaint::Vertex { pos: project(q),
+                                uv: egui::pos2((q.dot(u)+1.0)*0.5,(1.0-q.dot(v))*0.5),
+                                color: Color32::from_white_alpha(204) });
+                        }
+                        mesh.add_triangle(start,start+1,start+2);
+                    }
+                }
+                p.add(egui::Shape::mesh(mesh));
+            }
+            if inside {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                if response.clicked() { self.cam.animate_view(normal); }
+            }
+        }
+        // Studio exposes quarter-turn arrows around the aligned face.
+        if self.cam.forward().abs().max_element() > 0.999 {
+            for (offset, direction) in [(Vec2::new(-40.0,0.0), -self.cam.right()),
+                (Vec2::new(40.0,0.0), self.cam.right()),
+                (Vec2::new(0.0,-40.0), self.cam.up()),
+                (Vec2::new(0.0,40.0), -self.cam.up())] {
+                let c=center+offset;
+                let d=offset.normalized(); let t=Vec2::new(-d.y,d.x);
+                let r=Rect::from_center_size(c, Vec2::splat(15.0));
+                let response=ui.interact(r, egui::Id::new(("view-turn",offset.x as i32,offset.y as i32)),Sense::click());
+                p.add(egui::Shape::convex_polygon(vec![c+d*5.0,c-d*4.0+t*4.0,c-d*4.0-t*4.0],
+                    if response.hovered() {Color32::from_rgb(95,162,218)} else {Color32::from_gray(190)},Stroke::NONE));
+                if response.clicked() {self.cam.animate_view(direction);}
+            }
+        }
+
+    }
+
 }
 
 impl LightingState {
@@ -3103,7 +3458,7 @@ impl Editor {
         // lit WaterColor (fog.z 2 = the underwater curve, docs/MECHANICS.md
         // "Underwater"); the shader lights the colour.
         if let Some((_, _, v)) = self.terrain_drawn.as_ref() {
-            if v.water_at(self.cam.pos.to_array()) {
+            if v.under_drawn_water(self.cam.pos.to_array()) {
                 let rgb = self.terrain_water_look.map(|l| l.0).unwrap_or(mech::WATER_COLOR_DEFAULT);
                 fl.globals.fog[0] = mech::UNDERWATER_FOG[0];
                 fl.globals.fog[1] = mech::UNDERWATER_FOG[1];
@@ -3111,6 +3466,11 @@ impl Editor {
                 fl.globals.fog_color = crate::lighting::sq(rgb).extend(1.0).to_array();
             }
         }
+        // Terrain.Clouds' sun cover (clouds.rs): it softens and dims the sun
+        // (shader.wgsl reads it from outdoor.w).
+        let cover = crate::clouds::sun_cover(crate::clouds::look(&self.doc).is_some());
+        fl.globals.outdoor[3] = cover;
+        fl.shadow_softness = crate::clouds::shadow_softness(fl.shadow_softness, cover);
         // The sun's shadow cascades (sun_shadow.rs), around this camera.
         let aspect = (rect.width() / rect.height().max(1.0)).max(0.01);
         let tan_y = (self.cam.fov_deg.to_radians() * 0.5).tan();
@@ -3135,6 +3495,12 @@ pub struct DrawCache {
     pub waiting: std::collections::HashSet<Ref>,
     /// Per part: (loaded mesh, textured, decals, clothed) for the self-test.
     flags: std::collections::HashMap<Ref, [u32; 4]>,
+    /// Parts drawn as one instance a restyle can patch: the factor from the
+    /// part's colour to the drawn one, and whether the drawn opacity is
+    /// forced (0 while a mesh is missing) rather than the part's.
+    style: std::collections::HashMap<Ref, ([f32; 3], bool)>,
+    /// Waiting parts held up only by these textures.
+    wait_tex: std::collections::HashMap<Ref, Vec<String>>,
     totals: [usize; 4],
 }
 
@@ -3164,6 +3530,8 @@ impl DrawCache {
         }
         self.xf.remove(&r);
         self.waiting.remove(&r);
+        self.style.remove(&r);
+        self.wait_tex.remove(&r);
     }
 
     pub fn totals(&self) -> [usize; 4] {
@@ -3335,6 +3703,32 @@ fn gizmo_updates(drag: &GizmoDrag, dir: Vec3, d: f32, symmetric: bool, uniform: 
                 updates.push((*r, Xform { pos: xf.pos + dir * d, rot: xf.rot }, *size));
             }
         }
+        // ExtrudeHandlesImplementation.axesToScale: all three axes when Alt is
+        // held, or when the selection is more than one loose part. Then the
+        // selection's box scales as one: sizes and offsets by the same factor,
+        // about the opposite face (Ctrl: about the centre).
+        Tool::Scale if uniform || drag.parts.len() > 1 => {
+            let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+            for (_, xf, size) in &drag.parts {
+                for a in 0..3 {
+                    let ax = drag.axes.col(a);
+                    let c = (xf.pos - drag.origin).dot(ax);
+                    let e: f32 = (0..3).map(|i| xf.rot.col(i).dot(ax).abs() * size[i] * 0.5).sum();
+                    lo[a] = lo[a].min(c - e);
+                    hi[a] = hi[a].max(c + e);
+                }
+            }
+            let a = h.axis;
+            let extent = (hi[a] - lo[a]).max(1e-6);
+            let min_dim = drag.parts.iter().map(|(_, _, s)| s.min_element()).fold(f32::INFINITY, f32::min);
+            let f = ((extent + d * if symmetric { 2.0 } else { 1.0 }) / extent)
+                .max(crate::mech::MIN_PART_SIZE / min_dim.max(1e-6));
+            let centre = drag.origin + drag.axes * ((lo + hi) * 0.5);
+            let anchor = if symmetric { centre } else { centre - dir * (extent * 0.5) };
+            for (r, xf, size) in &drag.parts {
+                updates.push((*r, Xform { pos: anchor + (xf.pos - anchor) * f, rot: xf.rot }, *size * f));
+            }
+        }
         Tool::Scale => {
             for (r, xf, size) in &drag.parts {
                 // Grow the part's own axis closest to the dragged direction, one side only.
@@ -3360,4 +3754,111 @@ fn gizmo_updates(drag: &GizmoDrag, dir: Vec3, d: f32, symmetric: bool, uniform: 
         Tool::Select | Tool::None | Tool::Transform => {}
     }
     updates
+}
+
+/// Rasterize the union of clipped triangles and emit coverage boundaries only.
+struct SilhouetteMask {
+    rect: Rect, width: usize, height: usize, delta: Vec<i64>, full_rows: Vec<bool>, covered_span: Vec<(usize,usize)>, remaining_rows: usize,
+}
+impl SilhouetteMask {
+    fn new(rect: Rect) -> Self {
+        // Fixed viewport budget; work is O(triangles * height + width * height).
+        let scale = (1024.0 / rect.width().max(rect.height()).max(1.0)).min(2.0);
+        let width = (rect.width() * scale).ceil().max(1.0) as usize;
+        let height = (rect.height() * scale).ceil().max(1.0) as usize;
+        Self { rect, width, height, delta: vec![0; (width + 1) * height], full_rows: vec![false; height], covered_span: vec![(0,0); height], remaining_rows: height }
+    }
+    fn triangle(&mut self, tri: [glam::Vec4; 3]) {
+        if self.remaining_rows == 0 || tri.iter().any(|p| !p.is_finite()) { return; }
+        let mut poly = tri.to_vec();
+        // WGPU homogeneous frustum, including the near plane, before divide.
+        for plane in 0..6 {
+            let distance = |p: glam::Vec4| match plane {
+                0 => p.x+p.w, 1 => p.w-p.x, 2 => p.y+p.w,
+                3 => p.w-p.y, 4 => p.z, _ => p.w-p.z,
+            };
+            if poly.iter().all(|p| distance(*p) >= 0.0) { continue; }
+            let mut clipped = Vec::with_capacity(9);
+            for i in 0..poly.len() {
+                let a=poly[i]; let b=poly[(i+1)%poly.len()];
+                let da=distance(a); let db=distance(b);
+                if da >= 0.0 { clipped.push(a); }
+                if (da >= 0.0) != (db >= 0.0) { clipped.push(a+(b-a)*(da/(da-db))); }
+            }
+            poly=clipped;
+            if poly.len()<3 { return; }
+        }
+        let points: Vec<_> = poly.iter().map(|p| egui::pos2(
+            (p.x/p.w+1.0)*0.5*self.width as f32,
+            (1.0-p.y/p.w)*0.5*self.height as f32)).collect();
+        let lo=points.iter().map(|p| p.y).fold(f32::INFINITY,f32::min).max(0.0) as usize;
+        let hi=points.iter().map(|p| p.y).fold(0.0,f32::max).ceil().min(self.height as f32) as usize;
+        // Each convex polygon edge contributes a linear x intersection. Compute
+        // slopes once, and step them rather than divide for every row.
+        let mut spans = vec![(f32::INFINITY, f32::NEG_INFINITY); hi-lo];
+        for i in 0..points.len() {
+            let mut a=points[i]; let mut b=points[(i+1)%points.len()];
+            if a.y > b.y { std::mem::swap(&mut a,&mut b); }
+            if a.y == b.y { continue; }
+            let start=(a.y-0.5).ceil().clamp(lo as f32,hi as f32) as usize;
+            let end=(b.y-0.5).ceil().clamp(lo as f32,hi as f32) as usize;
+            let slope=(b.x-a.x)/(b.y-a.y);
+            for y in start..end {
+                if self.full_rows[y] { continue; }
+                let x=a.x+slope*(y as f32+0.5-a.y);
+                spans[y-lo].0=spans[y-lo].0.min(x);
+                spans[y-lo].1=spans[y-lo].1.max(x);
+            }
+        }
+        for y in lo..hi {
+            if self.full_rows[y] { continue; }
+            let (left,right)=spans[y-lo];
+            if left <= right {
+                let start=(left-0.5).ceil().clamp(0.0,self.width as f32) as usize;
+                let end=(right-0.5).ceil().clamp(0.0,self.width as f32) as usize;
+                self.delta[y*(self.width+1)+start]+=1;
+                self.delta[y*(self.width+1)+end]-=1;
+                // A conservative connected covered interval permits saturation
+                // across adjacent triangles. Disconnected spans never bridge gaps.
+                let span=&mut self.covered_span[y];
+                if span.0 == span.1 { *span=(start,end); }
+                else if start <= span.1 && end >= span.0 {
+                    span.0=span.0.min(start); span.1=span.1.max(end);
+                }
+                if span.0 == 0 && span.1 == self.width {
+                    self.full_rows[y]=true;
+                    self.remaining_rows-=1;
+                }
+            }
+        }
+    }
+
+    fn edges(mut self) -> Vec<[Pos2;2]> {
+        for y in 0..self.height {
+            let mut coverage=0;
+            for x in 0..self.width { let i=y*(self.width+1)+x; coverage+=self.delta[i]; self.delta[i]=i64::from(coverage>0); }
+        }
+        let filled=|x: usize,y: usize| self.delta[y*(self.width+1)+x]>0;
+        let point=|x: usize,y: usize| self.rect.min+egui::vec2(x as f32/self.width as f32*self.rect.width(),y as f32/self.height as f32*self.rect.height());
+        let mut edges=Vec::new();
+        // Join collinear boundary pixels so antialiased line caps do not
+        // produce a dotted outline on straight edges.
+        for y in 0..=self.height {
+            let mut start=None;
+            for x in 0..=self.width {
+                let boundary=x<self.width && ((y>0 && filled(x,y-1)) != (y<self.height && filled(x,y)));
+                if boundary { start.get_or_insert(x); }
+                else if let Some(a)=start.take() { edges.push([point(a,y),point(x,y)]); }
+            }
+        }
+        for x in 0..=self.width {
+            let mut start=None;
+            for y in 0..=self.height {
+                let boundary=y<self.height && ((x>0 && filled(x-1,y)) != (x<self.width && filled(x,y)));
+                if boundary { start.get_or_insert(y); }
+                else if let Some(a)=start.take() { edges.push([point(x,a),point(x,y)]); }
+            }
+        }
+        edges
+    }
 }

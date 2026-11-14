@@ -70,7 +70,10 @@ struct ShadowSlot {
 @group(0) @binding(17) var<storage, read> lshadow_slots: array<ShadowSlot>;
 @group(0) @binding(20) var localgrid_tex: texture_3d<f32>;
 @group(0) @binding(12) var lightocc_tex: texture_3d<f32>;
+// The scene environment probe (env_probe.rs): PrefilteredEnvIndoorTexture
+// and PrefilteredEnvBlendTargetTexture, linear RGB, 128 px, 8 levels.
 @group(0) @binding(13) var indoor_tex: texture_cube<f32>;
+@group(0) @binding(21) var indoor_next: texture_cube<f32>;
 @group(0) @binding(14) var brdf_lut: texture_2d<f32>;
 
 @group(2) @binding(0) var glass_scene: texture_2d<f32>;
@@ -108,7 +111,25 @@ fn sq(c: vec3<f32>) -> vec3<f32> {
 // DefaultUnifiedNeonFS.0..3: 4 * pow(1.35 * encoded Color3, 4).
 // Instance colours are already squared, so square again in linear space.
 const NEON_GLOW: f32 = 13.286025; // 4 * 1.35^4
-// See-through Neon: NEON_SEE_THROUGH_CUT / _MAX come from mech.rs (round 26).
+
+// See-through Neon, as Studio draws it (Laser Tag RenderDoc captures,
+// checks/laser-tag-parity/render/findings.md): DefaultUnifiedNeonFS writes
+// e = sqrt(clamp(L × Exposure_DoFDistance.y)) (CB0[20].y = 0.25 × exposure)
+// with alpha 1 − visibility × Transparency, and the pipeline blends
+// SrcAlpha / InvSrcAlpha into the R10G10B10A2_UNORM scene, i.e. in that
+// square-root encoding; ImageProcessFXCompositionLinearFS decodes 4 e².
+// The scene here is linear float, so the encoded blend is done against the
+// opaque snapshot (glass_scene) and returned premultiplied: exact over the
+// opaque scene, see-through layers between keep their (1 − alpha) share.
+fn neon_over_scene(glow: vec3<f32>, a: f32, frag: vec2<f32>) -> vec4<f32> {
+    let k = 0.25 * max(g.params.y, 1e-4);
+    let size = vec2<i32>(textureDimensions(glass_scene));
+    let behind = max(textureLoad(glass_scene, clamp(vec2<i32>(frag), vec2<i32>(0), size - vec2<i32>(1)), 0).rgb, vec3<f32>(0.0));
+    let e = a * sqrt(clamp(glow * k, vec3<f32>(0.0), vec3<f32>(1.0)))
+        + (1.0 - a) * sqrt(clamp(behind * k, vec3<f32>(0.0), vec3<f32>(1.0)));
+    let blended = e * e / k;
+    return vec4<f32>(max(blended - (1.0 - a) * behind, vec3<f32>(0.0)), a);
+}
 // Terrain water: the share of the sun its colour takes (all of it, shadowed,
 // as Studio's LQ water: CB0[15] × skylight shadow), and
 // how opaque its surface is seen from below (Studio draws it as the lit
@@ -318,7 +339,7 @@ struct PartIn {
     @location(12) projection: vec4<f32>,
     @location(9) uvt: vec4<f32>,   // uv scale (xy) and offset (zw)
     @location(10) emissive: vec4<f32>, // SurfaceAppearance EmissiveTint^2 x EmissiveStrength
-    @location(11) vcol: vec4<f32>,     // per-vertex colour (sRGB; a 0 = the part's Color): union child colours
+    @location(11) vcol: vec4<f32>,     // per-vertex colour (sRGB; a 0 = the part's Color): a 1 union child colours, a in [-2, -1] mesh vertex colours (alpha -a - 1)
 };
 
 struct PartOut {
@@ -335,6 +356,9 @@ struct PartOut {
     @location(9) objn: vec3<f32>,
     // Material map scale per stud (uvt.xy).
     @location(10) mscale: vec4<f32>,
+    @location(11) @interpolate(flat) oblique: u32,
+    // Mesh vertex colour (squared) and alpha; (1, 1, 1, 1) without one.
+    @location(12) vtint: vec4<f32>,
 };
 
 @group(0) @binding(7) var studs_tex: texture_2d<f32>;
@@ -403,19 +427,25 @@ fn part_out(v: PartIn) -> PartOut {
     o.world = world;
     o.normal = normalize(n);
     o.color = v.color;
+    o.vtint = vec4<f32>(1.0);
     if (v.vcol.a > 0.5) {
         o.color = vec4<f32>(sq(v.vcol.rgb), v.color.a);
+    } else if (v.vcol.a < -0.5) {
+        // Mesh vertex colours (mesh.rs gpu_colors): Studio's part VS takes
+        // VARYING2 = COLOR0 × the instance colour, alpha included; fs_part
+        // multiplies it into Color or the texture (texture × VARYING2)².
+        o.vtint = vec4<f32>(sq(v.vcol.rgb), -v.vcol.a - 1.0);
     }
     o.extra = v.extra;
     o.local = v.pos * v.size.xyz;
-    o.uv = v.uv * v.uvt.xy + v.uvt.zw;
-    if (v.uvt.w < 0.0) {
+    o.uv = v.uv * v.uvt.xy + select(v.uvt.zw, vec2<f32>(0.0), v.uvt.w < 0.0);
+    if (v.uvt.w < 0.0 && v.uvt.w > -2.5) {
         // CSGMDL plane IDs: Studio. Tag zero preserves UVs.
         // MeshParts without TextureID share the normal-selected stud projection below.
         // Loaded positions are centered and divided by decoded extent.
         // o.local restores studs (normalized position * current Size).
-        // Never substitute stored UVs merely because Size ~= extent:
-        // their authored scale need not be one UV unit per stud.
+        // This branch is for resized unions and MeshParts. Unchanged
+        // unions use the -3 sentinel above to preserve authored UVs.
         let p = o.local;
         let modern = v.projection.w >= 9.0;
         let tag = u32(v.projection.w) - select(0u, 8u, modern);
@@ -444,6 +474,7 @@ fn part_out(v: PartIn) -> PartOut {
     o.emissive_albedo = v.emissive.w;
     o.half = v.size.xyz * 0.5;
     o.objn = v.normal;
+    o.oblique = select(0u, 1u, v.projection.x == -99.0);
     o.mscale = v.uvt;
     return o;
 }
@@ -457,15 +488,36 @@ fn vs_part(v: PartIn) -> PartOut {
 /// (DefaultUnifiedFlatOpaqueFS 8): the cascades' visibility, handed to the voxel sun over
 /// SUN_DIST .. SUN_DIST + 1 / HYBRID_LERP_SLOPE studs from the camera.
 fn sun_shadow(world: vec3<f32>, n: vec3<f32>) -> f32 {
+    return sun_visibility(world, n) * sun_cover();
+}
+
+/// Terrain.Clouds' sun cover (clouds.rs; 1 = clear), Studio's SkyAmbient.w:
+/// its surface shaders (Vulkan pack DefaultUnified*, SmoothCluster,
+/// SmoothWater, Grass) take the sun's diffuse × cover, its specular ×
+/// cover² and SkyAmbientNoIBL × skylight × (2 − cover). `sun_shadow`
+/// carries one cover; the specular sites add the second.
+fn sun_cover() -> f32 {
+    return g.outdoor.w;
+}
+
+/// The outdoor ambient's gain under the clouds (2 − cover).
+fn sky_gain() -> f32 {
+    return 2.0 - g.outdoor.w;
+}
+
+fn sun_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
+    return sun_visibility_at(world, n, world);
+}
+
+fn sun_visibility_at(world: vec3<f32>, n: vec3<f32>, receiver: vec3<f32>) -> f32 {
     if (g.bloom.z < 0.5) { return 1.0; }
     let voxel = light_grid_sun(world, n);
     if (g.sun_color.w > 0.5 && g.env_spec.z <= 0.5) { return voxel; }
-    let mapped = sun_shadow_map(world);
+    let mapped = sun_shadow_map(receiver);
     if (mapped < 0.0) { return voxel; }
-    if (g.sun_color.w < 0.5) {
-        return mix(mapped, voxel, clamp((length(world - g.cam_pos.xyz) - SUN_DIST) * HYBRID_LERP_SLOPE, 0.0, 1.0));
-    }
-    return mapped * voxel;
+    // Captured Soft/ShadowMap grass FS4438 _645..740 uses the same
+    // distance hand-off when the map gate is enabled (cb0[53].x > 0).
+    return mix(mapped, voxel, clamp((length(world - g.cam_pos.xyz) - SUN_DIST) * HYBRID_LERP_SLOPE, 0.0, 1.0));
 }
 
 /// The cascades alone (sun_shadow.rs): the first whose sphere holds the
@@ -575,12 +627,31 @@ fn env_reflect(r: vec3<f32>, rough: f32, sky: f32, sharp: bool) -> vec3<f32> {
     let lod_i = min(max(top_i - (ATMOS_ENV_CUBE_LEVELS - 1.0), 0.0) + m, top_i);
     let tint = mix(g.sky_grad[1].rgb, g.sky_grad[0].rgb, clamp(r.y * ENV_REFLECT_UP_GAIN, 0.0, 1.0));
     let outside = sky_color_lod(r, lod_s) * tint;
-    let inside = sq(textureSampleLevel(indoor_tex, sky_sampler, r, lod_i).rgb);
+    // Captured Future FS (Laser Tag door view, event 562): t14 at the
+    // reflection's lod, mixed toward t2 by CB0[32].w when that's non-zero.
+    var inside = textureSampleLevel(indoor_tex, sky_sampler, r, lod_i).rgb;
+    if (g.env_spec.w != 0.0) {
+        inside = mix(inside, textureSampleLevel(indoor_next, sky_sampler, r, lod_i).rgb, g.env_spec.w);
+    }
     return mix(inside, outside, sky);
 }
 
+// Studio's clustered light record (Laser Tag RenderDoc capture, door view,
+// Future FS event 562 cb6): position m[0], face axes with half extents
+// m[3] / m[4] (zero for point and spot lights). Surfaces are lit from the
+// closest point of a SurfaceLight's rectangle, not its centre.
+fn light_point(l: Light, world: vec3<f32>) -> vec3<f32> {
+    var source = l.pos_range.xyz;
+    if (l.color.w > 1.5) {
+        let rel = world - source;
+        source += l.surface_u.xyz * clamp(dot(rel, l.surface_u.xyz), -l.surface_u.w, l.surface_u.w)
+            + l.surface_v.xyz * clamp(dot(rel, l.surface_v.xyz), -l.surface_v.w, l.surface_v.w);
+    }
+    return source;
+}
+
 fn local_light(l: Light, world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    let to = l.pos_range.xyz - world;
+    let to = light_point(l, world) - world;
     let d = length(to);
     let range = l.pos_range.w;
     if (d >= range || range <= 0.0) {
@@ -697,7 +768,7 @@ fn local_pbr(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rough: f32,
         if (!any(radiance > vec3<f32>(0.0))) { continue; }
         if (light.extra.w >= 0.0) { radiance *= light_shadow(i32(light.extra.w), world); }
         else if (light.extra.z > 0.5) { radiance *= light_occlusion(world, n, light.pos_range.xyz); }
-        let direction = normalize(light.pos_range.xyz - world);
+        let direction = normalize(light_point(light, world) - world);
         let vh = v + direction;
         let h = vh * inverseSqrt(max(dot(vh, vh), 0.0001));
         let nh = max(dot(n, h), 0.001);
@@ -815,15 +886,33 @@ fn surface_shade(packed: u32, objn: vec3<f32>, local: vec3<f32>, half: vec3<f32>
 /// A box face's material coordinate in studs from the face's corner
 /// (Studio's TEXCOORD0 × 8; v runs down the side faces so maps stand
 /// upright), the same faces as `surface_shade`.
-fn face_studs(objn: vec3<f32>, local: vec3<f32>, half: vec3<f32>) -> vec2<f32> {
+fn face_studs(objn: vec3<f32>, local: vec3<f32>, half: vec3<f32>, oblique: u32) -> vec2<f32> {
     let a = abs(objn);
     let c = local + half;
+    // Oblique primitive faces need distance along the face, not an axis
+    // projection. Transform the normal by inverse size before forming an
+    // orthonormal basis in object stud space (rotation does not change it).
+    if (oblique != 0u) {
+        let n = normalize(objn / max(half, vec3<f32>(0.0001)));
+        let u = normalize(cross(n, vec3<f32>(0.0, 1.0, 0.0)));
+        let v = cross(u, n);
+        return vec2<f32>(dot(c, u), dot(c, v));
+    }
     if (a.x >= a.y && a.x >= a.z) {
         return vec2<f32>(c.z, 2.0 * half.y - c.y);
     } else if (a.y >= a.z) {
         return c.xz;
     }
     return vec2<f32>(c.x, 2.0 * half.y - c.y);
+}
+
+// Scene depth coverage for decals on any host, including invisible parts.
+// Test the same filtered alpha and authored opacity as the color pass.
+@fragment
+fn fs_decal_depth(in: PartOut) -> @location(0) vec4<f32> {
+    let alpha = textureSample(tex, tex_sampler, in.uv).a * in.color.a;
+    if (u32(in.extra.w + 0.5) != 2u || alpha < 1.0) { discard; }
+    return vec4<f32>(0.0);
 }
 
 @fragment
@@ -837,7 +926,7 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
     let material_lq = layer >= 0 && g.env_spec.z <= 0.5 && g.sun_color.w > 0.5;
     // Material map coordinate and its screen gradients (taken here, in
     // uniform control flow): the mesh's UVs, or the box face in studs.
-    var muv = face_studs(in.objn, in.local, in.half) * in.mscale.xy + in.mscale.zw;
+    var muv = face_studs(in.objn, in.local, in.half, in.oblique) * in.mscale.xy + in.mscale.zw;
     if ((code & 8u) != 0u) {
         muv = in.uv;
     }
@@ -849,8 +938,16 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
     // Two-sided meshes: light the side that faces the camera, whatever the
     // triangle winding (imported meshes wind either way).
     if (dot(n, g.cam_pos.xyz - in.world) < 0.0) { n = -n; }
-    var base = in.color.rgb;
+    var base = in.color.rgb * in.vtint.rgb;
     var alpha = in.color.a;
+    // Studio's opaque pass ignores VARYING2.w and texel alpha (MeshPart
+    // TextureID, SpecialMesh TextureId: transparent texels draw their RGB);
+    // once the part is translucent (Transparency > 0) both multiply alpha
+    // (2026-11-13 Studio quads, MECHANICS.md "Lighting model").
+    let translucent = alpha < 0.999;
+    if (translucent) {
+        alpha = alpha * in.vtint.a;
+    }
     // Textures: 1 = over the part colour (mesh textures, clothing), 2 =
     // decal (its own alpha, tinted by Color3). Studio squares the raw texel
     // (× Color3) like every colour (DefaultUnifiedFlatOpaqueFS,
@@ -877,17 +974,23 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         return vec4<f32>(mix(base, fog_rgb_at(in.world), fog) * cover, cover * (1.0 - fog));
     }
     if (mode == 1u) {
-        base = mix(base, t.rgb * in.emissive_albedo, t.a);
+        base = mix(base, t.rgb * in.emissive_albedo * in.vtint.rgb, t.a);
     } else if (mode == 2u) {
         base = t.rgb * base;
         alpha = alpha * t.a;
     } else if (mode == 3u) {
-        base = t.rgb * in.emissive_albedo;
+        base = t.rgb * in.emissive_albedo * in.vtint.rgb;
+        if (translucent) { alpha = alpha * t.a; }
     } else if (mode == 5u) {
-        base = t.rgb * in.color.rgb;
+        base = t.rgb * in.color.rgb * in.vtint.rgb;
+        if (translucent) { alpha = alpha * t.a; }
     } else if (mode == 4u) {
-        base = t.rgb * in.emissive_albedo;
-        if (t.a < 0.5) {
+        // SurfaceAppearance AlphaMode Transparency: a cutout at half alpha
+        // while opaque, blended by texel alpha once translucent.
+        base = t.rgb * in.emissive_albedo * in.vtint.rgb;
+        if (translucent) {
+            alpha = alpha * t.a;
+        } else if (t.a < 0.5) {
             discard;
         }
     }
@@ -1056,7 +1159,7 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         }
         let vd = normalize(in.world - g.cam_pos.xyz);
         let shadow = sun_shadow(in.world, up);
-        let lit = base * (g.ambient.rgb + g.outdoor.rgb * light_grid(in.world, up)
+        let lit = base * (g.ambient.rgb + g.outdoor.rgb * light_grid(in.world, up) * sky_gain()
             + g.sun_color.rgb * g.sun_dir.w * shadow * WATER_SUN);
         let fres = clamp((clamp(0.78 - 2.5 * abs(dot(n, vd)), 0.0, 1.0) + 0.3) * in.emissive.x, 0.0, 1.0);
         if (below) {
@@ -1073,11 +1176,9 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         }
         return vec4<f32>(c * alpha, alpha);
     } else if (kind > 0.5 && kind < 1.5) {
-        // Neon glows at its own colour, unlit (and blooms).
+        // Neon glows at its own colour, unlit (and blooms). See-through
+        // Neon blends the same radiance (neon_over_scene below).
         c = base * base * NEON_GLOW;
-        if (alpha < 0.999) {
-            c = clamp(c - vec3<f32>(NEON_SEE_THROUGH_CUT), vec3<f32>(0.0), vec3<f32>(NEON_SEE_THROUGH_MAX));
-        }
     } else {
         let l = normalize(g.sun_dir.xyz);
         let ndl = max(dot(n, l), 0.0);
@@ -1117,7 +1218,7 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
             let a = pow(rough, 4.0);
             let d = (nh * a - nh) * nh + 1.0;
             let dterm = (a + a * a) / (d * d * (lh * 3.0 + 0.5) * (nh * 0.75 + 0.25));
-            sun_spec = fs * dterm * ndl * shadow * g.sun_color.rgb * g.sun_dir.w;
+            sun_spec = fs * dterm * ndl * shadow * g.sun_color.rgb * g.sun_dir.w * sun_cover();
         }
         let sun_light = g.sun_color.rgb * g.sun_dir.w * ndl * shadow;
         // Lamp1 lights what faces away from Lamp0, through the same shadow
@@ -1135,7 +1236,7 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         // LQ TiledFS.0 uses AmbientColorNoIBL / SkyAmbientNoIBL and
         // geometric (vertex) normals, with no environment BRDF contribution.
         var light = select((kd - fe * sS * kd) * env_cube(n, sv), vec3<f32>(0.0), material_lq)
-            + g.ambient.rgb + g.outdoor.rgb * sv
+            + g.ambient.rgb + g.outdoor.rgb * sv * sky_gain()
             + (kd - fs * sS * kd) * sun_light
             + g.lamp1.rgb * kd * back;
         let local = local_pbr(in.world, select(n, normalize(in.normal), g.sun_color.w > 0.5), v, rough, f0, kd, sS);
@@ -1203,33 +1304,25 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
     }
     // Hover highlight.
     c = c + vec3<f32>(0.004, 0.008, 0.014) * step(1.5, in.extra.z);
-    // Premultiplied (see-through parts blend One, OneMinusSrcAlpha): see-
-    // through Neon adds its glow over what's behind without hiding it, as
-    // Studio's does (round 26: the floor under lightwall's panels keeps its
-    // red channel exactly).
-    let glow_only = kind > 0.5 && kind < 1.5 && alpha < 0.999;
-    var cover = alpha;
-    if (glow_only) {
-        cover = 0.0;
-    }
-    // Fog (FogStart..FogEnd, FogColor). The glow of see-through Neon fades
-    // with it instead (what's behind is fogged already): Studio's Neon FS
-    // mixes toward the fog colour by the same amount and covers what's
-    // behind by 1 − visibility × alpha (DefaultUnifiedNeonFS).
+    // Premultiplied (see-through parts blend One, OneMinusSrcAlpha).
+    let see_through_neon = kind > 0.5 && kind < 1.5 && alpha < 0.999;
+    // Fog (FogStart..FogEnd, FogColor); DefaultUnifiedNeonFS mixes Neon
+    // toward the fog colour by the same visibility.
+    var visibility = 1.0;
     if (g.fog.z > 0.5) {
         let d = length(in.world - g.cam_pos.xyz);
         let f = fog_amount(d);
-        if (glow_only) {
-            c = c * (1.0 - f);
-        } else {
-            c = mix(c, fog_rgb_at(in.world), f);
-        }
+        visibility = 1.0 - f;
+        c = mix(c, fog_rgb_at(in.world), f);
+    }
+    if (see_through_neon) {
+        return neon_over_scene(c, 1.0 - visibility * (1.0 - alpha), in.clip.xy);
     }
     if (glass_scene_alpha >= 0.0) {
         let visibility = select(1.0, 1.0 - fog_amount(length(in.world - g.cam_pos.xyz)), g.fog.z > 0.5);
         return vec4<f32>(c, glass_scene_alpha * visibility);
     }
-    return vec4<f32>(c * alpha, cover);
+    return vec4<f32>(c * alpha, alpha);
 }
 
 // --------------------------------------------------------------- water
@@ -1329,12 +1422,9 @@ fn fs_water(in: PartOut) -> @location(0) vec4<f32> {
     if (scene_d0 < view_d - 0.05) {
         discard;
     }
-    var up = normalize(in.normal);
-    let below = dot(up, cam - in.world) < 0.0;
-    if (under_water() && (!below || up.y < WATER_INSIDE_MIN_UP)) {
-        discard;
-    }
-    if (below) { up = -up; }
+    // Native captured water uses cull-none and shades every interface.
+    // Keep exit walls/bottoms; reverse-Z and scene depth resolve coverage.
+    let up = normalize(in.normal);
     let v = normalize(cam - in.world);
     // Ripples: the normal maps projected along the face's main axis every
     // 20 studs (× 0.05), two frames blended; normal X / Y in .w / .y.
@@ -1349,9 +1439,34 @@ fn fs_water(in: PartOut) -> @location(0) vec4<f32> {
         s = 0.0;
     }
     uv = uv * 0.05;
+    // SmoothWaterVS / FS: each triangle corner shifts the map by its cell's
+    // random byte r, (r, floor(r × 2.6651442)) × 0.1, and the three corner
+    // samples are blended by barycentric weight, so the 20-stud tile never
+    // repeats visibly. The bytes and weights come packed in the UVs (water
+    // mesh, viewport.rs).
+    let packed_x = floor(in.uv.x * 0.25 + 1e-3);
+    let packed_y = floor(in.uv.y * 0.25 + 1e-3);
+    let r0 = packed_x - floor(packed_x / 256.0) * 256.0;
+    let r1 = floor(packed_x / 256.0);
+    let r2 = packed_y;
+    let b0 = clamp(in.uv.x - packed_x * 4.0, 0.0, 1.0);
+    let b1 = clamp(in.uv.y - packed_y * 4.0, 0.0, 1.0);
+    let bw = vec3<f32>(b0, b1, max(1.0 - b0 - b1, 0.0)) / max(b0 + b1 + max(1.0 - b0 - b1, 0.0), 1e-4);
+    let o0 = vec2<f32>(r0, floor(r0 * 2.6651442)) * 0.1;
+    let o1 = vec2<f32>(r1, floor(r1 * 2.6651442)) * 0.1;
+    let o2 = vec2<f32>(r2, floor(r2 * 2.6651442)) * 0.1;
+    // One derivative set for all three (the offsets are constant per triangle).
+    let ddx_uv = dpdx(uv);
+    let ddy_uv = dpdy(uv);
+    let fa = i32(wp.frames.x);
+    let fb = i32(wp.frames.y);
     let t = mix(
-        textureSample(water_normals, water_sampler, uv, i32(wp.frames.x)),
-        textureSample(water_normals, water_sampler, uv, i32(wp.frames.y)),
+        textureSampleGrad(water_normals, water_sampler, uv + o0, fa, ddx_uv, ddy_uv) * bw.x
+            + textureSampleGrad(water_normals, water_sampler, uv + o1, fa, ddx_uv, ddy_uv) * bw.y
+            + textureSampleGrad(water_normals, water_sampler, uv + o2, fa, ddx_uv, ddy_uv) * bw.z,
+        textureSampleGrad(water_normals, water_sampler, uv + o0, fb, ddx_uv, ddy_uv) * bw.x
+            + textureSampleGrad(water_normals, water_sampler, uv + o1, fb, ddx_uv, ddy_uv) * bw.y
+            + textureSampleGrad(water_normals, water_sampler, uv + o2, fb, ddx_uv, ddy_uv) * bw.z,
         wp.wave.w);
     let xy = t.wy * 2.0 - vec2<f32>(1.0);
     let tz = sqrt(clamp(1.0 - dot(xy, xy), 0.0, 1.0));
@@ -1363,13 +1478,13 @@ fn fs_water(in: PartOut) -> @location(0) vec4<f32> {
     let nr = mix(up, nm, 0.25);
     // The lit water colour (as the LQ shader: no N·L).
     let shadow = sun_shadow(in.world, up);
-    let lit = in.color.rgb * (g.ambient.rgb + g.outdoor.rgb * light_grid(in.world, up)
+    let lit = in.color.rgb * (g.ambient.rgb + g.outdoor.rgb * light_grid(in.world, up) * sky_gain()
         + env_cube(nm, light_grid(in.world, up))
         + g.sun_color.rgb * g.sun_dir.w * shadow * WATER_SUN);
     // Refraction: the scene behind, offset by the ripples (0.05 of the
     // view), unless what's there is in front of the water.
     let size = wp.view.xy;
-    let px1 = px + vec2<f32>(nm.x, -nm.z) * 0.05 * size;
+    let px1 = px + nm.xz * 0.05 * size;
     let scene_d1 = (g.view_proj * vec4<f32>(scene_world(px1), 1.0)).w;
     let k1 = clamp(scene_d1 - view_d, 0.0, 1.0);
     let refr = mix(scene_rgb(px), scene_rgb(px1), k1);
@@ -1379,10 +1494,11 @@ fn fs_water(in: PartOut) -> @location(0) vec4<f32> {
     // through, and all of it far away (view depth × 0.004 − 1).
     let cover = clamp(clamp(depth * wp.frames.z + wp.frames.w, 0.0, 1.0)
         + clamp(view_d * 0.004 - 1.0, 0.0, 1.0), 0.0, 1.0);
+    // Captured native underwater draw459 (FS_8e27f425): the same depth
+    // blend and Fresnel run on both sides. No exit-interface transmission
+    // specialization was present in the executed shader.
     var c: vec3<f32>;
-    if (below) {
-        c = mix(refr, lit, WATER_BELOW_ALPHA);
-    } else {
+    {
         let under = mix(refr, lit, cover);
         let reflected = reflect(-v, nr);
         let tint = mix(g.sky_grad[1].rgb, g.sky_grad[0].rgb, clamp(reflected.y * 1.5882353, 0.0, 1.0));
@@ -1401,7 +1517,7 @@ fn fs_water(in: PartOut) -> @location(0) vec4<f32> {
         let den = (ndh * a2 - ndh) * ndh + 1.0;
         let dterm = (a2 + a2 * a2) / ((den * den) * (ldh * 3.0 + 0.5) * (ndh * 0.75 + 0.25));
         let spec_fade = clamp(1.0 - view_d * wp.view.z, 0.0, 1.0);
-        c += fr * dterm * clamp(dot(nm, l) * shadow, 0.0, 1.0) * g.sun_color.rgb * g.sun_dir.w * spec_fade;
+        c += fr * dterm * clamp(dot(nm, l) * shadow, 0.0, 1.0) * g.sun_color.rgb * g.sun_dir.w * spec_fade * sun_cover();
     }
     if (g.fog.z > 0.5) {
         c = mix(c, fog_rgb_at(in.world), fog_amount(water_d));
@@ -1421,19 +1537,25 @@ struct TerrainIn {
     @location(1) normal: vec4<f32>,  // snorm8: xyz, w = corner / 127
     @location(2) palette: vec4<u32>, // the corners' palette entries
     @location(3) axis: vec4<u32>,    // the corners' projection axes
+    @location(5) wind_local: vec4<f32>,
     @location(4) rnd: vec4<u32>,     // the corners' random bytes
 };
 
+// MSAA can cover a blade sliver without covering the pixel center. Use a
+// covered interpolation point so thin triangles cannot extrapolate root/tip
+// lighting and world positions far outside their vertex ranges.
 struct TerrainOut {
     @builtin(position) clip: vec4<f32>,
-    @location(0) world: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) bary: vec3<f32>,
-    @location(3) uv01: vec4<f32>,
-    @location(4) uv2: vec2<f32>,
+    @location(0) @interpolate(perspective, centroid) world: vec3<f32>,
+    @location(1) @interpolate(perspective, centroid) normal: vec3<f32>,
+    @location(2) @interpolate(perspective, centroid) bary: vec3<f32>,
+    @location(3) @interpolate(perspective, centroid) uv01: vec4<f32>,
+    @location(4) @interpolate(perspective, centroid) uv2: vec2<f32>,
     @location(5) @interpolate(flat) palette: vec4<u32>,
     @location(6) @interpolate(flat) axis: vec4<u32>,
     @location(7) @interpolate(flat) rnd: vec4<u32>,
+    @location(8) @interpolate(perspective, centroid) grass_direct: vec3<f32>,
+    @location(9) @interpolate(perspective, centroid) grass_view: vec4<f32>,
 };
 
 // Per palette entry (material × 3 + face), four vec4s:
@@ -1477,21 +1599,88 @@ fn terrain_uv(p: vec3<f32>, pal: u32, axis: u32, rnd: u32) -> vec2<f32> {
 // Decoration grass (terrain.rs grass_blades): a blade's tip sinks into the
 // ground with distance (Studio's Grass VS: smoothstep over the fade range
 // times the blade's height), so far grass shrinks instead of popping.
-const GRASS_FADE_START: f32 = 150.0;
-const GRASS_FADE_LEN: f32 = 100.0;
-const GRASS_BLADE_SHADE: f32 = 0.62;
+// Grass bounds are supplied by the shared Rust configuration.
+// Studio blades have an untextured olive albedo, independent of ground texels.
+const GRASS_BLADE_COLOR: vec3<f32> = vec3<f32>(106.0, 127.0, 63.0) / 255.0;
+
+// Native Grass VS value noise, validated against retained post-VS capture.
+fn grass_hash(cell: vec2<f32>) -> f32 {
+    // Clamp preserves the finite coordinate range and prevents multiply-add
+    // contraction across the native hash rounding boundary.
+    let scaled = clamp(cell * 0.3183099031448364, vec2<f32>(-1e20), vec2<f32>(1e20));
+    let a = fract(scaled + vec2<f32>(0.7099999785423279, 0.11299999803304672)) * 50.0;
+    return -1.0 + 2.0 * fract((a.x * a.y) * (a.x + a.y));
+}
+fn grass_noise(q: vec2<f32>) -> f32 {
+    let cell = floor(q);
+    let f = fract(q);
+    let u = (f * f) * (vec2<f32>(3.0) - 2.0 * f);
+    let a = grass_hash(cell) * (1.0-u.x) + grass_hash(cell+vec2<f32>(1.0,0.0)) * u.x;
+    let b = grass_hash(cell+vec2<f32>(0.0,1.0)) * (1.0-u.x) + grass_hash(cell+vec2<f32>(1.0,1.0)) * u.x;
+    return a * (1.0-u.y) + b * u.y;
+}
+fn grass_wind(local: vec2<f32>, phase: f32, direction: vec2<f32>, offset: vec2<f32>, bias: f32, amplitude: f32) -> vec2<f32> {
+    return (direction * 0.4 * amplitude) * (grass_noise(local + vec2<f32>(phase) + 2.0 * offset) + bias);
+}
+// Color pass: wind, then sinking (Studio GrassVSUnified).
+fn terrain_position(v: TerrainIn) -> vec3<f32> {
+    return grass_position(v, true);
+}
+// Sun caster pass: Studio's GrassShadowVS_ (the sun cascades' grass caster,
+// VS4426 in checks/grass-full-re/sweep) has no wind term, only the distance
+// sink, so blade shadows hold still while the blades sway. Drawing swaying
+// blades into the 0.07-stud cascade-0 texels made every frame's shadow
+// differ (checks/grass-shadow-stability).
+fn grass_position(v: TerrainIn, wind: bool) -> vec3<f32> {
+    return grass_position_from(v, wind, g.cam_pos.xyz);
+}
+// `eye`: where the distance sink is measured from. The colour pass uses the
+// camera; Studio's sun caster pass has its Globals CameraPosition set to the
+// cascade's sphere centre, so blades far from that centre are cast sunk.
+fn grass_position_from(v: TerrainIn, wind: bool, eye: vec3<f32>) -> vec3<f32> {
+    var p = v.pos;
+    if (v.palette.w > 0u) {
+        // cam_pos.w is elapsed seconds. Phase is in noise-cell units;
+        // one cell/second is the explicit compatibility rate (epoch is local).
+        let phase = g.cam_pos.w * 1.0;
+        if (wind && v.palette.w == 2u) {
+            let w = grass_wind(v.wind_local.xy, phase, vec2<f32>(0.5), vec2<f32>(0.0), 0.0, v.wind_local.z);
+            p.x += w.x;
+            p.z += w.y;
+        }
+        let d = length(eye - p);
+        let height = v.wind_local.w;
+        let fade_end = select(GRASS_RADIUS, GRASS_NEAR_RADIUS, v.axis.w == 1u);
+        let fade_len = select(GRASS_FADE_LEN, GRASS_NEAR_FADE_LEN, v.axis.w == 1u);
+        let visibility = 1.0 - smoothstep(fade_end - fade_len, fade_end, d);
+        p.y -= (1.0 - visibility) * height;
+    }
+    return p;
+}
 
 @vertex
 fn vs_terrain(v: TerrainIn) -> TerrainOut {
     var o: TerrainOut;
-    var p = v.pos;
-    if (v.palette.w == 2u) {
-        let d = length(g.cam_pos.xyz - p);
-        p.y -= smoothstep(0.0, 1.0, (d - GRASS_FADE_START) / GRASS_FADE_LEN) * f32(v.rnd.w) / 32.0;
-    }
+    let p = terrain_position(v);
     o.clip = g.view_proj * vec4<f32>(p, 1.0);
     o.world = p;
     o.normal = v.normal.xyz;
+    // Grass frame data.x = 2.2 + 1.7 * Lamp0Dir.y. Lamp0Dir points
+    // away from the sun; our sun_dir points toward it.
+    // Actual capture draw248 cb2[3]=(1.2,.6) on the tint path.
+    // Legacy recolor uses (1,0); attenuation is interpolated after VS.
+    let grass_tint = tp.p[v.palette.x * 4u + 2u].w > 0.5;
+    let grass_height = select(vec2<f32>(1.0, 0.0), vec2<f32>(1.2, 0.6), grass_tint);
+    let grass_ao = exp2((-select(1.0, 0.0, v.palette.w == 2u) * grass_height.x + grass_height.y) * (2.2 - 1.7 * g.sun_dir.y));
+    let grass_l = normalize(g.sun_dir.xyz);
+    let grass_v = normalize(g.cam_pos.xyz - p);
+    let grass_h = normalize(grass_l + grass_v);
+    let grass_nl = abs(dot(v.normal.xyz, grass_l));
+    let grass_fade = 1.0 - clamp((length(g.cam_pos.xyz - p) - (GRASS_RADIUS) + 40.0) * 0.025, 0.0, 1.0);
+    o.grass_direct = g.sun_color.rgb * g.sun_dir.w * clamp((grass_nl + 0.9) / 1.9, 0.0, 1.0) * grass_ao;
+    o.grass_view = vec4<f32>(grass_nl * 0.5 + 0.5, abs(dot(grass_h, v.normal.xyz)),
+        dot(grass_v, -grass_l) * grass_fade * grass_ao,
+        pow(clamp(grass_h.y, 0.0, 1.0), 8.0) * grass_fade * grass_ao);
     let corner = u32(round(v.normal.w * 127.0));
     o.bary = vec3<f32>(f32(corner == 0u), f32(corner == 1u), f32(corner == 2u));
     o.uv01 = vec4<f32>(
@@ -1520,7 +1709,7 @@ struct TerrainSample {
     glow: f32,
 };
 
-fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32) -> TerrainSample {
+fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32, blade: bool) -> TerrainSample {
     var s: TerrainSample;
     let a = tp.p[pal * 4u];
     let layer = i32(a.w);
@@ -1530,7 +1719,12 @@ fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32) -> Terr
     var t = vec4<f32>(tp.p[pal * 4u + 3u].rgb, 0.5);
     var su = vec4<f32>(0.5, 0.5, 1.0, 0.0);
     var glow = 0.0;
-    if (layer >= 0) {
+    if (blade) {
+        t = vec4<f32>(GRASS_BLADE_COLOR, 0.5);
+        // Grass color has no texture tint mask: native multiplies the tint directly.
+        su.a = 1.0;
+    }
+    if (layer >= 0 && !blade) {
         // Studio's terrain arrays are 512² (a 1024² pack drops its top
         // level), which is level 1 of the 1024² layer: never finer than that
         // (magnified, Studio filters its 512² level).
@@ -1548,7 +1742,15 @@ fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32) -> Terr
     // mask rides in the surface map's alpha).
     var y = ycocg(t.rgb);
     if (rc.w > 0.5) {
-        let ty = ycocg(t.rgb * mix(vec3<f32>(1.0), rc.rgb, su.a));
+        // Captured cb3 = square(base blade RGB * MaterialColor).
+        // The modern blade base is recovered from the bound palette upload.
+        // The blade base is the grass layer's mean albedo: built-in 2022
+        // Grass's captured bytes, or a loaded MaterialService override's
+        // ColorMap mean (row 3 .w = 1, viewport sync_terrain_params).
+        let mean = tp.p[pal * 4u + 3u];
+        let blade_base = select(vec3<f32>(194.0, 196.0, 188.0) / 255.0, mean.rgb, mean.w > 0.5);
+        let tint_base = select(t.rgb, blade_base, blade);
+        let ty = ycocg(tint_base * mix(vec3<f32>(1.0), rc.rgb, su.a));
         s.ycocg = ty;
         s.height = t.a;
         s.nxy = su.rg;
@@ -1566,6 +1768,11 @@ fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32) -> Terr
 
 @fragment
 fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
+    // Opt-in capture: same animated geometry, rasterizer and depth writes.
+    // Red = exposed terrain, green = decoration blade. No lighting inference.
+    if (TERRAIN_CAPTURE_ID) {
+        return select(vec4<f32>(1.0, 0.0, 0.0, 1.0), vec4<f32>(0.0, 1.0, 0.0, 1.0), in.palette.w > 0u);
+    }
     let n0 = normalize(in.normal);
     let d0x = dpdx(in.uv01.xy);
     let d0y = dpdy(in.uv01.xy);
@@ -1573,9 +1780,9 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     let d1y = dpdy(in.uv01.zw);
     let d2x = dpdx(in.uv2);
     let d2y = dpdy(in.uv2);
-    let s0 = terrain_sample(in.uv01.xy, d0x, d0y, in.palette.x);
-    let s1 = terrain_sample(in.uv01.zw, d1x, d1y, in.palette.y);
-    let s2 = terrain_sample(in.uv2, d2x, d2y, in.palette.z);
+    let s0 = terrain_sample(in.uv01.xy, d0x, d0y, in.palette.x, in.palette.w > 0u);
+    let s1 = terrain_sample(in.uv01.zw, d1x, d1y, in.palette.y, in.palette.w > 0u);
+    let s2 = terrain_sample(in.uv2, d2x, d2y, in.palette.z, in.palette.w > 0u);
     // Height blend (FS HQ): each corner's height remapped and weighted by its
     // barycentric; the highest wins over a softness of bary · sharpness; back
     // to plain barycentrics as the texture gets small on screen.
@@ -1610,8 +1817,7 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     let bit = mix(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -n0.z, n0.y), edge);
     var n = normalize(tan * nb.x + bit * nb.y + n0 * nb.z);
     if (in.palette.w > 0u) {
-        // A grass blade: the ground's colour, darker, a little varied per blade.
-        albedo = albedo * GRASS_BLADE_SHADE * (0.85 + 0.3 * f32(in.rnd.x) / 255.0);
+        // Flat blade colour still follows Terrain.MaterialColors via recolor.
         n = n0;
     }
     let rough = 0.089 + 0.911 * (s0.rough * w.x + s1.rough * w.y + s2.rough * w.z);
@@ -1623,10 +1829,15 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
 
     let l = normalize(g.sun_dir.xyz);
     let ndl = max(dot(n, l), 0.0);
-    let shadow = select(1.0, sun_shadow(in.world, n0), ndl > 0.0);
+    // Bound terrain FS event271 _1136: world - Lamp0Dir * bits981668463
+    // before both cascade selection and matrix lookup. Grass FS4403 has no bias.
+    let shadow = select(1.0, sun_visibility_at(in.world, n0,
+        in.world + g.sun_dir.xyz * bitcast<f32>(981668463u)) * sun_cover(), ndl > 0.0);
     // The light grid's skylight (SmoothCluster FS HQ: LightGridSkylight .x
     // scales SkyAmbient and the sky's share of the ambient cube).
-    let sv = light_grid(in.world, n0);
+    // Captured Grass VS samples at world + (0,6,0), independent of blade normal.
+    let grid_n = select(n0, vec3<f32>(0.0, 1.0, 0.0), in.palette.w > 0u);
+    let sv = light_grid(in.world, grid_n);
     // FS HQ: F0 0.04 with the environment BRDF (PrecomputedBRDF at roughness,
     // N·V), the sun's Schlick Fresnel at L·H; both take their share from the
     // diffuse light, scaled by EnvironmentSpecularScale (fading with distance).
@@ -1640,11 +1851,37 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     let vh = dot(l, hv);
     let e5 = pow(1.0 - clamp(vh, 0.0, 1.0), 5.0);
     let fr = e5 + 0.04 * (1.0 - e5);
-    var light = (1.0 - fe * sS) * env_cube(n, sv) + g.ambient.rgb + g.outdoor.rgb * sv
+    var light = (1.0 - fe * sS) * env_cube(n, sv) + g.ambient.rgb + g.outdoor.rgb * sv * sky_gain()
         + (1.0 - fr * sS) * g.sun_color.rgb * g.sun_dir.w * ndl * shadow + glow;
     // SmoothCluster VS/FS includes Lamp1 on faces turned away from the sun.
     light += g.lamp1.rgb * max(-dot(n, l), 0.0);
     light += local_lights(in.world, select(n, n0, g.sun_color.w > 0.5));
+    if (in.palette.w > 0u) {
+        // SHQ grass variants 3/7 add transmitted sunlight and a narrow
+        // highlight. All angular terms and root attenuation are VS outputs.
+        let grass_shadow = select(1.0, sun_shadow(in.world, grid_n), g.env_spec.z > 0.5);
+        // Actual bound FS reads CB0[13/14], including the averaged IBL
+        // fallback, rather than NoIBL rows 32/33. Native sky cube is
+        // stored minus indoor; g.env holds the absolute outdoor cube.
+        var grass_indoor = vec3<f32>(0.0);
+        var grass_sky = vec3<f32>(0.0);
+        for (var i = 0u; i < 6u; i += 1u) {
+            grass_indoor += g.env_indoor[i].rgb / 6.0;
+            grass_sky += g.env[i].rgb / 6.0;
+        }
+        let grass_ambient = g.ambient.rgb + grass_indoor;
+        let grass_outdoor = g.outdoor.rgb + grass_sky - grass_indoor;
+        var grass_c = albedo * albedo * (grass_ambient + grass_outdoor * sv + in.grass_direct * grass_shadow);
+        if (g.env_spec.z > 0.5) {
+            let transmission = clamp(in.grass_view.z * pow(in.grass_view.x, 3.0), 0.0, 1.0);
+            let highlight = pow(clamp(in.grass_view.y, 0.0, 1.0), 12.0) * in.grass_view.w;
+            grass_c += (albedo * albedo * transmission + vec3<f32>(highlight * sun_cover())) * g.sun_color.rgb * g.sun_dir.w * grass_shadow;
+        }
+        if (g.fog.z > 0.5) {
+            grass_c = mix(grass_c, fog_rgb_at(in.world), fog_amount(length(in.world - g.cam_pos.xyz)));
+        }
+        return vec4<f32>(grass_c, 1.0);
+    }
     var c = base * light;
     // Sun highlight: GGX (a = roughness⁴), and the prefiltered environment
     // along the reflection at mip roughness × 5.
@@ -1652,7 +1889,7 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     let nh = max(dot(n, hv), 0.001);
     let dd = nh * nh * (a2 - 1.0) + 1.0;
     let spec = fr * (a2 + a2 * a2) / (dd * dd * (vh * 3.0 + 0.5) * (nh * 0.75 + 0.25));
-    c += g.sun_color.rgb * g.sun_dir.w * spec * ndl * shadow * fade;
+    c += g.sun_color.rgb * g.sun_dir.w * spec * ndl * shadow * fade * sun_cover();
     c += env_reflect(reflect(-v, n), rough, sv, false) * fe * sS;
     if (g.fog.z > 0.5) {
         let d = length(in.world - g.cam_pos.xyz);
@@ -1668,6 +1905,12 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
 
 struct SunPass {
     vp: mat4x4<f32>,
+    rect: vec4<f32>,
+    hw: array<vec4<f32>, 3>,
+    vw: array<vec4<f32>, 2>,
+    vo: vec4<f32>,
+    // The cascade's sphere centre (sun_shadow.rs PassRaw.centre).
+    centre: vec4<f32>,
 };
 @group(1) @binding(0) var<uniform> sunp: SunPass;
 
@@ -1678,7 +1921,7 @@ struct TerrainShadowOut {
 @vertex
 fn vs_terrain_shadow(v: TerrainIn) -> TerrainShadowOut {
     var o: TerrainShadowOut;
-    o.clip = sunp.vp * vec4<f32>(v.pos, 1.0);
+    o.clip = sunp.vp * vec4<f32>(grass_position_from(v, false, sunp.centre.xyz), 1.0);
     o.clip.z = max(o.clip.z, 0.0);
     return o;
 }
@@ -1841,6 +2084,7 @@ fn fs_bloom_bright(in: PostOut) -> @location(0) vec4<f32> {
 @fragment fn fs_bloom_down(in: PostOut) -> @location(0) vec4<f32> {
     let t = 1.0 / vec2<f32>(textureDimensions(hdr_tex));
     var c = textureSampleLevel(hdr_tex, hdr_sampler, in.uv, 0.0).rgb;
+    if (TERRAIN_CAPTURE_ID) { return vec4<f32>(c, 1.0); }
     let offsets = array<vec2<f32>,8>(vec2<f32>(0.75,0.0),vec2<f32>(-0.75,0.0),vec2<f32>(0.0,0.75),vec2<f32>(0.0,-0.75),vec2<f32>(0.70512277),vec2<f32>(-0.70512277),vec2<f32>(0.70512277,-0.70512277),vec2<f32>(-0.70512277,0.70512277));
     for(var i=0;i<8;i++){ c += textureSampleLevel(hdr_tex,hdr_sampler,clamp(in.uv+offsets[i]*t*2.0,t*0.5,vec2<f32>(1.0)-t*0.5),0.0).rgb; }
     return vec4<f32>(c/9.0,1.0);
@@ -1909,35 +2153,205 @@ vec2<f32>(0.22490672767162322998046875, 0.16340430080890655517578125),
     vec2<f32>(0.4457383453845977783203125, -0.8951632976531982421875),
     vec2<f32>(0.73900890350341796875, -0.673695623874664306640625),
     vec2<f32>(0.93247222900390625, -0.3612416684627532958984375));
+const DOF_CHEAP_DISK: array<vec2<f32>, 27> = array<vec2<f32>, 27>(
+    vec2<f32>(0.5400000215, 0),
+    vec2<f32>(0.436869204, 0.3174040616),
+    vec2<f32>(0.1668691784, 0.5135705471),
+    vec2<f32>(-0.1668691784, 0.5135705471),
+    vec2<f32>(-0.436869204, 0.3174040616),
+    vec2<f32>(-0.5400000215, 6.612874893e-17),
+    vec2<f32>(-0.436869204, -0.3174040616),
+    vec2<f32>(-0.1668691784, -0.5135705471),
+    vec2<f32>(0.1668691784, -0.5135705471),
+    vec2<f32>(0.436869204, -0.3174040616),
+    vec2<f32>(1, 0),
+    vec2<f32>(0.932472229, 0.3612416685),
+    vec2<f32>(0.7390089035, 0.6736956239),
+    vec2<f32>(0.4457383454, 0.8951632977),
+    vec2<f32>(0.09226836264, 0.9957341552),
+    vec2<f32>(-0.2736629844, 0.9618256688),
+    vec2<f32>(-0.6026346087, 0.7980172038),
+    vec2<f32>(-0.8502171636, 0.5264321566),
+    vec2<f32>(-0.9829730988, 0.1837495118),
+    vec2<f32>(-0.9829730988, -0.1837495118),
+    vec2<f32>(-0.8502171636, -0.5264321566),
+    vec2<f32>(-0.6026346087, -0.7980172038),
+    vec2<f32>(-0.2736629844, -0.9618256688),
+    vec2<f32>(0.09226836264, -0.9957341552),
+    vec2<f32>(0.4457383454, -0.8951632977),
+    vec2<f32>(0.7390089035, -0.6736956239),
+    vec2<f32>(0.932472229, -0.3612416685)
+);
 fn dof_coc(uv: vec2<f32>) -> f32 {
     let d = fx_distance(uv);
-    let far = clamp((d - g.dof.x - g.dof.y) / d, 0.0, 1.0);
-    let near = clamp((g.dof.x - g.dof.y - d) / d, 0.0, 1.0);
-    return max(select(0.0, far, g.dof.w > 0.0), select(0.0, near, g.dof.z > 0.0));
+    let far = clamp((d - g.dof.x - g.dof.y - 0.5) / d, 0.0, 1.0);
+    let near = clamp((g.dof.x - g.dof.y + 0.5 - d) / d, 0.0, 1.0);
+    // Preserve which side of focus produced the CoC through the half-size pass.
+    // BokehFarCoCFS uses its far radius parameter, independently of near.
+    return select(select(0.0, far, g.dof.w > 0.0), -near, near > 0.0 && g.dof.z > 0.0);
 }
 @fragment fn fs_dof_h(in: PostOut) -> @location(0) vec4<f32> {
-    let c = tonemap(textureSampleLevel(hdr_tex, hdr_sampler, in.uv, 0.0).rgb * g.params.y);
-    return vec4<f32>(c*c, dof_coc(in.uv));
+    // DOFFullscreenFarFieldCoCFS decodes scene RGB squared times exposure.
+    // The renderer stores that radiance directly in its floating-point target.
+    let c = textureSampleLevel(hdr_tex, hdr_sampler, in.uv, 0.0).rgb;
+    return vec4<f32>(c, dof_coc(in.uv));
+}
+// Native CPU writer Studio: reduction footprint
+// is the fraction removed along each axis, normalized by full viewport width.
+fn near_reduction_params() -> vec2<f32> {
+    let full = vec2<f32>(textureDimensions(fx_depth_ms));
+    let quarter = max(floor((full + (full % 2.0)) / 4.0), vec2<f32>(1.0));
+    return vec2<f32>(2.0 * (full.x - quarter.x), full.x - quarter.y) / full.x;
+}
+// The shared far prepare stores squared color. Undo it at texel centers
+// before linear filtering, then square the filtered color as native H4 does.
+fn near_color(uv: vec2<f32>) -> vec3<f32> {
+    let size = vec2<i32>(textureDimensions(hdr_tex));
+    let p = uv * vec2<f32>(size) - 0.5;
+    let b = vec2<i32>(floor(p)); let f = fract(p);
+    let hi = size - vec2<i32>(1);
+    let a = sqrt(max(textureLoad(hdr_tex,clamp(b,vec2<i32>(0),hi),0).rgb,vec3<f32>(0)));
+    let c = sqrt(max(textureLoad(hdr_tex,clamp(b+vec2<i32>(1,0),vec2<i32>(0),hi),0).rgb,vec3<f32>(0)));
+    let d = sqrt(max(textureLoad(hdr_tex,clamp(b+vec2<i32>(0,1),vec2<i32>(0),hi),0).rgb,vec3<f32>(0)));
+    let e = sqrt(max(textureLoad(hdr_tex,clamp(b+vec2<i32>(1,1),vec2<i32>(0),hi),0).rgb,vec3<f32>(0)));
+    return mix(mix(a,c,f.x),mix(d,e,f.x),f.y);
+}
+@fragment fn fs_near_h(in: PostOut) -> @location(0) vec4<f32> {
+    let full = vec2<f32>(textureDimensions(fx_depth_ms));
+    let quarter_width = max(floor((full.x + (full.x % 2.0)) / 4.0), 1.0);
+    let dx = near_reduction_params().x / quarter_width;
+    let uv_max = vec2<f32>(1.0) - 0.5 / vec2<f32>(quarter_width, full.y);
+    var color = vec3<f32>(0.0); var coc = 0.0;
+    for (var i=0; i<4; i++) {
+        let uv = min(in.uv + vec2<f32>((f32(i)-1.5)*dx,0.0), uv_max);
+        let c = near_color(uv);
+        let d = fx_distance(uv);
+        color += c*c * 0.25;
+        coc = max(coc, clamp((g.dof.x-g.dof.y+0.5-d)/d,0.0,1.0));
+    }
+    return vec4<f32>(color,coc);
+}
+@fragment fn fs_near_v(in: PostOut) -> @location(0) vec4<f32> {
+    let full = vec2<f32>(textureDimensions(fx_depth_ms));
+    let quarter = max(floor((full + (full % 2.0)) / 4.0), vec2<f32>(1.0));
+    let dy = near_reduction_params().y / quarter.y;
+    let uv_max = vec2<f32>(1.0) - 0.5 / vec2<f32>(quarter.x, full.y);
+    let a = textureSampleLevel(hdr_tex,hdr_sampler,min(in.uv+vec2<f32>(0.0,0.5*dy),uv_max),0.0);
+    let b = textureSampleLevel(hdr_tex,hdr_sampler,min(in.uv-vec2<f32>(0.0,0.5*dy),uv_max),0.0);
+    return vec4<f32>((a.rgb+b.rgb)*0.5,max(a.a,b.a));
+}
+@fragment fn fs_near_mask0(in: PostOut) -> @location(0) vec4<f32> {
+    let step = vec2<f32>(1.0,0.0) / vec2<f32>(textureDimensions(hdr_tex)) * near_reduction_params().x;
+    let a = textureSampleLevel(hdr_tex,hdr_sampler,in.uv,0.0).a;
+    let b = textureSampleLevel(hdr_tex,hdr_sampler,in.uv+step,0.0).a;
+    let c = textureSampleLevel(hdr_tex,hdr_sampler,in.uv+2.0*step,0.0).a;
+    let d = textureSampleLevel(hdr_tex,hdr_sampler,in.uv-step,0.0).a;
+    let e = textureSampleLevel(hdr_tex,hdr_sampler,in.uv-2.0*step,0.0).a;
+    return vec4<f32>(max(a,max(max(b,c),max(d,e))));
+}
+@fragment fn fs_near_mask1(in: PostOut) -> @location(0) vec4<f32> {
+    let step = vec2<f32>(0.0,1.0) / vec2<f32>(textureDimensions(hdr_tex)) * near_reduction_params().y;
+    let a = textureSampleLevel(hdr_tex,hdr_sampler,in.uv,0.0).r;
+    let b = textureSampleLevel(hdr_tex,hdr_sampler,in.uv+step,0.0).r;
+    let c = textureSampleLevel(hdr_tex,hdr_sampler,in.uv+2.0*step,0.0).r;
+    let d = textureSampleLevel(hdr_tex,hdr_sampler,in.uv-step,0.0).r;
+    let e = textureSampleLevel(hdr_tex,hdr_sampler,in.uv-2.0*step,0.0).r;
+    return vec4<f32>(max(a,max(max(b,c),max(d,e))));
+}
+@fragment fn fs_near_mask2(in: PostOut) -> @location(0) vec4<f32> {
+    let step = vec2<f32>(1.0,0.0) / vec2<f32>(textureDimensions(hdr_tex)) * g.dof.z;
+    let a = textureSampleLevel(hdr_tex,hdr_sampler,in.uv,0.0).r;
+    let b = textureSampleLevel(hdr_tex,hdr_sampler,in.uv+step,0.0).r;
+    let c = textureSampleLevel(hdr_tex,hdr_sampler,in.uv+2.0*step,0.0).r;
+    let d = textureSampleLevel(hdr_tex,hdr_sampler,in.uv-step,0.0).r;
+    let e = textureSampleLevel(hdr_tex,hdr_sampler,in.uv-2.0*step,0.0).r;
+    return vec4<f32>(max(a,max(max(b,c),max(d,e))));
+}
+@fragment fn fs_near_mask3(in: PostOut) -> @location(0) vec4<f32> {
+    let step = vec2<f32>(0.0,1.0) / vec2<f32>(textureDimensions(hdr_tex)) * g.dof.z;
+    let a = textureSampleLevel(hdr_tex,hdr_sampler,in.uv,0.0).r;
+    let b = textureSampleLevel(hdr_tex,hdr_sampler,in.uv+step,0.0).r;
+    let c = textureSampleLevel(hdr_tex,hdr_sampler,in.uv+2.0*step,0.0).r;
+    let d = textureSampleLevel(hdr_tex,hdr_sampler,in.uv-step,0.0).r;
+    let e = textureSampleLevel(hdr_tex,hdr_sampler,in.uv-2.0*step,0.0).r;
+    return vec4<f32>(max(a,max(max(b,c),max(d,e))));
+}
+@fragment fn fs_near_mask4(in: PostOut) -> @location(0) vec4<f32> {
+    let step = vec2<f32>(1.0,0.0) / vec2<f32>(textureDimensions(hdr_tex)) * g.dof.z;
+    let a = textureSampleLevel(hdr_tex,hdr_sampler,in.uv,0.0).r;
+    let b = textureSampleLevel(hdr_tex,hdr_sampler,in.uv+step,0.0).r;
+    let c = textureSampleLevel(hdr_tex,hdr_sampler,in.uv+2.0*step,0.0).r;
+    let d = textureSampleLevel(hdr_tex,hdr_sampler,in.uv-step,0.0).r;
+    let e = textureSampleLevel(hdr_tex,hdr_sampler,in.uv-2.0*step,0.0).r;
+    return vec4<f32>(min(a,min(max(b,c),min(d,e))));
+}
+@fragment fn fs_near_mask5(in: PostOut) -> @location(0) vec4<f32> {
+    let step = vec2<f32>(0.0,1.0) / vec2<f32>(textureDimensions(hdr_tex)) * g.dof.z;
+    let a = textureSampleLevel(hdr_tex,hdr_sampler,in.uv,0.0).r;
+    let b = textureSampleLevel(hdr_tex,hdr_sampler,in.uv+step,0.0).r;
+    let c = textureSampleLevel(hdr_tex,hdr_sampler,in.uv+2.0*step,0.0).r;
+    let d = textureSampleLevel(hdr_tex,hdr_sampler,in.uv-step,0.0).r;
+    let e = textureSampleLevel(hdr_tex,hdr_sampler,in.uv-2.0*step,0.0).r;
+    return vec4<f32>(min(a,min(max(b,c),min(d,e))));
+}
+// Executed native event700 (completion-shader-700.spv). Keep the second
+// predicate's color red channel: this is the actual register value flow.
+@fragment fn fs_near_edge(in: PostOut) -> @location(0) vec4<f32> {
+    let step = 1.0 / vec2<f32>(textureDimensions(hdr_tex));
+    let center = textureSampleLevel(hdr_tex,hdr_sampler,in.uv,0.0);
+    let threshold = textureSampleLevel(bloom_tex,hdr_sampler,in.uv,0.0).r * 1.05;
+    let offsets = array<vec2<f32>,4>(vec2<f32>(-1.0,-1.0),vec2<f32>(1.0,-1.0),vec2<f32>(-1.0,1.0),vec2<f32>(1.0,1.0));
+    var sum = center.rgb; var count = 1.0;
+    for (var i=0;i<4;i++) {
+        let uv = in.uv + offsets[i]*step;
+        let color = textureSampleLevel(hdr_tex,hdr_sampler,uv,0.0).rgb;
+        let mask = textureSampleLevel(bloom_tex,hdr_sampler,uv,0.0).r;
+        if (threshold >= select(mask,color.r,i==1)) { sum += color; count += 1.0; }
+    }
+    return vec4<f32>(sum/count,center.a);
+}
+@fragment fn fs_near_bokeh(in: PostOut) -> @location(0) vec4<f32> {
+    let center = textureSampleLevel(hdr_tex,hdr_sampler,in.uv,0.0);
+    let size = vec2<f32>(textureDimensions(hdr_tex));
+    let mask = textureSampleLevel(bloom_tex,hdr_sampler,in.uv,0.0).r;
+    let radius = mask*mask*g.dof.z;
+    let scale = vec2<f32>(size.y/size.x,1.0)*0.014;
+    var sum = center; var weight = mask*mask;
+    for (var i=0; i<45; i++) {
+        let uv = in.uv + DOF_DISK[i]*radius*scale;
+        let t = textureSampleLevel(hdr_tex,hdr_sampler,uv,0.0);
+        if (all(uv>=vec2<f32>(0.0)) && all(uv<=vec2<f32>(1.0))) {sum += t*t.a; weight += t.a;}
+    }
+    return sum*clamp(1.0/(weight+0.001),0.0,1.0);
+}
+@fragment fn fs_near_tent(in: PostOut) -> @location(0) vec4<f32> {
+    let step = 0.5/vec2<f32>(textureDimensions(hdr_tex));
+    return (textureSampleLevel(hdr_tex,hdr_sampler,in.uv+step,0.0)+textureSampleLevel(hdr_tex,hdr_sampler,in.uv-step,0.0)+textureSampleLevel(hdr_tex,hdr_sampler,in.uv+step*vec2<f32>(1.0,-1.0),0.0)+textureSampleLevel(hdr_tex,hdr_sampler,in.uv+step*vec2<f32>(-1.0,1.0),0.0))*0.25;
 }
 @fragment fn fs_dof_v(in: PostOut) -> @location(0) vec4<f32> {
     let center = textureSampleLevel(hdr_tex, hdr_sampler, in.uv, 0.0);
-    let coc2 = center.a * center.a;
+    let far_coc = max(center.a, 0.0);
+    let coc2 = far_coc * far_coc;
     let size = vec2<f32>(textureDimensions(hdr_tex));
     let scale = vec2<f32>(size.y / size.x, 1.0) * 0.014;
-    let radius = coc2 * max(g.dof.z, g.dof.w);
+    let intensity = g.dof.w;
+    let radius = coc2 * intensity;
     var sum = center * coc2;
     var weight = coc2;
-    for (var i = 0; i < 45; i++) {
-        let offset = DOF_DISK[i] * radius;
+    for (var i = 0; i < 27; i++) {
+        let offset = DOF_CHEAP_DISK[i] * radius;
         let uv = in.uv + offset * scale;
         let tap = textureSampleLevel(hdr_tex, hdr_sampler, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
-        let coc = tap.a;
-        if (all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0)) && coc*coc >= dot(offset,offset)*0.995) {
+        let coc = max(tap.a, 0.0);
+        if (all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0))) {
             sum += tap*coc;
             weight += coc;
         }
     }
-    return sum * clamp(1.0 / (weight + 0.001), 0.0, 1.0);
+    let blurred = sum * clamp(1.0 / (weight + 0.001), 0.0, 1.0);
+    // CheapBokehFS: mix(center*(1+a), blurred*a, a) = mix(center, blurred, a*a).
+    let amount = select(0.0, center.a, g.dof.w > 0.0 && center.a > 0.0);
+    return vec4<f32>(mix(center.rgb, blurred.rgb, amount * amount), center.a);
 }
 
 @group(2) @binding(0) var fx_depth_ms: texture_depth_multisampled_2d;
@@ -1953,32 +2367,57 @@ fn fx_distance(uv: vec2<f32>) -> f32 {
     return min(z * sqrt(1.0 + dot(ray, ray)), 500.0);
 }
 
+// This slot also serves unfilterable SSAO textures; explicitly bilinear-filter near RGBA.
+fn post_near(uv: vec2<f32>) -> vec4<f32> {
+    let size = vec2<i32>(textureDimensions(fx_unused));
+    let p = uv * vec2<f32>(size) - 0.5;
+    let b = vec2<i32>(floor(p)); let f = fract(p);
+    let hi = size - vec2<i32>(1);
+    return mix(mix(textureLoad(fx_unused, clamp(b, vec2<i32>(0), hi), 0),
+                   textureLoad(fx_unused, clamp(b + vec2<i32>(1,0), vec2<i32>(0), hi), 0), f.x),
+               mix(textureLoad(fx_unused, clamp(b + vec2<i32>(0,1), vec2<i32>(0), hi), 0),
+                   textureLoad(fx_unused, clamp(b + vec2<i32>(1,1), vec2<i32>(0), hi), 0), f.x), f.y);
+}
+
 @fragment
 fn fs_post(in: PostOut) -> @location(0) vec4<f32> {
     var c = textureSampleLevel(hdr_tex, hdr_sampler, in.uv, 0.0).rgb;
-    // Bloom, filtered up from half resolution.
-    if (g.cc_tint.w > 0.0) {
-        c += textureSampleLevel(bloom_tex, hdr_sampler, in.uv, 0.0).rgb * g.cc_tint.w / max(g.params.y, 1e-3);
-    }
-    c = tonemap(c * g.params.y);
-    // Studio's DOF works in squared display colour, after tone mapping.
+    if (TERRAIN_CAPTURE_ID) { return vec4<f32>(c, 1.0); }
+    // Native DoF resolves linear radiance before ImageProcessFXCompositionLinearFS.
     if (g.dof.z > 0.0 || g.dof.w > 0.0) {
         let distance = fx_distance(in.uv);
-        let far_coc = clamp((distance - (g.dof.x + g.dof.y)) / distance, 0.0, 1.0);
-        let near_coc = clamp(((g.dof.x - g.dof.y) - distance) / distance, 0.0, 1.0);
-        let intensity = select(g.dof.w, g.dof.z, near_coc > 0.0);
-        let coc = max(far_coc, near_coc);
-        let amount = clamp(coc * 1.5, 0.0, 1.0);
-        if (amount > 0.0 && intensity > 0.0) {
-            // TentFilterFS: four bilinear taps at half a source texel.
-            let half_texel = vec2<f32>(0.5) / vec2<f32>(textureDimensions(surface_tex));
-            let blurred = (textureSampleLevel(surface_tex, hdr_sampler, in.uv-half_texel, 0.0).rgb
-                + textureSampleLevel(surface_tex, hdr_sampler, in.uv+half_texel, 0.0).rgb
-                + textureSampleLevel(surface_tex, hdr_sampler, in.uv+half_texel*vec2<f32>(1.0,-1.0), 0.0).rgb
-                + textureSampleLevel(surface_tex, hdr_sampler, in.uv+half_texel*vec2<f32>(-1.0,1.0), 0.0).rgb) * 0.25;
-            c = sqrt(mix(c * c, blurred, amount * amount));
+        let far_coc = clamp((distance - (g.dof.x + g.dof.y + 0.5)) / distance, 0.0, 1.0);
+        let near_coc = clamp(((g.dof.x - g.dof.y + 0.5) - distance) / distance, 0.0, 1.0);
+        // Native stages: full-resolution far resolve, then near coverage over it.
+        if (g.dof.w > 0.0) {
+            c = max(textureSampleLevel(surface_tex, hdr_sampler, in.uv, 0.0).rgb, vec3<f32>(0.0));
+        }
+        if (g.dof.z > 0.0) {
+            // Native resolve (event748): tent-filter RGBA, then max the
+            // filtered coverage with current near CoC before squaring weight.
+            let step = vec2<f32>(4.0) / vec2<f32>(textureDimensions(hdr_tex));
+            var blurred = vec4<f32>(0.0);
+            for (var y = -1; y <= 1; y++) {
+                for (var x = -1; x <= 1; x++) {
+                    let weight = select(1.0, 2.0, x == 0) * select(1.0, 2.0, y == 0);
+                    blurred += post_near(in.uv + vec2<f32>(f32(x), f32(y)) * step) * weight * 0.0625;
+                }
+            }
+            let amount = min(max(blurred.a, near_coc) * 1.5, 1.0);
+            c = mix(c, blurred.rgb, amount * amount);
         }
     }
+
+    // ImageProcessFXCompositionLinearFS reads the scene from Studio's
+    // R10G10B10A2_UNORM target (Laser Tag capture: 6014) as 4 e², with e =
+    // sqrt(L × 0.25 × exposure) stored clamped to 1: the composited scene
+    // never exceeds 4 / exposure (bloom_scene_sample applies the same).
+    c = min(c, vec3<f32>(4.0 / max(g.params.y, 1e-4)));
+    // ImageProcessFXCompositionLinearFS: add bloom to the resolved scene,
+    // then apply the rational tone curve and colour correction.
+    c += textureSampleLevel(bloom_tex, hdr_sampler, in.uv, 0.0).rgb * g.cc_tint.w / max(g.params.y, 1e-3);
+    c = tonemap(c * g.params.y);
+
     // ColorCorrectionEffect (display space).
     if (g.cc.w > 0.5) {
         c = c + vec3<f32>(g.cc.x);
@@ -1998,6 +2437,7 @@ fn fs_post(in: PostOut) -> @location(0) vec4<f32> {
 // w on.
 @group(1) @binding(0) var ssao_depth_ms: texture_depth_multisampled_2d;
 @group(1) @binding(1) var ssao_in: texture_2d<f32>;
+@group(1) @binding(2) var ssao_scene: texture_2d<f32>;
 
 /// AO depth from the reverse-Z depth buffer: view depth × 0.002 (sky 1).
 fn ssao_lin(d: f32) -> f32 {
@@ -2027,35 +2467,45 @@ fn fs_ssao_down(in: PostOut) -> @location(0) vec4<f32> {
     return vec4<f32>(m, 0.0, 0.0, 1.0);
 }
 
+// Bound native draw390: view-space hemisphere visibility, four directions
+// and seven radial samples, not a depth-only paired kernel.
+fn ssao_point(uv: vec2<f32>) -> vec3<f32> {
+    let d = ssao_load(uv).x / SSAO_DEPTH_SCALE;
+    return vec3<f32>((uv.x - 0.5) * d / g.ssao.x,
+        (0.5 - uv.y) * d / g.ssao.y, -d);
+}
 @fragment
 fn fs_ssao(in: PostOut) -> @location(0) vec4<f32> {
     let dims = vec2<f32>(textureDimensions(ssao_in));
     let texel = 1.0 / dims;
     let d = ssao_load(in.uv).x;
-    if (d > 0.99 || g.ssao.w < 0.5) {
-        return vec4<f32>(1.0, d, 0.0, 1.0);
+    if (d > 0.99 || g.ssao.w < 0.5) { return vec4<f32>(1.0, d, 0.0, 1.0); }
+    let p = ssao_point(in.uv);
+    let right = ssao_point(in.uv + vec2<f32>(texel.x, 0.0)) - p;
+    let left = p - ssao_point(in.uv - vec2<f32>(texel.x, 0.0));
+    let down = ssao_point(in.uv + vec2<f32>(0.0, texel.y)) - p;
+    let up = p - ssao_point(in.uv - vec2<f32>(0.0, texel.y));
+    let dx = select(right, left, abs(left.z) < abs(right.z));
+    let dy = select(down, up, abs(up.z) < abs(down.z));
+    let normal = normalize(cross(dy, dx));
+    let pixel = vec2<u32>(in.pos.xy);
+    let jitter = fract(f32((pixel.y - pixel.x) & 3u) * 0.25)
+        + fract(fract(dot(in.uv * 0.5, vec2<f32>(0.06711056, 0.00583715))) * 52.9829189) * 0.5;
+    let radial = max(4.0 / max(dot(p,p), 1e-8), 21.0) * 0.125;
+    var occlusion = 0.0;
+    for (var direction = 0u; direction < 4u; direction += 1u) {
+        let angle = (jitter - 0.25 + f32(direction)) * 1.57079632679;
+        let axis = vec2<f32>(cos(angle), sin(angle)) * texel;
+        for (var step = 0u; step < 7u; step += 1u) {
+            let radius = max((jitter - 0.25 + f32(step)) * radial, f32(min(step + 1u, 2u)));
+            let uv = clamp(in.uv + axis * radius, texel * 0.5, vec2<f32>(1.0) - texel * 0.5);
+            let delta = ssao_point(uv) - p;
+            let len2 = dot(delta, delta);
+            let cosine = dot(normal, delta) * inverseSqrt(max(len2, 1e-8));
+            occlusion += max(1.0 - len2 * 0.0625, 0.0) * select(0.0, clamp(cosine, 0.0, 1.0), cosine > 0.18);
+        }
     }
-    // Studio rotates the pattern by a 4×4 noise tile (randMap); here a
-    // rotation from the pixel's place in its 4×4 tile.
-    let q = vec2<u32>(in.pos.xy) % vec2<u32>(4u);
-    let ang = f32(q.x + q.y * 4u) * 0.3926991 + 0.2;
-    let rot = mat2x2<f32>(vec2<f32>(cos(ang), sin(ang)), vec2<f32>(-sin(ang), cos(ang)));
-    let radius = clamp(g.ssao.xy * (SSAO_RADIUS_K / d), texel * SSAO_RADIUS_MIN_TEXELS, texel * SSAO_RADIUS_MAX_TEXELS);
-    var sum = 1.0;
-    var cnt = 2.0;
-    for (var i = 0u; i < SSAO_SAMPLES; i++) {
-        let fi = f32(i);
-        let t = (fi + 1.0) * 0.1;
-        let a = fi * 0.7853981;
-        let bias = (fi + 1.0) * 0.01;
-        let off = (rot * (vec2<f32>(cos(a), sin(a)) * t)) * radius;
-        let s = vec2<f32>(ssao_load(in.uv + off).x, ssao_load(in.uv - off).x);
-        let v = (s - vec2<f32>(d)) * (SSAO_DEPTH_GAIN / sqrt(1.0 - t * t)) + vec2<f32>(0.5);
-        let w = clamp(min(v.x, v.y) + 0.75, 0.0, 1.0);
-        cnt += 2.0 * w;
-        sum += (clamp(v.x + bias, 0.0, 1.0) + clamp(v.y + bias, 0.0, 1.0)) * w;
-    }
-    return vec4<f32>(clamp(sum / cnt * 2.0, 0.0, 1.0), d, 0.0, 1.0);
+    return vec4<f32>(1.0 - min(occlusion * 0.04357143119, 1.0), d, 0.0, 1.0);
 }
 
 fn ssao_blur(uv: vec2<f32>, dir: vec2<f32>) -> vec4<f32> {
@@ -2088,12 +2538,45 @@ fn fs_ssao_blur_y(in: PostOut) -> @location(0) vec4<f32> {
 // value, or where its depth isn't this pixel's, the mean of the neighbours
 // 2 pixels away that match; faded out by Lighting's linear fog; multiplies
 // the scene (blend Zero, Src).
+// Bound event358 downsamples encoded scene with a linear sampler. Native
+// event498 samples that half-resolution scene with a linear sampler again.
+fn ssao_encoded_pixel(pixel: vec2<i32>) -> vec3<f32> {
+    let dims = vec2<i32>(textureDimensions(ssao_scene));
+    let c = textureLoad(ssao_scene, clamp(pixel, vec2<i32>(0), dims-1), 0).rgb;
+    return round(sqrt(clamp(c * g.params.y * 0.25, vec3<f32>(0.0), vec3<f32>(1.0))) * 255.0) / 255.0;
+}
+fn ssao_encoded_half(pixel: vec2<i32>) -> vec3<f32> {
+    let full = vec2<f32>(textureDimensions(ssao_scene));
+    let half = vec2<f32>((textureDimensions(ssao_scene) + 1u) / 2u);
+    let position = (vec2<f32>(clamp(pixel, vec2<i32>(0), vec2<i32>(half)-1)) + 0.5) * full / half - 0.5;
+    let p = vec2<i32>(floor(position));
+    let t = fract(position);
+    let c = mix(mix(ssao_encoded_pixel(p), ssao_encoded_pixel(p + vec2<i32>(1,0)), t.x),
+        mix(ssao_encoded_pixel(p + vec2<i32>(0,1)), ssao_encoded_pixel(p + vec2<i32>(1,1)), t.x), t.y);
+    // Native event358 target4755 is RGBA8 UNORM.
+    return round(c * 255.0) / 255.0;
+}
+fn ssao_encoded_scene(uv: vec2<f32>) -> vec3<f32> {
+    let half = vec2<f32>((textureDimensions(ssao_scene) + 1u) / 2u);
+    let p = uv * half - 0.5;
+    let q = vec2<i32>(floor(p));
+    let t = fract(p);
+    return mix(mix(ssao_encoded_half(q), ssao_encoded_half(q + vec2<i32>(1,0)), t.x),
+        mix(ssao_encoded_half(q + vec2<i32>(0,1)), ssao_encoded_half(q + vec2<i32>(1,1)), t.x), t.y);
+}
+
 @fragment
 fn fs_ssao_apply(in: PostOut) -> @location(0) vec4<f32> {
+    if (g.ssao.w < 0.5) { return vec4<f32>(1.0); }
     let full = vec2<f32>(textureDimensions(ssao_depth_ms));
     let dims = vec2<i32>(full) - vec2<i32>(1);
     let p = clamp(vec2<i32>(in.pos.xy), vec2<i32>(0), dims);
-    let raw = textureLoad(ssao_depth_ms, p, 0);
+    var raw = textureLoad(ssao_depth_ms, p, 0);
+    if (all(textureDimensions(ssao_in) == vec2<u32>(full))) {
+        for (var sample = 1; sample < 4; sample++) {
+            raw = min(raw, textureLoad(ssao_depth_ms, p, sample));
+        }
+    }
     let d = ssao_lin(raw);
     let o = 2.0 / full;
     let c = ssao_load(in.uv);
@@ -2111,20 +2594,35 @@ fn fs_ssao_apply(in: PostOut) -> @location(0) vec4<f32> {
         s += n[i].x * k;
     }
     var ao = c.x;
-    if (abs(c.y - d) * m > 0.00004) {
+    if (any(textureDimensions(ssao_in) != vec2<u32>(full)) && abs(c.y - d) * m > 0.00004) {
         ao = s / m;
+    }
+    if (all(textureDimensions(ssao_in) == vec2<u32>(full))) {
+        // Native event498: blend linear AO with a four-texel gather mean.
+        let hi = vec2<i32>(textureDimensions(ssao_in)) - 1;
+        let gathered = (c.x + textureLoad(ssao_in, min(p + vec2<i32>(1,0), hi), 0).x
+            + textureLoad(ssao_in, min(p + vec2<i32>(0,1), hi), 0).x
+            + textureLoad(ssao_in, min(p + vec2<i32>(1,1), hi), 0).x) * 0.25;
+        ao = c.x + (gathered - c.x) * 0.25;
     }
     // LinearizeDepthFS's y: Lighting's linear fog at the pixel (Params1.zw
     // = FogEnd, 1 / (FogEnd − FogStart)), the radial distance as Studio
     // estimates it.
     var y = 0.0;
-    if (g.fog.z > 0.5 && g.fog.z < 1.5 && raw > 0.0) {
+    if (g.fog.z > 0.5 && raw > 0.0) {
         let uvc = in.uv - vec2<f32>(0.5);
-        let dist = sqrt(dot(uvc, uvc) * 4.0 + 1.0) * (g.ssao.z / raw);
-        y = clamp(1.0 - (g.fog.y - dist) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
+        let dist = sqrt(dot(uvc, uvc) * 0.5 + 1.0) * (g.ssao.z / raw);
+        y = fog_amount(dist);
     }
-    let a = (1.0 - y) * ao + y;
-    return vec4<f32>(a, a, a, 1.0);
+    let a = (1.0 - y) * max(ao, 0.5) + y;
+    // Native draw498 operates on sqrt(scene * exposure / 4).
+    // Its blend multiplies that encoded scene; our HDR buffer is linear.
+    let encoded = ssao_encoded_scene(in.uv);
+    let visibility = max(a, 0.5);
+    let q = max(vec3<f32>(visibility), visibility * (
+        visibility * (visibility * (encoded * 2.0404 - 0.3324)
+            + (encoded * -4.7951 + 0.6417)) + (encoded * 2.7552 + 0.6903)));
+    return vec4<f32>(q * q, 1.0);
 }
 
 

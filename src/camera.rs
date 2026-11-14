@@ -32,6 +32,7 @@ pub struct Camera {
     /// SupportOrthoCameraApi on: checks/parity/world.md).
     pub ortho: Option<(f32, u32)>,
     pub stretch: f32,
+    pub view_transition: Option<(glam::Quat, glam::Quat, f32, f32)>,
 }
 
 impl Default for Camera {
@@ -48,6 +49,7 @@ impl Default for Camera {
             basis: None,
             ortho: None,
             stretch: 1.0,
+            view_transition: None,
         };
         c.focus = c.pos + c.forward() * pos.length();
         c
@@ -55,6 +57,36 @@ impl Default for Camera {
 }
 
 impl Camera {
+    /// Snap around the current focus without changing the orbit distance or lens.
+    pub fn select_view(&mut self, direction: Vec3) {
+        self.view_transition = None;
+        let distance = self.pos.distance(self.focus).max(0.1);
+        let back = direction.normalize();
+        let up = if back.y.abs() > 0.99 { -Vec3::Z } else { Vec3::Y };
+        let right = up.cross(back).normalize();
+        self.pos = self.focus + back * distance;
+        self.set_rotation(Mat3::from_cols(right, back.cross(right), back));
+    }
+
+    pub fn animate_view(&mut self, direction: Vec3) {
+        let start = glam::Quat::from_mat3(&Mat3::from_cols(self.right(), self.up(), -self.forward()));
+        let mut target = self.clone();
+        target.select_view(direction);
+        let end = glam::Quat::from_mat3(&target.basis.unwrap());
+        self.view_transition = Some((start, end, 0.0, self.pos.distance(self.focus)));
+    }
+
+    pub fn advance_view(&mut self, dt: f32) -> bool {
+        let Some((start,end,time,distance)) = self.view_transition else {return false};
+        let time = (time + dt / 0.2).min(1.0);
+        let t = time*time*(3.0-2.0*time);
+        let rot = Mat3::from_quat(start.slerp(end,t));
+        self.set_rotation(rot);
+        self.pos = self.focus + rot.z_axis*distance;
+        self.view_transition = (time < 1.0).then_some((start,end,time,distance));
+        true
+    }
+
     fn forward_yp(&self) -> Vec3 {
         Vec3::new(
             -self.yaw.sin() * self.pitch.cos(),
@@ -190,7 +222,8 @@ impl Camera {
     }
 
     pub fn pan(&mut self, dx: f32, dy: f32) {
-        let k = self.focus_distance() * mech::PAN_FRACTION_PER_PX;
+        // Studio Settings > Camera > Pan Speed scales it (default 1).
+        let k = self.focus_distance() * mech::PAN_FRACTION_PER_PX * crate::studio_settings::camera_pan_speed();
         let delta = -self.right() * dx * k + self.up() * dy * k;
         self.pos += delta;
         self.focus += delta;
@@ -203,12 +236,14 @@ impl Camera {
     /// is on, else straight ahead. No slow-down near what's under the cursor:
     /// the camera can pass through it. The view direction stays.
     pub fn zoom_toward(&mut self, dir: Vec3, notches: f32, shift: bool) {
+        // Studio Settings > Camera: Scroll Speed, Shift Speed, Scroll
+        // Towards Cursor Position (src/studio_settings.rs).
         let speed = if shift {
-            mech::FLY_SHIFT_FACTOR
+            crate::studio_settings::camera_shift_speed()
         } else {
-            mech::WHEEL_STEP
+            crate::studio_settings::camera_scroll_speed()
         };
-        let dir = if mech::WHEEL_ZOOM_TO_MOUSE {
+        let dir = if crate::studio_settings::camera_zoom_to_mouse() {
             dir
         } else {
             self.forward()
@@ -224,8 +259,11 @@ impl Camera {
         if dir == Vec3::ZERO {
             return;
         }
-        let speed = mech::FLY_SPEED * boost * if slow { mech::FLY_SHIFT_FACTOR } else { 1.0 };
-        // Studio: the key vector (A/D x, Q/E
+        // Studio Settings > Camera > Camera Speed / Shift Speed.
+        let speed = crate::studio_settings::fly_speed()
+            * boost
+            * if slow { crate::studio_settings::camera_shift_speed() } else { 1.0 };
+        // Studio (Studio, then Studio): the key vector (A/D x, Q/E
         // y, W/S z) is normalised, then multiplied by all three columns of
         // the camera's rotation (, the look column
         // negated by the sign mask): Q / E go along the
@@ -283,5 +321,25 @@ impl Camera {
         }
         let dist = (at - self.pos).dot(self.forward()).max(0.1);
         2.0 * dist * (self.fov_deg.to_radians() * 0.5).tan() / rect.height().max(1.0)
+    }
+}
+
+#[cfg(test)]
+mod view_selector_tests {
+    use super::*;
+    #[test]
+    fn all_six_views_preserve_focus_distance_and_have_finite_projection() {
+        let mut cam = Camera::default();
+        cam.focus = Vec3::new(12.0, 8.0, -4.0);
+        let focus = cam.focus;
+        let distance = cam.pos.distance(focus);
+        for direction in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z] {
+            cam.select_view(direction);
+            assert!((cam.forward() + direction).length() < 1e-5);
+            assert!((cam.pos.distance(focus) - distance).abs() < 1e-4);
+            assert_eq!(cam.focus, focus);
+            assert!(cam.view().is_finite());
+            assert!(cam.view().transform_point3(focus).truncate().length() < 1e-4);
+        }
     }
 }

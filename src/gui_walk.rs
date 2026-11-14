@@ -8,6 +8,28 @@ use super::*;
 use crate::mech;
 use crate::scene::{vec3_of, xform_of};
 
+/// `rect` inside the UIPadding of `r` (a GuiObject or a LayerCollector:
+/// Studio pads a ScreenGui's children too, e.g. Laser Tag's 20 px HUD margin).
+pub(super) fn padded(d: &Document, r: Ref, rect: Rect, scale: f32) -> Rect {
+    let Some(p) = child_of_class(d, r, "UIPadding") else {
+        return rect;
+    };
+    let l = udim(d, p, "PaddingLeft");
+    let rr = udim(d, p, "PaddingRight");
+    let t = udim(d, p, "PaddingTop");
+    let b = udim(d, p, "PaddingBottom");
+    Rect::from_min_max(
+        Pos2::new(
+            rect.left() + l[0] * rect.width() + l[1] * scale,
+            rect.top() + t[0] * rect.height() + t[1] * scale,
+        ),
+        Pos2::new(
+            rect.right() - rr[0] * rect.width() - rr[1] * scale,
+            rect.bottom() - b[0] * rect.height() - b[1] * scale,
+        ),
+    )
+}
+
 /// 2D affine map (turns of rotated GuiObjects).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Aff {
@@ -853,7 +875,10 @@ impl Walk<'_, '_> {
             self.viewport_frame(r, rect, &me);
         }
         if text_class {
-            gb.text = self.text(r, &class, rect, &me, stroke.filter(|_| stroke_on_text));
+            // Text is laid out inside the object's UIPadding (Studio: Laser
+            // Tag's right-aligned timer sits 16 px in from the box's right).
+            let text_rect = padded(d, r, rect, me.scale);
+            gb.text = self.text(r, &class, text_rect, &me, stroke.filter(|_| stroke_on_text));
         }
         // ParticleEmitter2D children, over the object, under its children.
         self.particles(r, rect, &me);
@@ -888,24 +913,8 @@ impl Walk<'_, '_> {
         self.boxes.push((r, gb));
 
         // Children: inside the padding; clipped by ClipsDescendants (not when turned).
-        let mut content = rect;
-        if let Some(p) = child_of_class(d, r, "UIPadding") {
-            let l = udim(d, p, "PaddingLeft");
-            let rr = udim(d, p, "PaddingRight");
-            let t = udim(d, p, "PaddingTop");
-            let b = udim(d, p, "PaddingBottom");
-            content = Rect::from_min_max(
-                Pos2::new(
-                    rect.left() + l[0] * rect.width() + l[1] * me.scale,
-                    rect.top() + t[0] * rect.height() + t[1] * me.scale,
-                ),
-                Pos2::new(
-                    rect.right() - rr[0] * rect.width() - rr[1] * me.scale,
-                    rect.bottom() - b[0] * rect.height() - b[1] * me.scale,
-                ),
-            );
-        }
-        // Chat-styled frames hold their children 17 px in (offline Studio: a
+        let mut content = padded(d, r, rect, me.scale);
+        // Chat-styled frames hold their children 17 px in (Studio: a
         // child at (-11, -8) of a ChatBlue frame lands at (+6, +9)).
         if chat_style {
             content = content.shrink(17.0 * me.scale);
@@ -1046,14 +1055,23 @@ impl Walk<'_, '_> {
             None => rgba([ic[0] * tint[0], ic[1] * tint[1], ic[2] * tint[2]], alpha),
         };
         let steps = if gradient.is_some() { 8 } else { 1 };
+        let mut meshes: Vec<Mesh> = Vec::new();
+        // ScaleType: Stretch 0, Slice 1, Tile 2, Fit 3, Crop 4.
+        let scale_type = enum_u32(d.prop(r, "ScaleType")).unwrap_or(0);
+        // Minified Stretch / Fit / Crop images sample a smaller copy (gui.rs `mip`).
+        let tex = if matches!(scale_type, 0 | 3 | 4) && rect.width() > 0.0 && rect.height() > 0.0 {
+            let ppp = self.ctx.pixels_per_point();
+            let m = (src.width() / (rect.width() * ppp)).min(src.height() / (rect.height() * ppp));
+            self.gui.mip(&id, tex, m)
+        } else {
+            tex
+        };
         // UICorner rounds the image too (Stretch, Fit, Crop).
         let quad = |dst: Rect, uv: Rect| match corner.filter(|c| *c >= 0.5) {
             Some(c) => rounded_quad_mesh(dst, uv, tex, &col, c),
             None => quad_mesh(dst, uv, tex, &col, steps),
         };
-        let mut meshes: Vec<Mesh> = Vec::new();
-        // ScaleType: Stretch 0, Slice 1, Tile 2, Fit 3, Crop 4.
-        match enum_u32(d.prop(r, "ScaleType")).unwrap_or(0) {
+        match scale_type {
             1 => {
                 let sc = match d.prop(r, "SliceCenter") {
                     Some(Variant::Rect(rc)) => Rect::from_min_max(

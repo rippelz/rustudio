@@ -94,13 +94,43 @@ pub struct PMass {
     pub inertia: Vec3,
 }
 
+/// `r` is the Handle of an Accessory (Accoutrement) worn by a character
+/// (a Model with a Humanoid).
+pub fn accessory_handle_on_character(d: &Document, r: Ref) -> bool {
+    let Some(i) = d.dom.get_by_ref(r) else { return false };
+    if i.name != "Handle" {
+        return false;
+    }
+    let Some(acc) = d.dom.get_by_ref(i.parent()) else { return false };
+    if !crate::doc::is_a(&acc.class, "Accoutrement") {
+        return false;
+    }
+    d.dom
+        .get_by_ref(acc.parent())
+        .is_some_and(|m| m.children().iter().any(|c| d.dom.get_by_ref(*c).is_some_and(|k| k.class == "Humanoid")))
+}
+
 pub fn part_mass(d: &Document, r: Ref) -> PMass {
     let class = d.class_of(r).map(|c| c.to_string()).unwrap_or_default();
     if class == "Terrain" {
         return PMass { mass: 0.0, com: Vec3::ZERO, inertia: Vec3::ZERO };
     }
+    // An accessory's Handle on a character weighs nothing: Studio 0.747,
+    // a Handle Part of 5.6 mass reads GetMass() 0 once Humanoid:AddAccessory
+    // has it (Massless and CustomPhysicalProperties untouched, CanCollide
+    // false), and the character's AssemblyMass stays 14.2551 / 12.6
+    // (checks/humanoid-physics/measure/accessory-mass.md).
+    if accessory_handle_on_character(d, r) {
+        return PMass { mass: 0.0, com: Vec3::ZERO, inertia: Vec3::ZERO };
+    }
     let s = v3p(d, r, "Size").unwrap_or(Vec3::ONE).max(Vec3::splat(0.05));
     let rho = phys_props(d, r).density;
+    // A part's volume comes from its physics geometry when that
+    // is a mesh: a character's Head weighs its mesh (Studio's default R15 Head
+    // 0.7729, box 1.1133), its body parts their box (physics_humanoid.rs).
+    if let Some(m) = head_mesh_mass(d, r, &class, s, rho) {
+        return m;
+    }
     let box_i = |m: f32, s: Vec3| {
         Vec3::new(s.y * s.y + s.z * s.z, s.x * s.x + s.z * s.z, s.x * s.x + s.y * s.y) * (m / 12.0)
     };
@@ -131,22 +161,75 @@ pub fn part_mass(d: &Document, r: Ref) -> PMass {
     }
 }
 
+/// A Humanoid character's MeshPart Head: mass, centre and inertia of its
+/// collision mesh (cached per mesh and size).
+fn head_mesh_mass(d: &Document, r: Ref, class: &str, s: Vec3, rho: f32) -> Option<PMass> {
+    if class != "MeshPart" || d.dom.get_by_ref(r)?.name != "Head" {
+        return None;
+    }
+    let parent = d.dom.get_by_ref(r)?.parent();
+    let has_humanoid = d.dom.get_by_ref(parent)?.children().iter().any(|c| d.class_of(*c).is_some_and(|k| k == "Humanoid"));
+    if !has_humanoid {
+        return None;
+    }
+    let id = match d.prop(r, "MeshId") {
+        Some(Variant::ContentId(c)) => c.as_str().to_string(),
+        Some(Variant::Content(c)) => c.as_uri().unwrap_or("").to_string(),
+        _ => return None,
+    };
+    let fid = crate::scene::enum_u32(d.prop(r, "CollisionFidelity")).unwrap_or(crate::collision::FIDELITY_DEFAULT);
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<(String, [u32; 3], u32), (f32, Vec3, Vec3)>> = Default::default();
+    }
+    let key = (id.clone(), s.to_array().map(f32::to_bits), fid);
+    let unit = CACHE.with(|c| c.borrow().get(&key).copied()).or_else(|| {
+        let crate::collision::Lookup::Ready(h) = crate::collision::hulls(&id, fid) else { return None };
+        let shape = crate::collision::shape_from_hulls(&h, s)?;
+        let mp = shape.mass_properties(1.0);
+        let pi = mp.principal_inertia();
+        let com = mp.local_com;
+        let v = (mp.mass(), Vec3::new(com.x, com.y, com.z), Vec3::new(pi.x, pi.y, pi.z));
+        CACHE.with(|c| c.borrow_mut().insert(key, v));
+        Some(v)
+    })?;
+    Some(PMass { mass: unit.0 * rho, com: unit.1, inertia: unit.2 * rho })
+}
+
 // ------------------------------------------------------------- assemblies
 
+/// What one joint or constraint under Workspace adds to the graph, kept so
+/// a change to it can be undone without walking the workspace.
+#[derive(Default, Clone, PartialEq, Debug)]
+struct JointRec {
+    /// The parts it is listed under in `joints` (GetJoints), in push order.
+    named: Vec<Ref>,
+    /// The attachments a constraint names.
+    atts: Vec<Ref>,
+    /// The rigid edge it makes.
+    edge: Option<(Ref, Ref)>,
+}
+
+/// Parts, the rigid joints between them and the assemblies they form. Kept
+/// current from the change journal like Studio's assemblies, which follow
+/// joint connects and disconnects (only the assemblies a change touches are
+/// redone; a full walk of the workspace only when the journal can't say).
 #[derive(Default)]
 pub struct Graph {
     /// Part → its group (rigidly joined parts).
     group: HashMap<Ref, usize>,
+    /// Groups by index (an emptied slot is in `free`).
     groups: Vec<Vec<Ref>>,
-    /// Part → parts it is rigidly joined to directly.
+    free: Vec<usize>,
+    /// Part → parts it is rigidly joined to directly (one entry per joint).
     rigid: HashMap<Ref, Vec<Ref>>,
     /// Part → joints and constraints naming it (GetJoints).
     joints: HashMap<Ref, Vec<Ref>>,
     /// Group → its root and whether it holds an anchored part.
     roots: Vec<(Ref, bool)>,
-    /// Joints and constraints that made an edge or named a part, and the
-    /// attachments constraints name (moving one moves the constraint).
-    joint_set: HashSet<Ref>,
+    /// Joint or constraint under Workspace → what it adds.
+    recs: HashMap<Ref, JointRec>,
+    /// Attachment → the constraints naming it (moving one moves the constraint).
+    att: HashMap<Ref, Vec<Ref>>,
 }
 
 fn rigid_joint(class: &str) -> bool {
@@ -159,63 +242,103 @@ fn anchored(d: &Document, r: Ref) -> bool {
     boolp(d, r, "Anchored", false) || d.class_of(r).is_some_and(|c| c == "Terrain")
 }
 
+/// 0 other, 1 part, 2 joint, 3 constraint.
+fn kind_of(class: &str) -> u8 {
+    if doc::is_a(class, "BasePart") {
+        1
+    } else if rigid_joint(class) || doc::is_a(class, "JointInstance") {
+        2
+    } else if doc::is_a(class, "Constraint") && class != "NoCollisionConstraint" {
+        3
+    } else {
+        0
+    }
+}
+
+/// What joint `r` (of `kind` 2 or 3, under `ws`) adds as the document has it now.
+fn joint_rec(d: &Document, ws: Ref, r: Ref, kind: u8, class: &str) -> JointRec {
+    let mut rec = JointRec::default();
+    let pair = if kind == 2 {
+        (refp(d, r, "Part0"), refp(d, r, "Part1"))
+    } else {
+        for k in ["Attachment0", "Attachment1"] {
+            if let Some(a) = refp(d, r, k) {
+                rec.atts.push(a);
+            }
+        }
+        let pp = |k: &str| refp(d, r, k).and_then(|a| d.dom.get_by_ref(a)).map(|a| a.parent());
+        (pp("Attachment0"), pp("Attachment1"))
+    };
+    for p in [pair.0, pair.1].into_iter().flatten() {
+        if is_part(d, p) {
+            rec.named.push(p);
+        }
+    }
+    if let (Some(a), Some(b)) = pair {
+        // A kinematic AnimationConstraint (the avatar joint upgrade's rig
+        // joint) holds its parts rigidly, like a Motor6D: Studio reports
+        // one 14.2551 assembly rooted at the HumanoidRootPart.
+        let kinematic_ac = class == "AnimationConstraint"
+            && boolp(d, r, "IsKinematic", true);
+        if a != b
+            && (rigid_joint(class) || kinematic_ac)
+            && boolp(d, r, "Enabled", true)
+            && is_part(d, a)
+            && is_part(d, b)
+            && d.is_ancestor(ws, a)
+            && d.is_ancestor(ws, b)
+        {
+            rec.edge = Some((a, b));
+        }
+    }
+    rec
+}
+
+fn remove_one(map: &mut HashMap<Ref, Vec<Ref>>, k: Ref, v: Ref) {
+    if let Some(list) = map.get_mut(&k) {
+        if let Some(i) = list.iter().position(|x| *x == v) {
+            list.remove(i);
+        }
+        if list.is_empty() {
+            map.remove(&k);
+        }
+    }
+}
+
+/// Where `r` comes in `descendants_of` (breadth first, children in order):
+/// its depth, then its path of child positions.
+fn bfs_key(d: &Document, r: Ref) -> (usize, Vec<u32>) {
+    let mut path = Vec::new();
+    let mut cur = r;
+    while let Some(i) = d.dom.get_by_ref(cur) {
+        let parent = i.parent();
+        let Some(p) = d.dom.get_by_ref(parent) else { break };
+        path.push(p.children().iter().position(|c| *c == cur).unwrap_or(0) as u32);
+        cur = parent;
+    }
+    path.reverse();
+    (path.len(), path)
+}
+
 fn build(d: &Document) -> Graph {
     let _b = crate::bench::scope("joint_graph");
     let mut g = Graph::default();
     let Some(ws) = d.workspace() else { return g };
-    // Per class: 0 other, 1 part, 2 joint, 3 constraint (classes repeat; is_a interns its names).
+    // Per class (classes repeat; is_a interns its names).
     let mut kinds: rustc_hash::FxHashMap<rbx_dom_weak::Ustr, u8> = Default::default();
     let mut edges: Vec<(Ref, Ref)> = Vec::new();
     for inst in d.dom.descendants_of(ws) {
         let class = inst.class;
-        let kind = *kinds.entry(class).or_insert_with(|| {
-            let c = class.as_str();
-            if doc::is_a(c, "BasePart") {
-                1
-            } else if rigid_joint(c) || doc::is_a(c, "JointInstance") {
-                2
-            } else if doc::is_a(c, "Constraint") && c != "NoCollisionConstraint" {
-                3
-            } else {
-                0
-            }
-        });
+        let kind = *kinds.entry(class).or_insert_with(|| kind_of(class.as_str()));
         if kind < 2 {
             continue;
         }
         let r = inst.referent();
-        let class = class.as_str();
-        let pair = if kind == 2 {
-            (refp(d, r, "Part0"), refp(d, r, "Part1"))
-        } else {
-            for k in ["Attachment0", "Attachment1"] {
-                if let Some(a) = refp(d, r, k) {
-                    g.joint_set.insert(a);
-                }
-            }
-            let pp = |k: &str| refp(d, r, k).and_then(|a| d.dom.get_by_ref(a)).map(|a| a.parent());
-            (pp("Attachment0"), pp("Attachment1"))
-        };
-        for p in [pair.0, pair.1].into_iter().flatten() {
-            if is_part(d, p) {
-                g.joints.entry(p).or_default().push(r);
-                g.joint_set.insert(r);
-            }
+        let rec = joint_rec(d, ws, r, kind, class.as_str());
+        if let Some(e) = rec.edge {
+            edges.push(e);
         }
-        if let (Some(a), Some(b)) = pair {
-            if a != b
-                && rigid_joint(class)
-                && boolp(d, r, "Enabled", true)
-                && is_part(d, a)
-                && is_part(d, b)
-                && d.is_ancestor(ws, a)
-                && d.is_ancestor(ws, b)
-            {
-                edges.push((a, b));
-                g.rigid.entry(a).or_default().push(b);
-                g.rigid.entry(b).or_default().push(a);
-            }
-        }
+        g.add_rec(r, rec);
     }
     // Union-find over the rigid edges. Parts no rigid joint names are
     // single-part assemblies: the lookups' fallback, so they get no entry.
@@ -306,44 +429,232 @@ impl Graph {
         self.group.get(&r).is_some_and(|gi| self.groups[*gi].len() > 1)
     }
 
-    /// Whether the journal marks since the last look can change the graph.
-    /// Moving parts (CFrame, Velocity, ...) can't; new parts with no joints are
-    /// single-part assemblies (the lookups' fallback), so they don't either.
-    fn stale(&self, d: &Document, marks: &[doc::Mark]) -> bool {
+    fn add_rec(&mut self, r: Ref, rec: JointRec) {
+        for p in &rec.named {
+            self.joints.entry(*p).or_default().push(r);
+        }
+        for a in &rec.atts {
+            self.att.entry(*a).or_default().push(r);
+        }
+        if let Some((a, b)) = rec.edge {
+            self.rigid.entry(a).or_default().push(b);
+            self.rigid.entry(b).or_default().push(a);
+        }
+        self.recs.insert(r, rec);
+    }
+
+    fn remove_rec(&mut self, r: Ref) -> Option<JointRec> {
+        let rec = self.recs.remove(&r)?;
+        for p in &rec.named {
+            remove_one(&mut self.joints, *p, r);
+        }
+        for a in &rec.atts {
+            remove_one(&mut self.att, *a, r);
+        }
+        if let Some((a, b)) = rec.edge {
+            remove_one(&mut self.rigid, a, b);
+            remove_one(&mut self.rigid, b, a);
+        }
+        Some(rec)
+    }
+
+    /// Notes what a change to `x` can affect: joints to look at again, parts
+    /// whose assembly (or its root) to redo.
+    fn touch(&self, d: &Document, x: Ref, dj: &mut HashSet<Ref>, dp: &mut HashSet<Ref>) {
+        if self.recs.contains_key(&x) || d.class_of(x).is_some_and(|c| joint_class(c.as_str())) {
+            dj.insert(x);
+        }
+        if let Some(js) = self.att.get(&x) {
+            dj.extend(js.iter().copied());
+        }
+        if let Some(js) = self.joints.get(&x) {
+            dj.extend(js.iter().copied());
+            dp.insert(x);
+        }
+        if self.group.contains_key(&x) {
+            dp.insert(x);
+        }
+    }
+
+    /// Brings the graph up to date with journal marks: only the joints they
+    /// touch are read again, only the assemblies those change are redone.
+    fn update(&mut self, d: &Document, marks: &[doc::Mark]) {
+        let mut dj: HashSet<Ref> = HashSet::new();
+        let mut dp: HashSet<Ref> = HashSet::new();
         for m in marks {
             match *m {
                 doc::Mark::Prop(r, name) => {
                     let n = name.as_str();
-                    // (a part no rigid joint names is its own assembly whatever these say)
-                    if structural_prop(n) && (self.joint_set.contains(&r) || self.group.contains_key(&r)) {
-                        return true;
-                    }
-                    // the root pick weighs these among joined parts
-                    if matches!(n, "Size" | "Name") && self.in_multi(r) {
-                        return true;
-                    }
-                    if structural_prop(n) && d.class_of(r).is_some_and(|c| joint_class(c.as_str())) {
-                        return true;
+                    if structural_prop(n) {
+                        self.touch(d, r, &mut dj, &mut dp);
+                    } else if matches!(n, "Size" | "Name") && self.in_multi(r) {
+                        // the root pick weighs these among joined parts
+                        dp.insert(r);
                     }
                 }
                 doc::Mark::Tree(r) => {
-                    if self.joint_set.contains(&r) || self.in_multi(r) {
-                        return true;
-                    }
+                    self.touch(d, r, &mut dj, &mut dp);
                     for x in d.subtree(r) {
-                        if self.joint_set.contains(&x) || self.in_multi(x) {
-                            return true;
-                        }
-                        // (a removed instance's class is in limbo; one freed outright is unknown here
-                        // and was neither a known joint nor a joined part)
-                        if d.class_of(x).is_some_and(|c| joint_class(c.as_str())) {
-                            return true;
-                        }
+                        self.touch(d, x, &mut dj, &mut dp);
                     }
                 }
             }
         }
-        false
+        if dj.is_empty() && dp.is_empty() {
+            return;
+        }
+        let _b = crate::bench::scope("joint_graph_update");
+        let ws = d.workspace();
+        for j in dj {
+            if let Some((a, b)) = self.remove_rec(j).and_then(|old| old.edge) {
+                dp.insert(a);
+                dp.insert(b);
+            }
+            let (Some(ws), Some(inst)) = (ws, d.dom.get_by_ref(j)) else { continue };
+            let kind = kind_of(inst.class.as_str());
+            if kind >= 2 && d.is_ancestor(ws, j) {
+                let rec = joint_rec(d, ws, j, kind, inst.class.as_str());
+                if let Some((a, b)) = rec.edge {
+                    dp.insert(a);
+                    dp.insert(b);
+                }
+                self.add_rec(j, rec);
+            }
+        }
+        self.regroup(d, dp);
+    }
+
+    /// Redoes the assemblies of `dp`'s parts (and any its joints now reach).
+    fn regroup(&mut self, d: &Document, dp: HashSet<Ref>) {
+        let mut todo: Vec<Ref> = Vec::new();
+        let mut queued: HashSet<Ref> = HashSet::new();
+        for p in dp {
+            self.dissolve(p, &mut todo, &mut queued);
+            if queued.insert(p) {
+                todo.push(p);
+            }
+        }
+        let mut done: HashSet<Ref> = HashSet::new();
+        let mut i = 0;
+        while i < todo.len() {
+            let start = todo[i];
+            i += 1;
+            if done.contains(&start) || !self.rigid.contains_key(&start) {
+                continue;
+            }
+            let mut comp = vec![start];
+            done.insert(start);
+            let mut k = 0;
+            while k < comp.len() {
+                let p = comp[k];
+                k += 1;
+                let next: Vec<Ref> = self.rigid.get(&p).cloned().unwrap_or_default();
+                for q in next {
+                    // (a part whose assembly wasn't marked joins this one now)
+                    self.dissolve(q, &mut todo, &mut queued);
+                    if done.insert(q) {
+                        comp.push(q);
+                    }
+                }
+            }
+            self.sort_members(d, &mut comp);
+            let gi = match self.free.pop() {
+                Some(gi) => gi,
+                None => {
+                    self.groups.push(Vec::new());
+                    self.roots.push((Ref::none(), false));
+                    self.groups.len() - 1
+                }
+            };
+            for p in &comp {
+                self.group.insert(*p, gi);
+            }
+            self.roots[gi] = pick_root(d, &comp);
+            self.groups[gi] = comp;
+        }
+    }
+
+    /// Takes `p`'s assembly apart, queueing its parts to be grouped again.
+    fn dissolve(&mut self, p: Ref, todo: &mut Vec<Ref>, queued: &mut HashSet<Ref>) {
+        let Some(gi) = self.group.remove(&p) else { return };
+        let members = std::mem::take(&mut self.groups[gi]);
+        self.roots[gi] = (Ref::none(), false);
+        self.free.push(gi);
+        for m in members {
+            self.group.remove(&m);
+            if queued.insert(m) {
+                todo.push(m);
+            }
+        }
+    }
+
+    /// Orders an assembly's parts as a full build lists them (the root pick
+    /// keeps the first of equals): by the first rigid joint naming each, in
+    /// `descendants_of` order, Part0 before Part1.
+    fn sort_members(&self, d: &Document, comp: &mut [Ref]) {
+        let mut keys: HashMap<Ref, (usize, Vec<u32>)> = HashMap::new();
+        let mut key_of = |p: Ref| {
+            let mut best: Option<((usize, Vec<u32>), u8)> = None;
+            for j in self.joints.get(&p).into_iter().flatten() {
+                let Some((a, b)) = self.recs.get(j).and_then(|r| r.edge) else { continue };
+                let side = if a == p { 0 } else if b == p { 1 } else { continue };
+                let k = keys.entry(*j).or_insert_with(|| bfs_key(d, *j)).clone();
+                if best.as_ref().is_none_or(|(bk, bs)| (&k, side) < (bk, *bs)) {
+                    best = Some((k, side));
+                }
+            }
+            best
+        };
+        let mut keyed: Vec<(Option<((usize, Vec<u32>), u8)>, Ref)> = comp.iter().map(|p| (key_of(*p), *p)).collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        for (slot, (_, p)) in comp.iter_mut().zip(keyed) {
+            *slot = p;
+        }
+    }
+
+    /// RUSTUDIO_GRAPH_CHECK: differences from a full build (empty = same).
+    fn diff(&self, other: &Graph) -> Vec<String> {
+        let mut out = Vec::new();
+        let norm = |g: &Graph| {
+            let mut v: Vec<(Vec<Ref>, Ref, bool)> = g
+                .groups
+                .iter()
+                .zip(&g.roots)
+                .filter(|(m, _)| !m.is_empty())
+                .map(|(m, r)| (m.clone(), r.0, r.1))
+                .collect();
+            v.sort_by_key(|x| x.0.first().map(|r| r.to_string()));
+            v
+        };
+        let (a, b) = (norm(self), norm(other));
+        if a != b {
+            out.push(format!("groups: {} vs {} (incremental vs full)", a.len(), b.len()));
+            for x in a.iter().filter(|x| !b.contains(x)).take(3) {
+                out.push(format!("  only incremental: {x:?}"));
+            }
+            for x in b.iter().filter(|x| !a.contains(x)).take(3) {
+                out.push(format!("  only full: {x:?}"));
+            }
+        }
+        let sorted = |m: &HashMap<Ref, Vec<Ref>>| {
+            let mut v: Vec<(Ref, Vec<Ref>)> = m.iter().map(|(k, v)| {
+                let mut v = v.clone();
+                v.sort_by_key(|r| r.to_string());
+                (*k, v)
+            }).collect();
+            v.sort_by_key(|x| x.0.to_string());
+            v
+        };
+        if sorted(&self.joints) != sorted(&other.joints) {
+            out.push("joints differ".into());
+        }
+        if sorted(&self.rigid) != sorted(&other.rigid) {
+            out.push("rigid differs".into());
+        }
+        if sorted(&self.att) != sorted(&other.att) {
+            out.push("attachments differ".into());
+        }
+        out
     }
 }
 
@@ -353,20 +664,28 @@ fn joint_class(class: &str) -> bool {
         || (doc::is_a(class, "Constraint") && class != "NoCollisionConstraint")
 }
 
-/// Runs `f` on the joint graph of `d`, rebuilt only when the document's
-/// change journal holds a change that can alter it.
+/// Runs `f` on the joint graph of `d`, kept current from the document's
+/// change journal (built in full only the first time, or when the journal
+/// can't say what changed).
 pub fn with_graph<R>(d: &Document, f: impl FnOnce(&Graph) -> R) -> R {
     GRAPHS.with(|gs| {
         let mut gs = gs.borrow_mut();
         let marks = d.graph_marks();
         let i = match gs.iter().position(|(id, _)| *id == d.id) {
             Some(i) => {
-                let rebuild = match &marks {
-                    doc::Marks::All => true,
-                    doc::Marks::Some(m) => gs[i].1.stale(d, m),
-                };
-                if rebuild {
-                    gs[i].1 = build(d);
+                match &marks {
+                    doc::Marks::All => gs[i].1 = build(d),
+                    doc::Marks::Some(m) if m.is_empty() => {}
+                    doc::Marks::Some(m) => {
+                        gs[i].1.update(d, m);
+                        if graph_check() {
+                            let full = build(d);
+                            let diff = gs[i].1.diff(&full);
+                            if !diff.is_empty() {
+                                eprintln!("GRAPH_CHECK mismatch after {} marks: {}", m.len(), diff.join("\n"));
+                            }
+                        }
+                    }
                 }
                 i
             }
@@ -380,6 +699,12 @@ pub fn with_graph<R>(d: &Document, f: impl FnOnce(&Graph) -> R) -> R {
         };
         f(&gs[i].1)
     })
+}
+
+/// RUSTUDIO_GRAPH_CHECK=1: compare every incremental update with a full build.
+fn graph_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTUDIO_GRAPH_CHECK").is_some())
 }
 
 impl Graph {
@@ -465,6 +790,17 @@ thread_local! {
     static OWNERS: RefCell<HashMap<(u64, Ref), Owner>> = RefCell::new(HashMap::new());
     /// (document id, model) → SetIdentityOrientation's rotation.
     static IDENTITY: RefCell<HashMap<(u64, Ref), Mat3>> = RefCell::new(HashMap::new());
+}
+
+/// The assembly roots a script gave to a player with SetNetworkOwner (the
+/// client simulates them: physics_humanoid.rs `set_owned_movers`).
+pub fn player_owned_roots(doc_id: u64) -> Vec<Ref> {
+    OWNERS.with(|o| o.borrow().iter().filter(|((d, _), w)| *d == doc_id && !w.auto && w.player.is_some()).map(|((_, r), _)| *r).collect())
+}
+
+/// The assembly roots a script kept on the server with SetNetworkOwner(nil).
+pub fn server_owned_roots(doc_id: u64) -> Vec<Ref> {
+    OWNERS.with(|o| o.borrow().iter().filter(|((d, _), w)| *d == doc_id && !w.auto && w.player.is_none()).map(|((_, r), _)| *r).collect())
 }
 
 const NO_WS: &str = "Can only call Network Ownership API on a part that is descendent of Workspace";

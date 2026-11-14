@@ -331,6 +331,20 @@ fn take_lua() -> Vec<(String, f64, u64)> {
 
 /// Adds `ms` and `calls` to section `name` without a guard (for totals
 /// gathered in a loop, or counts with `ms` 0).
+/// Runs `f` and returns its result with the work it took on this thread:
+/// milliseconds, or millions of instructions under RUSTUDIO_BENCH_INSTR
+/// (work done on a helper thread, credited to the caller's section by `add`).
+pub fn measure<R>(f: impl FnOnce() -> R) -> (R, f64) {
+    let (t0, i0) = (Instant::now(), if instr_on() { instructions() } else { 0 });
+    let r = f();
+    let v = if instr_on() {
+        instructions().saturating_sub(i0) as f64 / 1e6
+    } else {
+        t0.elapsed().as_secs_f64() * 1000.0
+    };
+    (r, v)
+}
+
 pub fn add(name: &'static str, ms: f64, calls: u64) {
     SECTIONS.with(|s| {
         let mut s = s.borrow_mut();
