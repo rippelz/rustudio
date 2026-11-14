@@ -13,7 +13,10 @@ permissions:
   contents: read
 
 jobs:
+  # Checks and tests run for branches and pull requests. A v* tag points at a
+  # commit main already tested, so its run only builds and publishes.
   check:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +34,7 @@ jobs:
   # macOS: Apple Silicon and Intel. The tests run here too (the GPU tests
   # skip themselves when the runner has no Metal device).
   macos:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     strategy:
       fail-fast: false
       matrix:
@@ -109,7 +113,7 @@ jobs:
   # A v* tag: one release with all three downloads and their SHA-256 sums.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, macos, macos-app, linux-release, windows-release]
+    needs: [macos-app, linux-release, windows-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
