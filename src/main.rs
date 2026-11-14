@@ -1,6 +1,7 @@
 //! rustudio: a native Linux editor for Roblox place and model files.
 
 mod grass_stream;
+mod update;
 mod env_probe;
 mod account_ui;
 mod char_builder;

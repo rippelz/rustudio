@@ -357,6 +357,7 @@ pub enum PendingAction {
 
 pub struct RustudioApp {
     watchdog: crate::frame_watchdog::Watchdog,
+    updater: crate::update::Updater,
     pub dock: DockState<Tab>,
     pub ed: Editor,
     /// Keeps the dock, window and view settings (src/layout_store.rs).
@@ -595,6 +596,7 @@ impl RustudioApp {
         // `--play` starts once the 3D view has its size (Camera.ViewportSize).
         RustudioApp {
             watchdog: crate::frame_watchdog::Watchdog::new(cc.egui_ctx.clone()),
+            updater: crate::update::Updater::start(),
             dock,
             ed,
             layout,
@@ -1579,7 +1581,10 @@ impl Editor {
         } else if let Some(origin) = &self.doc.cloud {
             args = vec!["--open-roblox".into(), origin.place_id.to_string(), "--local-copy".into()];
         }
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rustudio"));
+        // After an update the running file was renamed: start the new one.
+        let exe = crate::update::installed_exe()
+            .or_else(|| std::env::current_exe().ok())
+            .unwrap_or_else(|| PathBuf::from("rustudio"));
         match std::process::Command::new(&exe).args(&args).spawn() {
             Ok(_) => std::process::exit(0),
             Err(e) => self.error(format!("Restart failed: couldn't start {}: {e}", exe.display())),
@@ -1928,6 +1933,9 @@ impl eframe::App for RustudioApp {
             ed.request(PendingAction::Open(Some(p)));
         }
         ed.poll_file_dialogs();
+        if let crate::update::Action::Restart = self.updater.show(&ctx) {
+            ed.request(PendingAction::Restart);
+        }
         ed.frame_no += 1;
         let frame_start = Instant::now();
         let now = Instant::now();
