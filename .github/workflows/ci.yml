@@ -65,11 +65,72 @@ jobs:
         with:
           name: rustudio-macos-universal
           path: target/macos/*.zip
-      - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/v')
+
+  # Linux x86_64 (built on 22.04 so it runs on older glibc) and Windows x64:
+  # the binary, api-dump.json beside it, and the licences.
+  linux-release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+      - run: cargo build --release
+      - name: Package
+        run: |
+          d=rustudio-linux-x86_64
+          mkdir -p dist/$d
+          cp target/release/rustudio api-dump.json LICENSE-MIT LICENSE-APACHE README.md dist/$d/
+          tar -C dist -czf dist/$d.tar.gz $d
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustudio-linux-x86_64
+          path: dist/*.tar.gz
+
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          $d = "dist/rustudio-windows-x64"
+          New-Item -ItemType Directory -Force $d | Out-Null
+          Copy-Item target/release/rustudio.exe, api-dump.json, LICENSE-MIT, LICENSE-APACHE, README.md $d
+          Compress-Archive -Path $d -DestinationPath dist/rustudio-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustudio-windows-x64
+          path: dist/*.zip
+
+  # A v* tag: one release with all three downloads and their SHA-256 sums.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, macos, macos-app, linux-release, windows-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release upload "$GITHUB_REF_NAME" target/macos/*.zip --clobber ||
-            gh release create "$GITHUB_REF_NAME" target/macos/*.zip --prerelease --title "$GITHUB_REF_NAME" \
-              --notes "macOS: unzip, move rustudio.app to Applications, and the first time right-click it > Open (it isn't notarized)."
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber ||
+            gh release create "$GITHUB_REF_NAME" dist/* --title "rustudio $GITHUB_REF_NAME" --notes-file - <<'NOTES'
+          Downloads:
+          - Linux x86_64: rustudio-linux-x86_64.tar.gz (unpack, run ./rustudio)
+          - Windows x64: rustudio-windows-x64.zip (unzip, run rustudio.exe)
+          - macOS (Apple Silicon and Intel): unzip, move rustudio.app to Applications, and the first time right-click it > Open (it isn't notarized).
+
+          SHA256SUMS lists each file's checksum.
+          NOTES
