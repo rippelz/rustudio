@@ -101,8 +101,15 @@ impl Editor {
         if self.defer_play_until_loaded(mode) {
             return;
         }
-        let clear_output = self.harness.plain()
+        // (a teleport's new session keeps the Output, as Studio's does)
+        let teleport = self.game.teleport_to.as_ref().map(|t| t.place_id);
+        let clear_output = teleport.is_none()
+            && self.harness.plain()
             && rustudio_core::rustudio_settings::studio_flag("Studio", "Clear Output On Start", true);
+        if let Some(place) = teleport {
+            // Asset delivery answers for the place being played.
+            rustudio_account::session::set_place_context(place);
+        }
         let live_ids = self.live_team_create_ids();
         self.game.keep_game_settings = self.harness.keeps_game_settings();
         // Deterministic editor self-tests inspect intermediate VM state.
@@ -118,6 +125,25 @@ impl Editor {
 
     pub fn stop_play(&mut self) {
         self.with_game_host(|game, host| game.stop_play(host));
+        self.restore_place_context();
+    }
+
+    /// After a teleported session: asset delivery answers for the open place again.
+    fn restore_place_context(&self) {
+        if let Some(o) = self.game.doc.cloud.as_ref() {
+            rustudio_account::session::set_place_context(o.place_id);
+        }
+    }
+
+    /// A play-testing teleport whose destination is ready: this session
+    /// ends and Play starts on the destination (rustudio-player play_teleport.rs).
+    fn teleport_tick(&mut self) {
+        if !self.game.poll_teleport() {
+            return;
+        }
+        let Some(mode) = self.game.play.as_ref().map(|p| p.mode) else { return };
+        self.with_game_host(|game, host| game.stop_play(host));
+        self.start_play(mode);
     }
 
     pub fn show_play_side(&mut self, side: Side) {
@@ -128,5 +154,14 @@ impl Editor {
         let (no_ui, shift) = (self.harness.run.no_ui, self.harness.run.input.shift);
         self.game.keep_game_settings = self.harness.keeps_game_settings();
         self.with_game_host(|game, host| game.play_tick(ctx, dt, host, no_ui, shift));
+        self.teleport_tick();
+    }
+
+    /// play_tick for a window the compositor isn't drawing (app.rs background_tick).
+    pub fn play_tick_hidden(&mut self, dt: f32) {
+        let no_ui = self.harness.run.no_ui;
+        self.game.keep_game_settings = self.harness.keeps_game_settings();
+        self.with_game_host(|game, host| game.play_tick_hidden(dt, host, no_ui));
+        self.teleport_tick();
     }
 }

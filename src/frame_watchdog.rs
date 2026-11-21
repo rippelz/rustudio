@@ -57,6 +57,11 @@ impl Watchdog {
         self.state.lock().unwrap().active = active;
         self.stage("previous frame", "asset polling");
     }
+    /// The compositor isn't drawing the window (app.rs hidden_tick): no
+    /// frames are expected until it shows again, when `begin` re-arms this.
+    pub fn hidden(&self) {
+        self.state.lock().unwrap().active = false;
+    }
     pub fn complete(&self) {
         let mut p = self.state.lock().unwrap();
         p.completed = Instant::now();

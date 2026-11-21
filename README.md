@@ -43,6 +43,13 @@ quite yet.
   Studio's solver (`RUSTUDIO_SOLVER=rapier` for the earlier rapier3d one),
   R15/R6 characters with climbing and held jump, saved play settings, shift
   lock, sounds, tweens, 2D and 3D GUIs.
+- **Teleports in Play:** like Studio's play-testing teleports, a server's
+  `TeleportService:TeleportAsync` to another place of the same experience
+  starts Play on that place (the open place as it is in the editor, others
+  at their latest saved version), with `TeleportData` in
+  `Player:GetJoinData()` and `GetLocalPlayerTeleportData()`. Reserved
+  servers work; deprecated teleport calls, client teleports, VIP servers and
+  other experiences fail with Studio's messages.
 - **Luau:** the real Luau VM, with most of the engine API that real games
   call (see [docs/ENGINE-GAPS.md](docs/ENGINE-GAPS.md) for what's missing).
 - **Rendering:** wgpu, with lighting, shadows, sky, atmosphere and materials

@@ -866,6 +866,9 @@ impl Editor {
         self.cloud.live.as_ref().filter(|l|l.document_id==Some(self.game.doc.id)).map(|l|(l.universe,l.place))
     }
 
+    /// A Team Create session is open (joining or joined).
+    pub fn live_session_open(&self)->bool { self.cloud.live.is_some() }
+
     pub fn live_team_create_place(&self)->Option<u64> {
         self.cloud.live.as_ref().filter(|l|l.document_id==Some(self.game.doc.id)).map(|l|l.place)
     }

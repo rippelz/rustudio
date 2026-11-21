@@ -86,6 +86,7 @@ pub const OPTS: &[Opt] = &[
     Opt { key: "fps", cat: "Performance", label: "Editor frame limit", desc: "Limits scheduled editor and playtest redraws. Input and window changes can redraw immediately.", env: "RUSTUDIO_PERF_FPS", kind: OptKind::Choice(&[("unlimited", "Unlimited"), ("60", "60 FPS"), ("30", "30 FPS")]) },
     Opt { key: "present", cat: "Performance", label: "Presentation", desc: "Low latency shows each finished frame at the next screen refresh without waiting for one, like Studio, and paces redraws to the frame limit (the screen's refresh rate when Unlimited). Wait for vsync blocks each frame on the refresh. Applies after a restart.", env: "RUSTUDIO_PERF_PRESENT", kind: OptKind::Choice(&[("mailbox", "Low latency"), ("fifo", "Wait for vsync")]) },
     Opt { key: "idle", cat: "Performance", label: "Idle grass animation", desc: "Pauses grass animation redraws while the editor is idle.", env: "RUSTUDIO_PERF_IDLE", kind: OptKind::Choice(&[("animate", "Animate"), ("pause", "Pause when idle")]) },
+    Opt { key: "background", cat: "Performance", label: "Hidden window", desc: "Keeps a running playtest and Team Create going while the window is on another workspace or minimized, without drawing (as Studio does behind other windows). Pause freezes them until the window shows again.", env: "RUSTUDIO_PERF_BACKGROUND", kind: OptKind::Choice(&[("run", "Keep running"), ("pause", "Pause")]) },
     Opt {
         key: "solver",
         cat: "Physics",

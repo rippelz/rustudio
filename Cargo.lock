@@ -4115,7 +4115,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio"
-version = "0.3.3-alpha.3"
+version = "0.3.3"
 dependencies = [
  "blake2",
  "blake3",
@@ -4176,7 +4176,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-account"
-version = "0.3.3-alpha.3"
+version = "0.3.3"
 dependencies = [
  "base64 0.23.1",
  "dirs",
@@ -4193,7 +4193,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-core"
-version = "0.3.3-alpha.3"
+version = "0.3.3"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -4221,7 +4221,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-engine"
-version = "0.3.3-alpha.3"
+version = "0.3.3"
 dependencies = [
  "blake2",
  "blake3",
@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-net"
-version = "0.3.3-alpha.3"
+version = "0.3.3"
 dependencies = [
  "base64 0.23.1",
  "blake2",
@@ -4279,7 +4279,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-physics"
-version = "0.3.3-alpha.3"
+version = "0.3.3"
 dependencies = [
  "flate2",
  "glam 0.30.10",
@@ -4293,7 +4293,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-player"
-version = "0.3.3-alpha.3"
+version = "0.3.3"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -4321,7 +4321,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-profiler-ui"
-version = "0.3.3-alpha.3"
+version = "0.3.3"
 dependencies = [
  "eframe",
  "egui",
@@ -4337,7 +4337,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-render"
-version = "0.3.3-alpha.3"
+version = "0.3.3"
 dependencies = [
  "blake3",
  "bytemuck",

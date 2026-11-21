@@ -434,6 +434,25 @@ mod tests {
     }
 
     #[test]
+    fn source_hash_without_inline_copy_is_followed_by_the_next_item() {
+        // A live place, 2026-11-21: after File Sync pushed Sources, the server echoed one
+        // as `03 <ref> <prop> 00 <hash>` with no inline copy, then another
+        // item; the decoder used to read that item as the copy and stop TC.
+        let schema=Schema {classes:vec![SchemaClass {name:"ModuleScript".into(),props:vec![SchemaProp{name:"Source".into(),ty:6}],events:vec![]}],global_props:vec![(0,0)],..Default::default()};
+        let first=property(&schema,7,"ModuleScript","Source",&PropValue::String("return 1\n".into())).unwrap();
+        let second=property(&schema,8,"ModuleScript","Source",&PropValue::String("return 2\n".into())).unwrap();
+        let mut frame=first[..26].to_vec();
+        assert_eq!(&frame[10..26],&first[26..42]);
+        frame.extend_from_slice(&second[1..]);
+        let mut dec=Decoder::new();dec.schema=Some(schema);
+        let ops=dec.decode_frame(frame[0],&frame[1..]);
+        assert!(dec.errors.is_empty(),"{:?}",dec.errors);
+        assert_eq!(ops.len(),2);
+        assert!(matches!(&ops[0],RepOp::ChangeProperty {id:7,value:PropValue::SharedHash(h),..} if h[..]==frame[10..26]));
+        assert!(matches!(&ops[1],RepOp::ChangeProperty {id:8,value:PropValue::CachedSharedString {bytes,..},..} if bytes==b"return 2\n"));
+    }
+
+    #[test]
     fn publish_event_preserves_typed_options_and_response_metadata() {
         use crate::replicator::SchemaEvent;
         let schema=Schema {classes:vec![SchemaClass{name:"TeamCreatePublishService".into(),props:vec![],events:vec![

@@ -58,6 +58,8 @@ pub const LUA_METHODS: &[(&str, &str)] = &[
     ("TeleportToSpawnByName", "TeleportService"),
     ("TeleportToPlaceInstance", "TeleportService"),
     ("TeleportToPrivateServer", "TeleportService"),
+    ("TeleportAsync", "TeleportService"),
+    ("TeleportPartyAsync", "TeleportService"),
     ("PromptGameInvite", "SocialService"),
     ("PromptPhoneBook", "SocialService"),
     ("PromptLinkSharing", "SocialService"),

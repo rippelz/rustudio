@@ -278,6 +278,9 @@ pub struct RustudioApp {
     pub(crate) last_ui_frame: Option<Instant>,
     last_plugin_tick: Instant,
     plugins_ticked_between_frames: bool,
+    /// The window's egui context, for the ticks run between frames.
+    egui_ctx: Option<egui::Context>,
+    last_hidden_tick: Instant,
     pub dock: DockState<Tab>,
     pub ed: Editor,
     /// Keeps the dock, window and view settings (src/layout_store.rs).
@@ -516,6 +519,8 @@ impl RustudioApp {
             last_ui_frame: None,
             last_plugin_tick: Instant::now(),
             plugins_ticked_between_frames: false,
+            egui_ctx: None,
+            last_hidden_tick: Instant::now(),
             dock,
             ed,
             layout,
@@ -1924,13 +1929,80 @@ impl eframe::App for RustudioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         rustudio_render::gpu_health::check();
         self.last_ui_frame = Some(Instant::now());
+        if self.egui_ctx.is_none() {
+            self.egui_ctx = Some(ui.ctx().clone());
+        }
         self.frame(ui);
     }
 }
 
 const PLUGIN_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Play's step while the window gets no redraws (Studio's 60 Hz).
+const HIDDEN_PLAY_INTERVAL: std::time::Duration = std::time::Duration::from_micros(16_667);
+/// Team Create alone: often enough that edits keep arriving in order.
+const HIDDEN_LIVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl RustudioApp {
+    /// Work due between frames: plugin ticks, and while the compositor sends
+    /// no redraws (`hidden`: another workspace, minimized) the playtest and
+    /// Team Create, which Studio keeps running behind other windows.
+    pub fn tick_between_frames(&mut self, now: Instant, hidden: bool) -> Option<Instant> {
+        let plugins = self.tick_plugins_between_frames(now);
+        let hidden = if hidden { self.hidden_tick(now) } else { None };
+        match (plugins, hidden) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// What keeps running in a hidden window (Performance > Hidden window).
+    /// Fixed-step and harness runs stay frame-driven, so they replay the same.
+    fn hidden_interval(&self) -> Option<std::time::Duration> {
+        let ed = &self.ed;
+        if rustudio_core::rustudio_settings::performance_value("background") == "pause"
+            || ed.game.fixed_dt.is_some()
+            || ed.harness.run.screenshot.is_some()
+            || ed.harness.run.bench.is_some()
+            || ed.harness.selftest.is_some()
+            || ed.place_loading()
+        {
+            return None;
+        }
+        if ed.game.play.is_some() {
+            Some(HIDDEN_PLAY_INTERVAL)
+        } else {
+            ed.live_session_open().then_some(HIDDEN_LIVE_INTERVAL)
+        }
+    }
+
+    /// The simulation part of a frame, with nothing drawn: Play steps with no
+    /// keys held (the window lost focus), Team Create applies what arrived.
+    fn hidden_tick(&mut self, now: Instant) -> Option<Instant> {
+        let interval = self.hidden_interval()?;
+        if now >= self.last_hidden_tick + interval {
+            let _p = rustudio_core::bench::scope("hidden_tick");
+            self.last_hidden_tick = now;
+            self.watchdog.hidden();
+            let ed = &mut self.ed;
+            ed.game.frame_no += 1;
+            let dt = now.saturating_duration_since(ed.last_frame).as_secs_f32();
+            ed.last_frame = now;
+            ed.game.poll_assets();
+            ed.flush_output_changes();
+            if ed.game.play.is_some() {
+                let step = ed.game.play_step(dt);
+                ed.play_tick_hidden(step);
+            }
+            if let Some(ctx) = self.egui_ctx.clone() {
+                // (no overlays: nothing is drawn until the window shows)
+                ed.hud.viewport_drawn = false;
+                ed.cloud_poll(&ctx);
+            }
+        }
+        let interval = self.hidden_interval()?;
+        Some(self.last_hidden_tick + interval)
+    }
+
     pub fn tick_plugins_between_frames(&mut self, now: Instant) -> Option<Instant> {
         if self.ed.place_loading() || !self.ed.plugins.needs_idle_tick() {
             return None;

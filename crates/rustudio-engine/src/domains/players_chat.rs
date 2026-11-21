@@ -323,8 +323,12 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Resu
         "SetSuperSafeChat" => none(),
         "GetCameraState" => Err(rt_err("GetCameraState requires Server Authority to be enabled")),
         "GetData" => Err(rt_err("Player:GetData() is not yet enabled!")),
-        // A Studio Play test wasn't joined through a teleport: no data.
-        "GetJoinData" => one(Value::Table(lua.create_table()?)),
+        // A Play joined without a teleport has no data; after a play-testing
+        // teleport: SourcePlaceId, SourceGameId, TeleportData, Members (play_teleport.rs).
+        "GetJoinData" => match crate::play_teleport::arrival() {
+            Some(a) => one(crate::runtime::ext::from_json(lua, &a.join_data())?),
+            None => one(Value::Table(lua.create_table()?)),
+        },
         "IsVerified" => {
             if world(lua)?.side == Side::Client {
                 return Err(rt_err("isVerified() can only be called by the backend server"));

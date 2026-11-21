@@ -931,15 +931,7 @@ impl Decoder {
                 early_props.extend(props);
                 for (_, value) in &early_props {
                     if let PropValue::SharedHash(expected) = value {
-                        let hash: [u8; 16] = c.take(16)?.try_into().unwrap();
-                        if &hash != expected {
-                            return bad("new-object shared-string hash");
-                        }
-                        if c.u8()? != 0 {
-                            return bad("new-object shared-string encoding");
-                        }
-                        let len = c.varint()? as usize;
-                        self.shared.insert(hash, c.take(len)?.to_vec());
+                        self.inline_shared(c, expected)?;
                     }
                 }
                 let props = early_props;
@@ -978,11 +970,7 @@ impl Decoder {
                 let name = p.name.clone();
                 let collaborator = cls.name == "Collaborator";
                 if let PropValue::SharedHash(expected) = &value {
-                    let hash:[u8;16]=c.take(16)?.try_into().unwrap();
-                    if &hash!=expected {return bad("property shared-string hash");}
-                    if c.u8()?!=0 {return bad("property shared-string encoding");}
-                    let len=c.varint()? as usize;
-                    self.shared.insert(hash,c.take(len)?.to_vec());
+                    self.inline_shared(c, expected)?;
                 }
                 if let Some(id) = id {
                     if collaborator {ops.push(RepOp::Presence { user_id: id });}
@@ -1056,6 +1044,24 @@ impl Decoder {
             }
             k => return bad(format!("item {k:#x} at {}", c.o)),
         }
+        Ok(())
+    }
+
+    /// The inline copy of a shared string after its hash: `<hash> 00
+    /// <varint len> <bytes>`. The server leaves it out when this peer already
+    /// holds the string (a live place, 2026-11-21: a 37-byte frame echoing a Source our
+    /// File Sync had just sent: hash only, then the next item), so it is read
+    /// only when the next 16 bytes repeat the hash.
+    fn inline_shared(&mut self, c: &mut Cur, expected: &[u8; 16]) -> R<()> {
+        if c.left() < 16 || c.d[c.o..c.o + 16] != expected[..] {
+            return Ok(());
+        }
+        c.take(16)?;
+        if c.u8()? != 0 {
+            return bad("shared-string encoding");
+        }
+        let len = c.varint()? as usize;
+        self.shared.insert(*expected, c.take(len)?.to_vec());
         Ok(())
     }
 

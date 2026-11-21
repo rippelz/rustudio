@@ -606,9 +606,14 @@ impl Game {
         let show_client = self.play_shows_client;
         let keep_game_settings = self.keep_game_settings;
         let fixed_dt = self.fixed_dt;
+        let teleport = self.teleport_to.take();
+        if teleport.is_none() {
+            self.play_origin = live_ids;
+        }
 
         let worker = match PlayWorker::spawn(host.play_worker_host(), move |game, worker_host| {
             game.doc = doc;
+            game.teleport_to = teleport;
             game.cam = cam;
             game.account = account;
             game.play_rig = play_rig;
@@ -847,7 +852,9 @@ impl Game {
         if let Some(Ok((publication, _))) = worker.pending.map(|reply| reply.recv()) {
             self.append_play_output(publication.log);
         }
-        if let Ok(Ok(logs)) = worker.worker.submit(|game, worker_host| {
+        let quiet = self.quiet_stop;
+        if let Ok(Ok(logs)) = worker.worker.submit(move |game, worker_host| {
+            game.quiet_stop = quiet;
             game.stop_play(worker_host);
             std::mem::take(&mut game.log)
         }).map(|reply| reply.recv()) {

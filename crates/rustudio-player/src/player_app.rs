@@ -112,6 +112,15 @@ impl PlayerApp {
             }
             let _scope = rustudio_core::bench::scope("play_tick");
             game.play_tick(&ctx, step, &mut self.host, true, self.run.input.shift);
+            // A play-testing teleport: this session ends, the destination's begins.
+            if game.poll_teleport() {
+                game.stop_play(&mut self.host);
+                if game.use_gameplay_worker() {
+                    game.start_play_threaded(RunMode::Play, &mut self.host, false, None);
+                } else {
+                    game.start_play(RunMode::Play, &mut self.host, false, None);
+                }
+            }
         }
         self.run.end_value = self.host.end_value.take().or(self.run.end_value.take());
         game.scene.sync(&mut game.doc);

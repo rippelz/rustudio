@@ -175,6 +175,11 @@ pub fn call(
                 state(lua)?.raw_set(key, copy(lua, value, &mut Vec::new())?)?;
                 return Ok(MultiValue::new());
             }
+            // The arriving player's teleport data, on the client (play_teleport.rs).
+            "GetLocalPlayerTeleportData" => match crate::play_teleport::arrival().and_then(|a| a.data()) {
+                Some(d) if world(lua)?.side == Side::Client => crate::runtime::ext::from_json(lua, &d)?,
+                _ => Value::Nil,
+            },
             "SetTeleportGui" => {
                 let value = arg(args, 1);
                 if !value.is_nil() && opt_inst(&value).is_none() {

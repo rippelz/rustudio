@@ -25,6 +25,15 @@ pub struct Game {
     /// The running Play / Run session, if any.
     pub play: Option<crate::play::PlaySession>,
     pub(crate) play_thread: Option<crate::play_worker::ThreadedPlay>,
+    /// A play-testing teleport's destination, loading (play_teleport.rs).
+    pub(crate) teleport_job: Option<crate::play_teleport::TeleportJob>,
+    /// The place the next `start_play` plays instead of the edit document,
+    /// and how its player arrives (a teleport).
+    pub teleport_to: Option<crate::play_teleport::Teleport>,
+    /// The live Team Create (universe, place) the Play session began on.
+    pub(crate) play_origin: Option<(u64, u64)>,
+    /// Stop without the "■ Stopped" line (a teleport's session change).
+    pub(crate) quiet_stop: bool,
     pub(crate) play_input_pose_due: bool,
     /// Fixed frame time for deterministic self-tests.
     pub fixed_dt: Option<f32>,
@@ -145,6 +154,10 @@ impl Game {
             account: crate::account::Account::new(),
             play: None,
             play_thread: None,
+            teleport_job: None,
+            teleport_to: None,
+            quiet_stop: false,
+            play_origin: None,
             play_input_pose_due: false,
             fixed_dt: None,
             play_rig: None,

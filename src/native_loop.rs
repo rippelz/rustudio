@@ -1,4 +1,5 @@
-//! Keep plugin work on the main thread when the window stops receiving redraws.
+//! Keep plugin work, a running playtest and Team Create going on the main
+//! thread when the window stops receiving redraws (another workspace, minimized).
 //! On macOS, App Nap can still delay event-loop wakeups while the app is hidden.
 
 use std::cell::{Cell, RefCell};
@@ -71,6 +72,7 @@ pub fn run(
         pace_refresh,
         refresh: None,
         idle_since: None,
+        redraw_wanted: None,
     })?;
     // create_native logs its initialization error before exiting the loop.
     // Preserve a failing exit status even though it only exposes winit's result.
@@ -96,7 +98,13 @@ struct NativeLoop<'a> {
     refresh: Option<(Instant, u32)>,
     /// When the loop last went idle (--bench sleep accounting).
     idle_since: Option<Instant>,
+    /// The earliest root redraw asked for and not yet drawn (hidden-window
+    /// detection: app.rs tick_between_frames).
+    redraw_wanted: Option<Instant>,
 }
+
+/// How long an asked-for redraw may stay undrawn before the window counts as hidden.
+const HIDDEN_AFTER: Duration = Duration::from_millis(250);
 
 impl ApplicationHandler<UserEvent> for NativeLoop<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -191,6 +199,16 @@ impl ApplicationHandler<UserEvent> for NativeLoop<'_> {
                 }
             }
         }
+        #[allow(irrefutable_let_patterns)]
+        if let UserEvent::RequestRepaint { viewport_id, when, .. } = &event {
+            if *viewport_id == egui::ViewportId::ROOT {
+                let served = |w: Instant| self.last_ui_frame().is_some_and(|l| l >= w);
+                self.redraw_wanted = match self.redraw_wanted {
+                    Some(w) if !served(w) => Some(w.min(*when)),
+                    _ => Some(*when),
+                };
+            }
+        }
         self.eframe.user_event(event_loop, event);
     }
 
@@ -208,7 +226,20 @@ impl ApplicationHandler<UserEvent> for NativeLoop<'_> {
         let Some(app) = self.app_handle.borrow().as_ref().and_then(Weak::upgrade) else {
             return;
         };
-        let deadline = app.borrow_mut().tick_plugins_between_frames(Instant::now());
+        let now = Instant::now();
+        // A redraw asked for that hasn't come: the compositor stopped
+        // drawing the window (Wayland sends hidden surfaces no frame callbacks).
+        let hidden = self.redraw_wanted.is_some_and(|w| {
+            now >= w + HIDDEN_AFTER && app.borrow().last_ui_frame.is_none_or(|l| l < w)
+        });
+        let deadline = app.borrow_mut().tick_between_frames(now, hidden);
+        // (checks again once the stall is long enough to count as hidden)
+        let deadline = match self.redraw_wanted.filter(|_| !hidden) {
+            Some(w) if app.borrow().last_ui_frame.is_none_or(|l| l < w) => {
+                Some(deadline.map_or(w + HIDDEN_AFTER, |d| d.min(w + HIDDEN_AFTER)))
+            }
+            _ => deadline,
+        };
         if let Some(deadline) = deadline {
             event_loop.set_control_flow(with_plugin_deadline(event_loop.control_flow(), deadline));
         }
