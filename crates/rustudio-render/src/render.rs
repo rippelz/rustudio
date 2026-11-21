@@ -644,19 +644,28 @@ mod gpu_tests {
         // One triangle 1200 times: 76,800 bytes of corners, 3 vertices indexed.
         let repeated: Vec<Vertex> = verts[..3].iter().cycle().take(1200).copied().collect();
         let shared = Mesh::upload(&device, "loaded mesh", &repeated, wgpu::BufferUsages::VERTEX, None);
+        // Less than 25% sharing, but both buffers fit if indexed.
+        let lightly_shared: Vec<Vertex> = verts[..950].iter().cycle().take(1200).copied().collect();
+        let lightly_shared = Mesh::upload(&device, "loaded mesh", &lightly_shared, wgpu::BufferUsages::VERTEX, None);
+        // Even perfect vertex sharing cannot make this index buffer fit.
+        let too_many_indices: Vec<Vertex> = verts[..3].iter().cycle().take((1 << 14) + 2).copied().collect();
+        let too_many_indices = Mesh::upload(&device, "loaded mesh", &too_many_indices, wgpu::BufferUsages::VERTEX, None);
         assert!(pollster::block_on(scope.pop()).is_none());
         assert_eq!((big.count, small.count), (0, 96));
         assert_eq!(shared.count, 1200);
         assert!(shared.ibuf.is_some());
+        assert_eq!(lightly_shared.count, 1200);
+        assert!(lightly_shared.ibuf.is_some());
+        assert_eq!(too_many_indices.count, 0);
     }
 
-    /// A CPU-skinned mesh too big for the GPU keeps its one empty slot
-    /// through set_mesh each frame instead of adding a mesh per frame.
+    /// A CPU-skinned mesh keeps its slot while oversized and draws again
+    /// when its new pose can be indexed within the buffer limit.
     #[test]
-    fn oversized_skinned_mesh_keeps_its_slot() {
+    fn oversized_skinned_mesh_keeps_its_slot_and_recovers() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
-            eprintln!("no GPU adapter: oversized_skinned_mesh_keeps_its_slot skipped");
+            eprintln!("no GPU adapter: oversized_skinned_mesh_keeps_its_slot_and_recovers skipped");
             return;
         };
         let max = 16u64 << 20;
@@ -677,6 +686,12 @@ mod gpu_tests {
         }
         assert_eq!(r.meshes.len(), meshes);
         assert_eq!(r.meshes[first as usize + BUILTIN_MESHES].count, 0);
+        let shared: Vec<_> = positions[..3].iter().cycle().take(corners).copied().collect();
+        assert_eq!(r.set_mesh(&device, &queue, Some(first), &shared, &normals, &[], &[]), first);
+        assert_eq!(r.meshes.len(), meshes);
+        let recovered = &r.meshes[first as usize + BUILTIN_MESHES];
+        assert_eq!(recovered.count as usize, corners);
+        assert!(recovered.ibuf.is_some());
         assert!(pollster::block_on(scope.pop()).is_none());
     }
 
@@ -1314,41 +1329,55 @@ impl Mesh {
         }
     }
 
-    /// A triangle list as shared vertices and indices, when sharing saves
-    /// at least a quarter of the vertices (None: draw it as a list).
-    fn indexed(verts: &[Vertex]) -> Option<(Vec<Vertex>, Vec<u32>)> {
-        if verts.len() < 48 {
-            return None;
-        }
-        let mut seen: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::with_capacity(verts.len());
+    /// Shares identical corners, stopping as soon as the vertex budget is exceeded.
+    fn indexed(verts: &[Vertex], max_unique: usize) -> Option<(Vec<Vertex>, Vec<u32>)> {
+        use std::collections::hash_map::Entry;
+
+        let mut seen = std::collections::HashMap::<&[u8], u32>::with_capacity(verts.len().min(max_unique));
         let mut unique: Vec<Vertex> = Vec::new();
         let mut index = Vec::with_capacity(verts.len());
         for v in verts {
-            let key: &[u8] = bytemuck::bytes_of(v);
-            let at = *seen.entry(key).or_insert_with(|| {
-                unique.push(*v);
-                unique.len() as u32 - 1
-            });
+            let at = match seen.entry(bytemuck::bytes_of(v)) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
+                    if unique.len() == max_unique {
+                        return None;
+                    }
+                    let at = unique.len() as u32;
+                    entry.insert(at);
+                    unique.push(*v);
+                    at
+                }
+            };
             index.push(at);
         }
-        (unique.len() * 4 <= verts.len() * 3).then_some((unique, index))
+        Some((unique, index))
     }
 
-    /// Uploads `verts` (a triangle list), indexed when that saves work.
-    /// A mesh whose buffer is over the device's max_buffer_size (a 3M
-    /// triangle mesh against wgpu's 256 MiB default) is logged and uploaded
-    /// empty, so it draws nothing: wgpu's validation error would panic.
+    /// Uploads a triangle list, using indices when they save work or make
+    /// the mesh fit. A mesh that exceeds the device limit draws nothing.
     fn upload(device: &wgpu::Device, label: &str, verts: &[Vertex], usage: wgpu::BufferUsages, cull: Option<bool>) -> Mesh {
-        let indexed = Self::indexed(verts);
-        let bytes = match &indexed {
-            Some((unique, index)) => std::mem::size_of_val(unique.as_slice()).max(std::mem::size_of_val(index.as_slice())),
-            None => std::mem::size_of_val(verts),
-        } as u64;
+        Self::try_upload(device, label, verts, usage, cull).unwrap_or_else(|| {
+            let max = device.limits().max_buffer_size;
+            log::warn!(target: "rustudio::gpu", "{label}: {} corners cannot fit in the GPU's {max}-byte buffer limit; not drawn", verts.len());
+            Self::upload(device, label, &[], usage, cull)
+        })
+    }
+
+    fn try_upload(device: &wgpu::Device, label: &str, verts: &[Vertex], usage: wgpu::BufferUsages, cull: Option<bool>) -> Option<Mesh> {
         let max = device.limits().max_buffer_size;
-        if bytes > max {
-            log::warn!(target: "rustudio::gpu", "{label}: {} vertices need a {bytes}-byte buffer, over the GPU's {max}; not drawn", verts.len());
-            return Self::upload(device, label, &[], usage, cull);
-        }
+        let indexed = if std::mem::size_of_val(verts) as u64 > max {
+            let index_bytes = verts.len() as u64 * std::mem::size_of::<u32>() as u64;
+            if index_bytes > max {
+                return None;
+            }
+            Some(Self::indexed(verts, (max / std::mem::size_of::<Vertex>() as u64) as usize)?)
+        } else if verts.len() >= 48 {
+            // Use indices for a mesh that already fits when they save at least 25% of its vertices.
+            Self::indexed(verts, verts.len() - verts.len().div_ceil(4))
+        } else {
+            None
+        };
         let (vdata, ibuf, remap, count) = match indexed {
             Some((unique, index)) => {
                 let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1370,7 +1399,7 @@ impl Mesh {
             let p = Vec3::from(v.pos);
             Some(b.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))))
         });
-        Mesh { vbuf, count, ibuf, remap, bounds, cull, storage: false }
+        Some(Mesh { vbuf, count, ibuf, remap, bounds, cull, storage: false })
     }
 
     /// `corners` (one vertex per corner, as uploaded) as this mesh's
@@ -5892,20 +5921,8 @@ impl Renderer {
     ) -> u32 {
         self.mesh_gen += 1;
         let slot = index.map(|i| i as usize + BUILTIN_MESHES);
-        // A mesh too big for the GPU keeps the empty slot Mesh::upload gave
-        // it: re-adding it would push a new empty mesh (and a warning) every
-        // frame it is skinned on the CPU.
-        // shortcut: judged by its corner bytes, so a deformed copy whose
-        // indexed form would now fit stays empty; track the dropped size if
-        // that ever matters.
-        let corner_bytes = (positions.len() * std::mem::size_of::<Vertex>()) as u64;
-        if let (Some(i), Some(m)) = (index, slot.and_then(|s| self.meshes.get(s))) {
-            if m.count == 0 && corner_bytes > device.limits().max_buffer_size {
-                return i;
-            }
-        }
-        match slot.and_then(|s| self.meshes.get(s)) {
-            Some(m) if m.corners() as usize == positions.len() => {
+        match (index, slot.and_then(|s| self.meshes.get_mut(s))) {
+            (Some(i), Some(m)) if m.count == 0 || m.corners() as usize == positions.len() => {
                 let verts: Vec<Vertex> = positions
                     .iter()
                     .zip(normals)
@@ -5918,10 +5935,21 @@ impl Renderer {
                         color: colors.get(i).map(|c| c.to_array()).unwrap_or([0.0; 4]),
                     })
                     .collect();
+                if m.count == 0 {
+                    // A new pose can share enough corners to fit. Keep the
+                    // same slot even when the upload still exceeds the limit.
+                    if !verts.is_empty() {
+                        let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+                        if let Some(mesh) = Mesh::try_upload(device, "loaded mesh", &verts, usage, m.cull) {
+                            *m = mesh;
+                        }
+                    }
+                    return i;
+                }
                 match m.contents(&verts) {
                     Some(verts) => {
                         queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(&verts));
-                        index.unwrap_or(0)
+                        i
                     }
                     None => self.add_mesh_colored(device, positions, normals, uvs, colors),
                 }
