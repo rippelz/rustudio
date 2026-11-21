@@ -214,7 +214,7 @@ impl ProjectState {
     /// Whether a path is inside the project's mapped paths (or is one of its
     /// project files): the only places rustudio writes.
     pub fn writable(&self, p: &Path) -> bool {
-        p == self.file || self.mapped.iter().any(|m| p.starts_with(m))
+        project::within(&self.root, p) && (p == self.file || self.mapped.iter().any(|m| p.starts_with(m)))
     }
 
     /// Puts a snapshot under `parent`, replacing a same-named child the place
@@ -670,5 +670,64 @@ mod tests {
         let a2 = named(&doc2, server2, "A2").unwrap();
         assert_eq!(doc2.prop(a2, "Disabled"), Some(Variant::Bool(true)));
         assert!(named(&doc2, named(&doc2, server2, "Sub").unwrap(), "Box").is_some());
+    }
+
+    /// A `$path` that leaves the project folder (`..`, an absolute path, or a
+    /// symlink) is neither read nor writable.
+    #[test]
+    fn path_outside_project_is_refused() {
+        let base = std::env::temp_dir().join(format!("rustudio-test-escape-{}", std::process::id()));
+        let dir = base.join("proj");
+        let _ = std::fs::create_dir_all(dir.join("src"));
+        let secret = base.join("outside.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        let abs = secret.to_string_lossy().replace('\\', "/");
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&secret, dir.join("link.txt"));
+            let _ = std::os::unix::fs::symlink(&secret, dir.join("src/inner.txt"));
+            let _ = std::os::unix::fs::symlink(&base, dir.join("up"));
+        }
+        std::fs::write(
+            dir.join("default.project.json"),
+            format!(
+                r#"{{"name":"T","tree":{{"$className":"DataModel","ReplicatedStorage":{{
+                    "Dots":{{"$path":"../outside.txt"}},
+                    "Abs":{{"$path":"{abs}"}},
+                    "Link":{{"$path":"link.txt"}},
+                    "UpDir":{{"$path":"up"}},
+                    "Src":{{"$path":"src"}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let (doc, st) = open(&dir.join("default.project.json")).unwrap();
+        let rs = named(&doc, doc.dom.root_ref(), "ReplicatedStorage").unwrap();
+        for n in ["Dots", "Abs", "Link", "UpDir"] {
+            let r = named(&doc, rs, n).unwrap();
+            assert_eq!(doc.dom.get_by_ref(r).unwrap().class.as_str(), "Folder", "{n}");
+            assert!(doc.dom.get_by_ref(r).unwrap().children().is_empty(), "{n}");
+        }
+        let src = named(&doc, rs, "Src").unwrap();
+        assert!(named(&doc, src, "inner").is_none());
+        assert!(!doc.dom.descendants().any(|i| i.properties.values().any(|v| matches!(v, Variant::String(s) if s == "secret"))));
+        assert!(st.mapped.iter().all(|m| project::within(&st.root, m)), "{:?}", st.mapped);
+        assert!(!st.writable(&secret) && !st.writable(&base.join("new.txt")));
+        assert!(!st.writable(&dir.join("src/inner.txt")) && !st.writable(&dir.join("up/outside.txt")));
+        assert!(st.writable(&st.root.join("src/New.luau")));
+        assert!(!project::within(&dir, &dir.join("src/../../outside.txt")));
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(base.join("gone.txt"), dir.join("src/Dangling.luau"));
+            assert!(!st.writable(&st.root.join("src/Dangling.luau")));
+            // The filesystem follows deep/ before `..`: base/outside.txt.
+            let _ = std::fs::create_dir_all(base.join("deep"));
+            let _ = std::os::unix::fs::symlink(base.join("deep"), dir.join("deep"));
+            assert!(!project::within(&dir, &dir.join("deep/../outside.txt")));
+            assert!(!project::within(&dir, &dir.join("link.txt/../x")));
+            std::fs::remove_file(&st.file).unwrap();
+            std::os::unix::fs::symlink(&secret, &st.file).unwrap();
+            assert!(!st.writable(&st.file));
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

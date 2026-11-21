@@ -256,6 +256,10 @@ impl<'a> Reader<'a> {
     }
 
     fn bytes(&mut self, p: &Path) -> Option<Vec<u8>> {
+        if !within(self.root, p) {
+            self.warnings.push(format!("{}: outside the project folder, not read", p.display()));
+            return None;
+        }
         match std::fs::read(p) {
             Ok(b) => {
                 self.read.insert(p.to_path_buf(), b.clone());
@@ -297,6 +301,10 @@ impl<'a> Reader<'a> {
     /// path gives the name.
     pub fn snapshot(&mut self, path: &Path) -> Option<Snap> {
         if self.ignored(path) || !path.exists() {
+            return None;
+        }
+        if !within(self.root, path) {
+            self.warnings.push(format!("{}: outside the project folder, not read", path.display()));
             return None;
         }
         if path.is_dir() {
@@ -556,7 +564,12 @@ impl<'a> Reader<'a> {
         });
         if let Some(path) = n.get("$path").and_then(|p| p.as_str().or_else(|| p.get("optional").and_then(|o| o.as_str()))) {
             let full = clean(&project.parent().unwrap_or(Path::new(".")).join(path));
-            match self.snapshot(&full) {
+            let inside = within(self.root, &full);
+            if !inside {
+                self.warnings
+                    .push(format!("{}: $path {} is outside the project folder", project.display(), full.display()));
+            }
+            match inside.then(|| self.snapshot(&full)).flatten() {
                 Some(mut ps) => {
                     ps.name = name.to_string();
                     if ps.class == "Folder" {
@@ -564,7 +577,7 @@ impl<'a> Reader<'a> {
                     }
                     s = ps;
                 }
-                None if n.get("$path").is_some_and(|p| p.is_string()) && !full.exists() => {
+                None if inside && n.get("$path").is_some_and(|p| p.is_string()) && !full.exists() => {
                     self.warnings
                         .push(format!("{}: $path {} doesn't exist", project.display(), full.display()));
                 }
@@ -629,6 +642,35 @@ pub fn clean(p: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Whether `p` stays inside `root` as the filesystem resolves it (symlinks
+/// before `..`). A path that doesn't exist yet is judged by its nearest
+/// existing ancestor; a dangling symlink, or `..` after a missing part, is
+/// outside. Project files are untrusted: their `$path`s and symlinks must
+/// not reach the rest of the disk.
+pub fn within(root: &Path, p: &Path) -> bool {
+    use std::path::Component;
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| clean(root));
+    let mut probe = p;
+    let mut rest = Vec::new();
+    loop {
+        if std::fs::symlink_metadata(probe).is_ok() {
+            return match std::fs::canonicalize(probe) {
+                Ok(c) => rest.iter().rev().fold(c, |a, n| a.join(n)).starts_with(&root),
+                Err(_) => false,
+            };
+        }
+        match (probe.parent(), probe.components().next_back()) {
+            (Some(up), Some(Component::Normal(n))) => {
+                rest.push(n);
+                probe = up;
+            }
+            (Some(up), Some(Component::CurDir)) => probe = up,
+            (_, Some(Component::ParentDir)) => return false,
+            _ => return clean(p).starts_with(&root),
+        }
+    }
 }
 
 /// The data file beside a file: `X.meta.json` (or an existing `X.data.json`).
