@@ -477,8 +477,10 @@ pub mod gpu_check {
             };
             r.render(&rs, [320, 180], &frame);
         }
-        // The passes made on first use by a scene that has them.
-        for samples in [1, SAMPLES] {
+        // The passes made on first use by a scene that has them (a device that
+        // cannot sample multisampled textures never builds the 4x set).
+        let sample_counts: &[u32] = if caps.sampled_msaa() { &[1, SAMPLES] } else { &[1] };
+        for &samples in sample_counts {
             drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, samples));
             drop(crate::highlight::HighlightPass::new(&device, DISPLAY_FORMAT, DEPTH_FORMAT, samples, std::mem::size_of::<Vertex>() as u64));
         }
@@ -496,6 +498,30 @@ pub mod gpu_check {
 #[cfg(test)]
 mod gpu_tests {
     use super::*;
+
+    fn caps_on(backend: wgpu::Backend) -> crate::gpu_caps::GpuCaps {
+        crate::gpu_caps::GpuCaps {
+            name: "test".into(),
+            vendor: 0,
+            backend,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            limits: wgpu::Limits::downlevel_defaults(),
+            features: wgpu::Features::empty(),
+            downlevel: wgpu::DownlevelFlags::empty(),
+            r8_storage: false,
+        }
+    }
+
+    /// OpenGL cannot sample multisampled textures (gpu_caps::sampled_msaa), and
+    /// the 4x shader variant needs textureSamples (GL 4.5): the pipelines built
+    /// at startup must be the single-sample set there, or the "see-through
+    /// encode" pipeline panics on GL 4.3 drivers (Intel HD 4600).
+    #[test]
+    fn startup_samples_is_one_on_opengl() {
+        assert_eq!(startup_samples(&caps_on(wgpu::Backend::Gl)), 1);
+        assert_eq!(startup_samples(&caps_on(wgpu::Backend::Vulkan)), SAMPLES);
+        assert_eq!(startup_samples(&caps_on(wgpu::Backend::Dx12)), SAMPLES);
+    }
 
     #[test]
     fn primitive_parity_geometry() {
@@ -1532,6 +1558,8 @@ struct Target {
 }
 
 struct ViewportPipelines {
+    /// The sample count these pipelines were built for (1 on OpenGL).
+    samples: u32,
     water: crate::water::WaterPass,
     glass_resolve: wgpu::RenderPipeline,
     sky: wgpu::RenderPipeline,
@@ -2004,6 +2032,7 @@ impl ViewportPipelines {
 
 
         Self {
+            samples,
             water,
             glass_resolve,
             sky,
@@ -2047,6 +2076,14 @@ fn supports_two_samples(rs: &egui_wgpu::RenderState) -> bool {
         flags.sample_count_supported(2)
             && (format == DEPTH_FORMAT || flags.contains(Flags::MULTISAMPLE_RESOLVE))
     })
+}
+
+/// The sample count the startup viewport pipelines are built for. The 4x
+/// shader variant reads the MSAA scene with textureSamples (GL 4.5), and a
+/// GL device cannot sample multisampled textures anyway (gpu_caps::
+/// sampled_msaa), so it starts at one sample instead of failing to compile.
+fn startup_samples(caps: &crate::gpu_caps::GpuCaps) -> u32 {
+    if caps.sampled_msaa() { SAMPLES } else { 1 }
 }
 
 /// Single-sample textures take a mip level in place of the sample index.
@@ -2862,7 +2899,7 @@ impl Renderer {
             let bg = Self::sky_globals_group(device, &layout, &globals_buf, &sky_view, &sky_sampler);
             (layout, bg)
         });
-        let viewport = ViewportPipelines::new(device, queue, &bgl, &tex_layout, &glass_layout, &terrain_bgl, SAMPLES, reduced);
+        let viewport = ViewportPipelines::new(device, queue, &bgl, &tex_layout, &glass_layout, &terrain_bgl, startup_samples(&caps), reduced);
 
         let meshes = build_meshes()
             .into_iter()
@@ -3862,7 +3899,7 @@ impl Renderer {
     }
 
     fn pipelines(&self, samples: u32) -> &ViewportPipelines {
-        if samples == SAMPLES {
+        if samples == self.viewport.samples {
             &self.viewport
         } else {
             self.lower_samples[sample_slot(samples)].as_ref().expect("viewport pipelines")
@@ -3874,7 +3911,7 @@ impl Renderer {
             return;
         }
         let device = &rs.device;
-        let viewport = if samples == SAMPLES {
+        let viewport = if samples == self.viewport.samples {
             &self.viewport
         } else {
             self.lower_samples[sample_slot(samples)].get_or_insert_with(|| ViewportPipelines::new(
@@ -4653,7 +4690,7 @@ impl Renderer {
         };
 
         let target = self.target.as_ref()?;
-        let viewport = if samples == SAMPLES { &self.viewport } else { self.lower_samples[sample_slot(samples)].as_ref()? };
+        let viewport = if samples == self.viewport.samples { &self.viewport } else { self.lower_samples[sample_slot(samples)].as_ref()? };
         let cloud_slot = sample_slot(samples);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("viewport"),
