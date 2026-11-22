@@ -512,8 +512,15 @@ function ACP.GetAnimationClipAsync(self, id)
         task.wait()
         state = __rs_asset_ready(n)
     end
-    local ok, model = false, nil
-    if state == true then ok, model = pcall(__rs_anim_asset, n) end
+    local ok, model, decoding = false, nil, false
+    if state == true then
+        ok, model, decoding = pcall(__rs_anim_asset, n)
+        -- (decoded on a worker: yields until it is in)
+        while ok and decoding do
+            task.wait()
+            ok, model, decoding = pcall(__rs_anim_asset, n)
+        end
+    end
     if ok and model then
         local c = if model:IsA("AnimationClip") then model else model:FindFirstChildWhichIsA("AnimationClip", true)
         if c then c.Parent = nil; return c end

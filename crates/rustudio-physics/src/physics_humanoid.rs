@@ -378,6 +378,23 @@ pub struct Hums {
     pub(super) repl: HashMap<rp::RigidBodyHandle, Repl>,
 }
 
+impl Hums {
+    /// A new world (`Physics::reconcile`): the characters' bodies are built
+    /// again by their owners, and what is kept by body or collider handle
+    /// (forces, floors, stand-ins, replication buffers) was the old world's.
+    pub(super) fn new_world(&mut self) {
+        self.by_model.clear();
+        self.of_part.clear();
+        self.fext.clear();
+        self.mid = MidSolve::default();
+        self.floor_levels.clear();
+        self.roles.clear();
+        self.ghosts.clear();
+        self.history.clear();
+        self.repl.clear();
+    }
+}
+
 /// One replicated state of an assembly: the sender's stamp (its clock, s), pose, v, ω.
 #[derive(Clone, Copy)]
 pub(super) struct Sample {

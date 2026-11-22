@@ -182,6 +182,12 @@ pub(super) struct Route {
 }
 
 fn compute(class: rbx_dom_weak::Ustr, key: &str) -> Route {
+    // Every class is an Instance: one the reflection database and the API
+    // dump don't list (PlaceSettings, for one) still has IsA, FindFirstChild,
+    // … [Roblox docs: Instance].
+    let known = rustudio_core::doc::db().classes.contains_key(class.as_str())
+        || rustudio_core::api::get().is_some_and(|a| a.classes.contains_key(class.as_str()));
+    let class = if known { class } else { ustr("Instance") };
     let c = class.as_str();
     let special = match key {
         "Name" | "name" => Special::Name,

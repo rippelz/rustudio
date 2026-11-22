@@ -52,6 +52,8 @@ pub struct Account {
     restored: bool,
     avatar: Option<rustudio_engine::avatar::AvatarLook>,
     avatar_requested: bool,
+    /// An avatar arrived since `take_new_avatar` last asked.
+    avatar_new: bool,
     /// The add-account form: the pasted `.ROBLOSECURITY` value (cleared as
     /// soon as it is handed to the sign-in job).
     pub adding: bool,
@@ -103,6 +105,7 @@ impl Account {
             restored: false,
             avatar: None,
             avatar_requested: false,
+            avatar_new: false,
             adding: false,
             cookie_input: String::new(),
             add_error: None,
@@ -136,6 +139,18 @@ impl Account {
     /// The loaded avatar, if any.
     pub fn avatar(&self) -> Option<&rustudio_engine::avatar::AvatarLook> {
         self.avatar.as_ref()
+    }
+
+    /// Whether an avatar arrived since the last call (a fetch again replaces
+    /// the one Play already has).
+    pub fn take_new_avatar(&mut self) -> bool {
+        std::mem::take(&mut self.avatar_new)
+    }
+
+    /// AvatarEditorService:BustAvatarFetchCache: fetch the avatar again on
+    /// the next poll, keeping the current one until the new one arrives.
+    pub fn refetch_avatar(&mut self) {
+        self.avatar_requested = false;
     }
 
     /// The signed-in client, for asset downloads (None when signed out).
@@ -318,6 +333,7 @@ impl Account {
                     ));
                     if self.user == Some(look.user_id) {
                         self.avatar = Some(*look);
+                        self.avatar_new = true;
                     }
                 }
                 Msg::Done => {

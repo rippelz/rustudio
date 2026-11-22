@@ -682,7 +682,7 @@ impl Game {
         let Some(mut threaded) = self.play_thread.take() else { return };
         threaded.queue_edits(EditorEdits::take(self));
         // (a fixed-step replay joins every step: no frame reuses the last)
-        match threaded.receive(self, host, self.fixed_dt.is_some()) {
+        match threaded.receive(self, host, if self.fixed_dt.is_some() { Join::Block } else { Join::Poll }) {
             Receive::Available => {}
             Receive::Pending => {
                 threaded.deferred_dt = (threaded.deferred_dt + dt).min(rustudio_core::mech::MAX_FRAME_DT);
@@ -715,8 +715,11 @@ impl Game {
                 threaded.pending = Some(pending);
                 // InputBegan was delivered while the last viewport drew.
                 // Give the following RenderStepped's pose and camera the
-                // next presentation slot instead of queueing it one deeper.
-                if !wait_for_input_pose || matches!(threaded.receive(self, host, true), Receive::Available) {
+                // next presentation slot instead of queueing it one deeper,
+                // but never hold the display longer than a small budget: a
+                // slow step presents the last frame and lands next frame.
+                let budget = std::time::Duration::from_secs_f32(rustudio_core::mech::PLAY_INPUT_POSE_WAIT_MS / 1000.0);
+                if !wait_for_input_pose || !matches!(threaded.receive(self, host, Join::Upto(budget)), Receive::Stopped) {
                     self.play_thread = Some(threaded);
                 }
             }
@@ -767,6 +770,13 @@ enum Receive {
     Stopped,
 }
 
+/// How long `ThreadedPlay::receive` waits for the step in flight.
+enum Join {
+    Poll,
+    Upto(std::time::Duration),
+    Block,
+}
+
 impl ThreadedPlay {
     fn queue_edits(&mut self, edits: EditorEdits) {
         if let Some(queued) = &mut self.queued_edits {
@@ -777,17 +787,29 @@ impl ThreadedPlay {
         }
     }
 
-    fn receive(&mut self, main: &mut Game, host: &mut dyn GameHost, wait: bool) -> Receive {
+    fn receive(&mut self, main: &mut Game, host: &mut dyn GameHost, wait: Join) -> Receive {
         if let Some(pending) = self.pending.as_ref() {
-            let result = if wait {
-                let _join = rustudio_core::bench::scope("gameplay_publish_wait");
-                pending.recv().ok()
-            } else {
-                match pending.try_recv() {
+            let result = match wait {
+                Join::Block => {
+                    let _join = rustudio_core::bench::scope("gameplay_publish_wait");
+                    pending.recv().ok()
+                }
+                Join::Upto(budget) => {
+                    let _join = rustudio_core::bench::scope("gameplay_publish_wait");
+                    match pending.recv_timeout(budget) {
+                        Ok(frame) => Some(frame),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            rustudio_core::bench::add("gameplay_input_wait_timeouts", 0.0, 1);
+                            return Receive::Pending;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => None,
+                    }
+                }
+                Join::Poll => match pending.try_recv() {
                     Ok(frame) => Some(frame),
                     Err(mpsc::TryRecvError::Empty) => return Receive::Pending,
                     Err(mpsc::TryRecvError::Disconnected) => None,
-                }
+                },
             };
             self.pending = None;
             let Some((frame, source)) = result else {
@@ -807,7 +829,7 @@ impl Game {
     pub(super) fn show_worker_side(&mut self, side: Side, host: &mut dyn GameHost) {
         let Some(mut threaded) = self.play_thread.take() else { return };
         threaded.queue_edits(EditorEdits::take(self));
-        if !matches!(threaded.receive(self, host, true), Receive::Available) {
+        if !matches!(threaded.receive(self, host, Join::Block), Receive::Available) {
             return;
         }
         let edits = threaded.queued_edits.take().expect("edits scanned before side change");
@@ -823,7 +845,7 @@ impl Game {
             return;
         };
         threaded.pending = Some(reply);
-        if matches!(threaded.receive(self, host, true), Receive::Available) {
+        if matches!(threaded.receive(self, host, Join::Block), Receive::Available) {
             self.play_thread = Some(threaded);
         }
     }

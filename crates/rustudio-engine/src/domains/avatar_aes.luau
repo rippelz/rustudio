@@ -565,7 +565,7 @@ M.SearchCatalogAsync = function(self, params)
 	for _, a in params.AssetTypes do
 		table.insert(q, "&model.assetTypeIds=" .. a.Value)
 	end
-	table.insert(q, "&model.includeNotForSale=" .. tostring(params.IncludeOffSaleItems))
+	table.insert(q, "&model.includeNotForSale=" .. tostring(params.IncludeOffSale))
 	if params.CreatorId ~= 0 then
 		table.insert(q, "&model.creatorTargetId=" .. params.CreatorId)
 		table.insert(q, "&model.creatorType=" .. (params.CreatorType == Enum.CreatorTypeFilter.Group and 2 or 1))

@@ -27,6 +27,8 @@ use rbx_dom_weak::types::{Ref, Variant};
 
 use crate::runtime::*;
 
+#[path = "services_core.rs"]
+mod core_members;
 #[path = "services_encoding.rs"]
 pub(crate) mod encoding;
 #[path = "services_http.rs"]
@@ -45,6 +47,220 @@ pub const METHODS: &[(&str, &str)] = &[
     ("GetMessage", "DataModel"),
     ("GetRemoteBuildMode", "DataModel"),
     ("IsGearTypeAllowed", "DataModel"),
+    ("DefineFastFlag", "DataModel"),
+    ("DefineFastInt", "DataModel"),
+    ("DefineFastString", "DataModel"),
+    ("GetFastFlag", "DataModel"),
+    ("GetFastInt", "DataModel"),
+    ("GetFastString", "DataModel"),
+    ("GetEngineFeature", "DataModel"),
+    ("SetFlagVersion", "DataModel"),
+    ("GetPlaySessionId", "DataModel"),
+    ("AddCoreScriptLocal", "ScriptContext"),
+    ("GetPlatform", "UserInputService"),
+    ("GetNotificationTypeList", "GuiService"),
+    ("GetMessageId", "MessageBusService"),
+    ("GetProtocolMethodRequestMessageId", "MessageBusService"),
+    ("GetProtocolMethodResponseMessageId", "MessageBusService"),
+    ("Subscribe", "MessageBusService"),
+    ("SubscribeToProtocolMethodRequest", "MessageBusService"),
+    ("SubscribeToProtocolMethodResponse", "MessageBusService"),
+    ("Publish", "MessageBusService"),
+    ("GetLast", "MessageBusService"),
+    ("Call", "MessageBusService"),
+    ("PublishProtocolMethodRequest", "MessageBusService"),
+    ("PublishProtocolMethodResponse", "MessageBusService"),
+    ("SetRequestHandler", "MessageBusService"),
+    ("MakeRequest", "MessageBusService"),
+    ("Disconnect", "MessageBusConnection"),
+    ("GetItem", "LocalStorageService"),
+    ("SetItem", "LocalStorageService"),
+    ("Flush", "LocalStorageService"),
+    ("WhenLoaded", "LocalStorageService"),
+    ("GetRobloxVersion", "RunService"),
+    ("GetCoreScriptVersion", "RunService"),
+    ("GetRobloxClientChannel", "RunService"),
+    ("IsTeamCreateViewer", "RunService"),
+    ("IsTeamTest", "RunService"),
+    ("GetRobloxGuiFocused", "RunService"),
+    ("SetRobloxGuiFocused", "RunService"),
+    ("GetDeviceType", "UserInputService"),
+    ("GetDeviceLevel", "UserInputService"),
+    ("GetBlockListInitialized", "Player"),
+    ("SetBlockListInitialized", "Player"),
+    ("AddToBlockList", "Player"),
+    ("UpdatePlayerBlocked", "Player"),
+    ("HasBlockedPlayer", "Player"),
+    ("GetFriendStatus", "Player"),
+    ("GetUnder13", "Player"),
+    ("AddGlobalPointsField", "RbxAnalyticsService"),
+    ("AddGlobalPointsTag", "RbxAnalyticsService"),
+    ("RemoveGlobalPointsField", "RbxAnalyticsService"),
+    ("RemoveGlobalPointsTag", "RbxAnalyticsService"),
+    ("ReleaseRBXEventStream", "RbxAnalyticsService"),
+    ("ReportCounter", "RbxAnalyticsService"),
+    ("ReportInfluxSeries", "RbxAnalyticsService"),
+    ("ReportStats", "RbxAnalyticsService"),
+    ("ReportToDiagByCountryCode", "RbxAnalyticsService"),
+    ("SendEventDeferred", "RbxAnalyticsService"),
+    ("SendEventImmediately", "RbxAnalyticsService"),
+    ("SetRBXEvent", "RbxAnalyticsService"),
+    ("SetRBXEventStream", "RbxAnalyticsService"),
+    ("TrackEvent", "RbxAnalyticsService"),
+    ("TrackEventWithArgs", "RbxAnalyticsService"),
+    ("UpdateHeartbeatObject", "RbxAnalyticsService"),
+    ("GetClientId", "RbxAnalyticsService"),
+    ("GetSessionId", "RbxAnalyticsService"),
+    ("GetPlaySessionId", "RbxAnalyticsService"),
+    ("GetUserLayerLoadingStatus", "IXPService"),
+    ("GetUserLayerVariables", "IXPService"),
+    ("GetUserStatusForLayer", "IXPService"),
+    ("LogUserLayerExposure", "IXPService"),
+    ("RegisterUserLayers", "IXPService"),
+    ("GetRegisteredUserLayersToStatus", "IXPService"),
+    ("InitializeUserLayers", "IXPService"),
+    ("ClearUserLayers", "IXPService"),
+    ("GetCreatorLayerLoadingStatus", "IXPService"),
+    ("GetCreatorLayerVariables", "IXPService"),
+    ("GetCreatorStatusForLayer", "IXPService"),
+    ("LogCreatorLayerExposure", "IXPService"),
+    ("RegisterCreatorLayers", "IXPService"),
+    ("GetRegisteredCreatorLayersToStatus", "IXPService"),
+    ("InitializeCreatorLayers", "IXPService"),
+    ("ClearCreatorLayers", "IXPService"),
+    ("GetBrowserTrackerLayerLoadingStatus", "IXPService"),
+    ("GetBrowserTrackerLayerVariables", "IXPService"),
+    ("GetBrowserTrackerStatusForLayer", "IXPService"),
+    ("LogBrowserTrackerLayerExposure", "IXPService"),
+    ("LogFlagLinkedUserLayerExposure", "IXPService"),
+    ("GetItem", "MemStorageService"),
+    ("SetItem", "MemStorageService"),
+    ("HasItem", "MemStorageService"),
+    ("RemoveItem", "MemStorageService"),
+    ("Fire", "MemStorageService"),
+    ("Bind", "MemStorageService"),
+    ("BindAndFire", "MemStorageService"),
+    ("Call", "MemStorageService"),
+    ("Disconnect", "MemStorageConnection"),
+    ("ActionEnabled", "NotificationService"),
+    ("ActionTaken", "NotificationService"),
+    ("SubscribeToRccEventNamespace", "NotificationService"),
+    ("SubscribeToTopic", "NotificationService"),
+    ("UnsubscribeFromTopic", "NotificationService"),
+    ("SwitchedToAppShellFeature", "NotificationService"),
+    ("IsSingleSignOnSupported", "ThirdPartyUserService"),
+    ("IsAccountSwitchingSupported", "ThirdPartyUserService"),
+    ("IsChatRestrictionSupported", "ThirdPartyUserService"),
+    ("HaveActiveUser", "ThirdPartyUserService"),
+    ("GetUserPlatformName", "ThirdPartyUserService"),
+    ("ShowAccountPicker", "ThirdPartyUserService"),
+    ("GetAdTeleportInfo", "AdService"),
+    ("GetReportAdInfo", "AdService"),
+    ("GetUniversalAppAdsEligibility", "AdService"),
+    ("IsAdLoaded", "AdService"),
+    ("SetAdGuiInteractivityHandlerInitialized", "AdService"),
+    ("HideEudsaDisclosure", "AdService"),
+    ("IsVRAppBuild", "VRService"),
+    ("LoadLocalAsset", "InsertService"),
+    ("deviceMeetsRequirementsForFeature", "AvatarChatService"),
+    ("IsEnabled", "AvatarChatService"),
+    ("IsPlaceEnabled", "AvatarChatService"),
+    ("IsUniverseEnabled", "AvatarChatService"),
+    ("EnableVoice", "AvatarChatService"),
+    ("PollClientFeatures", "AvatarChatService"),
+    ("PollServerFeatures", "AvatarChatService"),
+    ("GetClientFeaturesAsync", "AvatarChatService"),
+    ("GetServerFeaturesAsync", "AvatarChatService"),
+    ("IsAvailable", "AchievementService"),
+    ("HasAchieved", "AchievementService"),
+    ("GrantAchievement", "AchievementService"),
+    ("GetPlayingAnimationTracksCoreScript", "Animator"),
+    ("SendEventDeferred", "EventIngestService"),
+    ("SendEventImmediately", "EventIngestService"),
+    ("SetRBXEvent", "EventIngestService"),
+    ("SetRBXEventStream", "EventIngestService"),
+    ("RequestInternal", "HttpService"),
+    ("Start", "HttpRequest"),
+    ("Cancel", "HttpRequest"),
+    ("RetrieveCaptures", "CaptureService"),
+    ("CanCaptureVideo", "CaptureService"),
+    ("IsCapturingVideo", "CaptureService"),
+    ("OnCaptureBegan", "CaptureService"),
+    ("OnCaptureEnded", "CaptureService"),
+    ("OnCaptureShared", "CaptureService"),
+    ("OnCaptureObjectShared", "CaptureService"),
+    ("OnVideoCaptureShared", "CaptureService"),
+    ("OnSavePromptFinished", "CaptureService"),
+    ("OnSharePromptFinished", "CaptureService"),
+    ("OnCapturePermissionsPromptFinished", "CaptureService"),
+    ("DeleteCapture", "CaptureService"),
+    ("SaveCaptureToExternalStorage", "CaptureService"),
+    ("SaveScreenshotCapture", "CaptureService"),
+    ("StopVideoCaptureInternal", "CaptureService"),
+    ("GetMaxQualityLevel", "RenderSettings"),
+    ("RegisterLuaUrl", "LinkingService"),
+    ("IsUrlRegistered", "LinkingService"),
+    ("GetLastLuaUrl", "LinkingService"),
+    ("GetAndClearLastPendingUrl", "LinkingService"),
+    ("StartLuaUrlDelivery", "LinkingService"),
+    ("StopLuaUrlDelivery", "LinkingService"),
+    ("DetectUrl", "LinkingService"),
+    ("DetectDlic", "LinkingService"),
+    ("CreateInternalDlic", "LinkingService"),
+    ("OpenUrl", "LinkingService"),
+    ("SupportsSwitchToSettingsApp", "LinkingService"),
+    ("SwitchToSettingsApp", "LinkingService"),
+    ("GetUserAgent", "HttpService"),
+    ("RegisterContextIdFromLua", "AudioFocusService"),
+    ("GetRegisteredContexts", "AudioFocusService"),
+    ("GetFocusedContextId", "AudioFocusService"),
+    ("RequestFocus", "AudioFocusService"),
+    ("AcquireFocus", "AudioFocusService"),
+    ("GetRootSID", "SessionService"),
+    ("SessionExists", "SessionService"),
+    ("SetSession", "SessionService"),
+    ("ReplaceSession", "SessionService"),
+    ("RemoveSession", "SessionService"),
+    ("GetSessionTag", "SessionService"),
+    ("GetCreatedTimestampUtcMs", "SessionService"),
+    ("SetMetadata", "SessionService"),
+    ("GetMetadata", "SessionService"),
+    ("RemoveMetadata", "SessionService"),
+    ("RemoveSessionsWithMetadataKey", "SessionService"),
+    ("GetSessionID", "SessionService"),
+    ("GenerateSessionInfoString", "SessionService"),
+    ("GetBreadcrumbs", "SessionService"),
+    ("GetHistory", "SessionService"),
+    ("AcquireContextFocus", "SessionService"),
+    ("ReleaseContextFocus", "SessionService"),
+    ("IsContextFocused", "SessionService"),
+    ("RegisterForExperienceJoin", "ExperienceService"),
+    ("RegisterForExperienceLeave", "ExperienceService"),
+    ("IsInExperience", "ExperienceService"),
+    ("GetPlaceJoinState", "ExperienceService"),
+    ("GetQueuePosition", "ExperienceService"),
+    ("GetFollowUserId", "ExperienceService"),
+    ("GetPendingJoinAttempt", "ExperienceService"),
+    ("ConsumePendingExperienceLeaveWithReason", "ExperienceService"),
+    ("LaunchExperience", "ExperienceService"),
+    ("LaunchExperienceFromSource", "ExperienceService"),
+    ("LaunchExperienceFromSourceWithCallback", "ExperienceService"),
+    ("LeaveExperienceWithReason", "ExperienceService"),
+    ("StartCrossExperience", "ExperienceService"),
+    ("StopCrossExperience", "ExperienceService"),
+    ("ExecuteCrossExperienceCall", "ExperienceService"),
+    ("LogEvent", "TelemetryService"),
+    ("LogCounter", "TelemetryService"),
+    ("LogStat", "TelemetryService"),
+    ("LogDurationEvent", "TelemetryService"),
+    ("LogDurationEventWithTimestamp", "TelemetryService"),
+    ("GetTextSizeOffsetAsync", "TextService"),
+    ("GetTextSize", "TextService"),
+    ("GetTextBoundsAsync", "TextService"),
+    ("RegisterSetCore", "StarterGui"),
+    ("RegisterGetCore", "StarterGui"),
+    ("SetCore", "StarterGui"),
+    ("GetCore", "StarterGui"),
     ("BindToSimulation", "RunService"),
     ("BindToAnimation", "RunService"),
     ("GetPredictionStatus", "RunService"),
@@ -161,6 +377,14 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("MessageOut", "LogService"),
     // Fired at once by the logger's own calls, on it and the loggers above it.
     ("MessageOut", "Logger"),
+    // LocalStorageService:SetItem (services_core.luau).
+    ("ItemWasSet", "LocalStorageService"),
+    ("RobloxGuiFocusedChanged", "RunService"),
+    ("BlockListChanged", "Player"),
+    ("FriendStatusChanged", "Player"),
+    ("OnContextRegistered", "AudioFocusService"),
+    ("OnUserLayerLoadingStatusChanged", "IXPService"),
+    ("OnCreatorLayerLoadingStatusChanged", "IXPService"),
     // Source links and SetValue (services `newindex`, services.luau).
     ("ReceiverConnected", "CustomEvent"),
     ("ReceiverDisconnected", "CustomEvent"),
@@ -189,6 +413,8 @@ pub const EVENTS: &[(&str, &str)] = &[
     // legacy gear-type settings never change, no MicroProfiler capture).
     ("FullscreenChanged", "UserGameSettings"),
     ("StudioModeChanged", "UserGameSettings"),
+    // (Nothing in a Play session toggles the performance stats overlay yet.)
+    ("PerformanceStatsVisibleChanged", "UserGameSettings"),
     ("ServerLifecycleChanged", "DataModel"),
     ("ServerRestartScheduled", "DataModel"),
     ("ServerLowMemoryWarning", "DataModel"),
@@ -224,6 +450,8 @@ struct State {
     physics_step: f64,
     /// HttpService:CreateWebStreamClient's clients (their objects' Refs).
     streams: Streams,
+    /// DataModel:DefineFastFlag and friends (services_core.rs).
+    fast_flags: core_members::FastFlags,
 }
 
 /// A WebStreamClient: its connection (`stream` module) and state.
@@ -359,6 +587,24 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
         ("DataModel", "IsGearTypeAllowed") => {
             enum_arg(args, 1, "GearType")?;
             ok(Value::Boolean(false))
+        }
+        ("DataModel", "DefineFastFlag" | "DefineFastInt" | "DefineFastString" | "GetFastFlag" | "GetFastInt" | "GetFastString" | "GetEngineFeature" | "SetFlagVersion" | "GetPlaySessionId")
+        | ("ScriptContext", "AddCoreScriptLocal")
+        | ("UserInputService", "GetPlatform")
+        | ("GuiService", "GetNotificationTypeList")
+        | ("MessageBusService" | "MessageBusConnection" | "LocalStorageService", _)
+        | ("StarterGui", "RegisterSetCore" | "RegisterGetCore" | "SetCore" | "GetCore")
+        | ("RbxAnalyticsService" | "IXPService" | "MemStorageService" | "MemStorageConnection" | "NotificationService" | "ThirdPartyUserService" | "AdService" | "AvatarChatService" | "AchievementService" | "EventIngestService", _)
+        | ("Animator", "GetPlayingAnimationTracksCoreScript")
+        | ("HttpService", "RequestInternal" | "GetUserAgent")
+        | ("TextService", "GetTextSizeOffsetAsync" | "GetTextSize" | "GetTextBoundsAsync")
+        | ("LinkingService" | "AudioFocusService" | "SessionService" | "ExperienceService" | "TelemetryService", _)
+        | ("HttpRequest", _)
+        | ("CaptureService", _)
+        | ("VRService", "IsVRAppBuild")
+        | ("InsertService", "LoadLocalAsset") => core_members::call(lua, owner, name, args),
+        ("RunService" | "UserInputService" | "Player", _) if core_members::luau_member(lua, owner, name)? => {
+            core_members::call(lua, owner, name, args)
         }
 
         // ---------------------------------------------------- RunService
@@ -539,6 +785,8 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
         }
 
         // ---------------------------------------------------- settings
+        // The highest Enum.QualityLevel (Level21 in the API dump).
+        ("RenderSettings", "GetMaxQualityLevel") => ok(Value::Integer(21)),
         ("UserSettings", "IsUserFeatureEnabled") => {
             let f = arg_str(args, 1, "string")?;
             Err(rt_err(format!("Flag {f} does not exist")))
@@ -564,6 +812,12 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
         ("UserGameSettings", _) => nothing(),
         ("GlobalSettings", _) => {
             let f = arg_str(args, 1, "string")?;
+            // The CoreScripts read Roblox's served flags here; rustudio
+            // serves none, so they get what they defined (DefineFast*), else
+            // false / "" (services_core.rs). Game scripts keep Studio's error.
+            if crate::runtime::security::current(lua) == crate::runtime::security::CORE {
+                return core_members::settings_flag(lua, name, &f);
+            }
             Err(rt_err(format!("Flag {f} does not exist")))
         }
 
@@ -1171,6 +1425,18 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
                 None => Value::Nil,
             }
         }
+        // Whether the player may chat: ExpChat's isUserChatEnabled takes
+        // "Enabled…" or "AllUsers". A signed-in Studio user chats with all
+        // users (estimate: the account's real setting isn't read).
+        "ChatAvailabilityStatus" if class == "Player" => s(lua, "AllUsers")?,
+        // The client's OS and platform names (RobloxScriptSecurity), and no
+        // VR headset: Windows off macOS, as GetPlatform (estimate).
+        "OsPlatform" | "PlatformName" if class == "Player" => s(lua, if cfg!(target_os = "macos") { "OSX" } else { "Windows" })?,
+        "VRDevice" if class == "Player" => s(lua, "")?,
+        "UnfilteredChat" if class == "Player" => Value::Boolean(false),
+        // The client build's git hash (RobloxScriptSecurity): rustudio is no
+        // Roblox build (estimate: empty, as GetRobloxVersion).
+        "ClientGitHash" if class == "RunService" => s(lua, "")?,
         "SelectionThickness" if class == "Selection" => Value::Number(0.02f32 as f64),
         "FullPath" if class == "Logger" => {
             let p = state(lua)?.logger_paths.get(&r).cloned();
@@ -1632,8 +1898,9 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     let m: Table = lua
         .load(include_str!("services.luau"))
         .set_name("=rustudio.services")
-        .call(rs)?;
+        .call(rs.clone())?;
     lua.set_named_registry_value("svc_impl", m)?;
+    core_members::install(lua, &rs)?;
     let start = lua.create_function(http_start)?;
     let poll = lua.create_function(http_poll)?;
     lua.load(HTTP_LUA).set_name("=rustudio.services.http").call::<()>((start, poll))?;

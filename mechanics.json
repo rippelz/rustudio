@@ -997,8 +997,23 @@
   {
    "name": "max physics steps per frame",
    "group": "physics",
-   "value": 3,
-   "estimated": true
+   "value": 12,
+   "unit": "steps",
+   "source": "Studio 0.746 World::updateStepsRequiredForCyclicExecutive (0x100309f1e): max(DFInt::MaxMissedWorldStepsRemembered = 12, 12)"
+  },
+  {
+   "name": "max physics steps per throttled frame",
+   "group": "physics",
+   "value": 4,
+   "unit": "steps",
+   "source": "Studio 0.746 World::updateStepsRequiredForCyclicExecutive: 4.0 when the environmental throttle's stepped fraction is 0.4 or less"
+  },
+  {
+   "name": "physics step carry",
+   "group": "physics",
+   "value": 3.99999,
+   "unit": "steps",
+   "source": "Studio 0.746 World::updateStepsRequiredForCyclicExecutive: the elapsed time kept for the next frame, min(rest, 3.99999)"
   },
   {
    "name": "physics length unit",

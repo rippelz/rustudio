@@ -513,7 +513,7 @@ async fn receive_lane(
         }
         if frame[0] == packet_id::SET_GLOBALS {
             initial.lock().unwrap().streaming = frame.get(1) == Some(&1);
-            match crate::replicator::assigned_peer_scope(&frame[1..]) {
+            match crate::replicator::assigned_peer_scope(crate::replicator::SessionKind::CloudEdit, &frame[1..]) {
                 Ok(scope) => {
                     next_id.store((u64::from(scope) << 32) | 1, Ordering::Release);
                 }

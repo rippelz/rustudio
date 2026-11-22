@@ -517,6 +517,7 @@ impl Physics {
             None => true,
         };
         if new {
+            let _w = rustudio_core::bench::scope("sj_walk");
             refs = doc.dom.descendants_of(ws).map(|i| i.referent()).filter(|r| seen.contains(r)).collect();
             // Constraints outside Workspace (a character's ragdoll sockets kept in a
             // Model, a destroyed original) are no connectors: forgotten here, or every
@@ -541,6 +542,11 @@ impl Physics {
             (Some(c), doc::Marks::Some(_)) => c.sig != sig || new || c.refs != refs,
             _ => true,
         };
+        rustudio_core::bench::add("count: sj_refs", refs.len() as f64, 1);
+        if full {
+            rustudio_core::bench::add("count: sj_full", 1.0, 1);
+        }
+        let _descs = rustudio_core::bench::scope("sj_descs");
         let mut cache = if full { None } else { self.sj_cache.take() };
         let dirty: Vec<usize> = match (&cache, &marks) {
             (Some(c), doc::Marks::Some(ms)) => {
@@ -595,6 +601,7 @@ impl Physics {
                 c
             }
         };
+        drop(_descs);
         let Some(sv) = self.studio.as_mut() else { return };
         sv.joints.begin_sync();
         let changed: HashSet<usize> = if full { (0..c.refs.len()).collect() } else { dirty.iter().copied().collect() };

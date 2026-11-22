@@ -494,6 +494,7 @@ pub mod gpu_check {
                 probe: None,
             };
             r.render(&rs, [320, 180], &frame);
+            r.finish_frame(&rs);
         }
         // The env probe's faces and a ViewportFrame: drawn with the startup
         // pipelines into their own targets, so their sample counts must
@@ -517,6 +518,7 @@ pub mod gpu_check {
             probe: Some(probe),
         };
         r.render(&rs, [320, 180], &frame);
+        r.finish_frame(&rs);
         let (layer, part) = (Ref::new(), Ref::new());
         r.set_layer(part, Some(layer));
         r.set_item(part, vec![PartDraw { custom_mesh: None, ..scene.parts[0].draw }]);
@@ -538,6 +540,9 @@ pub mod gpu_check {
             drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, samples));
             drop(crate::highlight::HighlightPass::new(&device, DISPLAY_FORMAT, DEPTH_FORMAT, samples, std::mem::size_of::<Vertex>() as u64));
         }
+        // (the render thread's commands, then the GPU; a validation error
+        // there is raised again here)
+        crate::render_thread::wait();
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         drop(r);
         let err = crate::gpu_caps::block_on(scope.pop());
@@ -2820,6 +2825,10 @@ pub struct Renderer {
     /// Local lights in lights_buf this frame (the effects read them).
     gui_n_lights: u32,
     post_dof: bool,
+    /// `render` recorded a frame whose post chain `finish_frame` hasn't yet,
+    /// and the encoder the world GUIs and effects recorded into for it.
+    post_due: bool,
+    post_encoder: Option<wgpu::CommandEncoder>,
     post_dof_near: bool,
     dof_v: wgpu::RenderPipeline,
     /// Studio's SSAO passes (shader.wgsl "SSAO"): depth down, occlusion,
@@ -2894,6 +2903,9 @@ pub struct Renderer {
     lightgrid_view: wgpu::TextureView,
     localgrid_tex: wgpu::Texture,
     localgrid_view: wgpu::TextureView,
+    /// Light grid copies taken since the last frame (lightgrid_gpu.rs),
+    /// recorded at the start of the next frame's encoder in arrival order.
+    grid_uploads: Vec<crate::lightgrid_gpu::GridUpload>,
     /// How much of each voxel parts fill, for local lights (lightocc.rs).
     lightocc_tex: wgpu::Texture,
     lightocc_view: wgpu::TextureView,
@@ -3644,6 +3656,8 @@ impl Renderer {
             glass_layout,
             material_epoch: Instant::now(),
             post_dof: false,
+            post_due: false,
+            post_encoder: None,
             post_dof_near: false,
             dof_v,
             bloom_bright,
@@ -3689,6 +3703,7 @@ impl Renderer {
             lightgrid_view,
             localgrid_tex,
             localgrid_view,
+            grid_uploads: Vec::new(),
             lightocc_tex,
             lightocc_view,
             studs_view,
@@ -3757,6 +3772,8 @@ impl Renderer {
     /// The last frame as shown (RGBA8, top row first): width, height,
     /// pixels. Waits for the GPU; for tests.
     pub fn read_frame(&self, rs: &egui_wgpu::RenderState) -> Option<(u32, u32, Vec<u8>)> {
+        // (the frame's commands are submitted before the copy)
+        crate::render_thread::wait();
         let target = self.target.as_ref()?;
         let [w, h] = target.size;
         let row = (w * 4).div_ceil(256) * 256;
@@ -3848,6 +3865,7 @@ impl Renderer {
     }
 
     fn read_hdr_layer(&self, rs: &egui_wgpu::RenderState, texture: &wgpu::Texture, size: [u32; 2], layer: u32) -> Option<(u32,u32,Vec<u8>)> {
+        crate::render_thread::wait();
         let [w, h] = size;
         let row = (w * 8).div_ceil(256) * 256;
         let buf = rs.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3933,13 +3951,19 @@ impl Renderer {
         mask: Option<(u32, u32, &[u8])>, surface: Option<(u32, u32, &[u8])>,
     ) -> u32 {
         let (sw, sh, sp) = surface.unwrap_or((1, 1, &[128, 128, 255, 0]));
+        // (a packed map made on an asset worker comes with its mip chain)
+        let chain: std::borrow::Cow<[u8]> = if sp.len() > (sw * sh * 4) as usize {
+            std::borrow::Cow::Borrowed(sp)
+        } else {
+            std::borrow::Cow::Owned(rustudio_core::texture::data_mip_chain(sw, sh, sp))
+        };
         let surface_view = device.create_texture_with_data(queue, &wgpu::TextureDescriptor {
             label: Some("SurfaceAppearance normal roughness metalness"),
             size: wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
             mip_level_count: mip_levels(sw, sh), sample_count: 1,
             dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
-        }, wgpu::util::TextureDataOrder::LayerMajor, &data_mip_chain(sw, sh, sp))
+        }, wgpu::util::TextureDataOrder::LayerMajor, &chain)
             .create_view(&Default::default());
         let mask_view = mask.map(|(w, h, px)| {
             device
@@ -4555,76 +4579,12 @@ impl Renderer {
         self.rebind_globals(device);
     }
 
-    /// Uploads the light grid (lightgrid.rs: skylight and sun bytes, X, then Z, then Y).
-    pub fn set_lightgrid(&mut self, queue: &wgpu::Queue, data: &[u8]) {
-        let [nx, ny, nz] = crate::lightgrid::dims().map(|n| n as u32);
-        if data.len() != (2 * nx * ny * nz) as usize {
-            return;
+    /// Takes a light grid upload (lightgrid_gpu.rs): its copies are recorded
+    /// first thing in the next frame's encoder.
+    pub fn upload_lightgrid(&mut self, up: crate::lightgrid_gpu::GridUpload) {
+        if !up.is_empty() {
+            self.grid_uploads.push(up);
         }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.lightgrid_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(2 * nx),
-                rows_per_image: Some(nz),
-            },
-            wgpu::Extent3d {
-                width: nx,
-                height: nz,
-                depth_or_array_layers: ny,
-            },
-        );
-    }
-
-    /// Uploads the voxels `lo..=hi` of the light grid from the whole grid's
-    /// bytes `data` (as `set_lightgrid` takes them).
-    pub fn set_lightgrid_region(&mut self, queue: &wgpu::Queue, data: &[u8], lo: [usize; 3], hi: [usize; 3]) {
-        let [nx, ny, nz] = crate::lightgrid::dims().map(|n| n as u32);
-        if data.len() != (2 * nx * ny * nz) as usize || (0..3).any(|k| lo[k] > hi[k]) {
-            return;
-        }
-        let size = [0, 1, 2].map(|k| (hi[k] - lo[k] + 1) as u32);
-        // (the texture is X, Z, Y: rows of X along Z, layers along Y)
-        let offset = 2 * ((lo[1] as u64 * nz as u64 + lo[2] as u64) * nx as u64 + lo[0] as u64);
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.lightgrid_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: lo[0] as u32, y: lo[2] as u32, z: lo[1] as u32 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            data,
-            wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(2 * nx), rows_per_image: Some(nz) },
-            wgpu::Extent3d { width: size[0], height: size[2], depth_or_array_layers: size[1] },
-        );
-    }
-
-    pub fn set_localgrid(&mut self, queue: &wgpu::Queue, data: &[u8]) {
-        let [nx, ny, nz] = crate::lightgrid::dims().map(|n| n as u32);
-        if data.len() != (nx * ny * nz * 4) as usize { return; }
-        queue.write_texture(wgpu::TexelCopyTextureInfo {
-            texture: &self.localgrid_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        }, data, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(nx * 4), rows_per_image: Some(nz) },
-        wgpu::Extent3d { width: nx, height: nz, depth_or_array_layers: ny });
-    }
-
-    /// Uploads part of the local light channel (lightgrid::LocalPatch).
-    pub fn set_localgrid_region(&mut self, queue: &wgpu::Queue, p: &crate::lightgrid::LocalPatch) {
-        let size = [0, 1, 2].map(|k| (p.hi[k] - p.lo[k] + 1) as u32);
-        if p.data.len() != (size[0] * size[1] * size[2] * 4) as usize { return; }
-        queue.write_texture(wgpu::TexelCopyTextureInfo {
-            texture: &self.localgrid_tex, mip_level: 0,
-            origin: wgpu::Origin3d { x: p.lo[0] as u32, y: p.lo[2] as u32, z: p.lo[1] as u32 },
-            aspect: wgpu::TextureAspect::All,
-        }, &p.data, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size[0] * 4), rows_per_image: Some(size[2]) },
-        wgpu::Extent3d { width: size[0], height: size[2], depth_or_array_layers: size[1] });
     }
 
     /// Uploads the parts' light occupancy (lightocc.rs: X, then Y, then Z).
@@ -4963,8 +4923,9 @@ impl Renderer {
     }
 
     /// World GUIs and effects enter the HDR scene before bloom, DoF and
-    /// colour correction (UILitFogFS / ParticleCustomFS). AlwaysOnTop and
-    /// screen GUIs are composed separately by egui.
+    /// colour correction (UILitFogFS / ParticleCustomFS), recorded for
+    /// `finish_frame`, which then draws the post chain once over them.
+    /// AlwaysOnTop and screen GUIs are composed separately by egui.
     pub fn draw_world_gui(
         &mut self,
         rs: &egui_wgpu::RenderState,
@@ -4973,7 +4934,7 @@ impl Renderer {
         fx: Option<&crate::world_gui::FxFrame>,
         tone_curve: Option<[f32; 5]>,
     ) {
-        let Some(t) = self.target.as_ref() else { return };
+        let Some(t) = self.target.as_ref().filter(|_| self.post_due) else { return };
         let pass = self.world_gui[sample_slot(t.samples)]
             .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, t.samples));
         pass.font_texture_update = Some(font_texture_update);
@@ -4985,9 +4946,29 @@ impl Renderer {
         // (effects light themselves from the frame's local lights)
         pass.lights = self.lights_buf.clone();
         pass.n_lights = self.gui_n_lights;
-        if pass.effects(rs, &t.hdr_view, t.size, &t.depth, batches, fx, tone_curve, self.gui_fog.0, self.gui_fog.1) {
-            self.finish_again(rs);
+        let encoder = self
+            .post_encoder
+            .get_or_insert_with(|| rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport post") }));
+        pass.effects(rs, encoder, &t.hdr_view, t.size, &t.depth, batches, fx, tone_curve, self.gui_fog.0, self.gui_fog.1);
+    }
+
+    /// Records the post chain of the frame `render` recorded (bloom, blur,
+    /// DoF, the display image), over the HDR image as the world GUIs and
+    /// effects left it, and hands it to the render thread. Every `render`
+    /// is followed by one, before anything draws on the display image
+    /// (highlights, adornments).
+    pub fn finish_frame(&mut self, rs: &egui_wgpu::RenderState) {
+        if !std::mem::take(&mut self.post_due) {
+            return;
         }
+        let mut encoder = self
+            .post_encoder
+            .take()
+            .unwrap_or_else(|| rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport post") }));
+        if let Some(target) = self.target.as_ref() {
+            self.encode_post(&mut encoder, target);
+        }
+        crate::render_thread::perform(&rs.queue, vec![encoder], None);
     }
 
     /// Highlights over the finished image (highlight.rs): each one's parts
@@ -5092,46 +5073,22 @@ impl Renderer {
         }
     }
 
-    fn finish_again(&self, rs: &egui_wgpu::RenderState) {
-        let _b = rustudio_core::bench::scope("fx_post_again");
-        let Some(target) = self.target.as_ref() else { return };
+    /// Bloom, blur, DoF and the display image from the HDR image (the
+    /// frame's globals bound).
+    fn encode_post(&self, encoder: &mut wgpu::CommandEncoder, target: &Target) {
         let viewport = self.pipelines(target.samples);
-        let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effects post") });
-        self.encode_bloom(&mut encoder, target, self.post_bloom_size);
-        self.encode_blur(&mut encoder, target, self.post_blur_size);
-        let steps: [(&str, &wgpu::RenderPipeline, &wgpu::BindGroup, Vec<&wgpu::TextureView>); 14] = [
-            ("dof across", &viewport.dof_h, &target.dof_bgs[0], vec![&target.dof_views[0]]),
-            ("dof down", &self.dof_v, &target.dof_bgs[1], vec![&target.dof_views[1]]),
-            ("dof near", &viewport.near_pipelines[0], &target.near_bgs[0], vec![&target.near_views[0]]),
-            ("dof near", &viewport.near_pipelines[1], &target.near_bgs[1], vec![&target.near_views[1]]),
-            ("dof near", &viewport.near_pipelines[2], &target.near_bgs[2], vec![&target.near_views[2]]),
-            ("dof near", &viewport.near_pipelines[3], &target.near_bgs[3], vec![&target.near_views[3]]),
-            ("dof near", &viewport.near_pipelines[4], &target.near_bgs[4], vec![&target.near_views[4]]),
-            ("dof near", &viewport.near_pipelines[5], &target.near_bgs[5], vec![&target.near_views[5]]),
-            ("dof near", &viewport.near_pipelines[6], &target.near_bgs[6], vec![&target.near_views[6]]),
-            ("dof near", &viewport.near_pipelines[7], &target.near_bgs[7], vec![&target.near_views[7]]),
-            ("dof near", &viewport.near_pipelines[8], &target.near_bgs[8], vec![&target.near_views[8]]),
-            ("dof near", &viewport.near_pipelines[9], &target.near_bgs[9], vec![&target.near_views[9]]),
-            ("dof near", &viewport.near_pipelines[10], &target.near_bgs[10], vec![&target.near_views[10]]),
-            ("post", &viewport.post, &target.hdr_bg, vec![&target.display_view]),
-        ];
-        for (label, pipeline, bg, views) in steps {
-            if label.starts_with("dof ") && !self.post_dof { continue; }
-            if label == "dof near" && !self.post_dof_near { continue; }
-            let attachments: Vec<_> = views
-                .iter()
-                .map(|v| {
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: v,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                    })
-                })
-                .collect();
+        self.encode_bloom(encoder, target, self.post_bloom_size);
+        self.encode_blur(encoder, target, self.post_blur_size);
+        crate::gpu_timing::mark(encoder, "gpu: bloom");
+        let fullscreen = |encoder: &mut wgpu::CommandEncoder, label: &str, pipeline: &wgpu::RenderPipeline, bg: &wgpu::BindGroup, view: &wgpu::TextureView| {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
-                color_attachments: &attachments,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
@@ -5140,11 +5097,25 @@ impl Renderer {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, bg, &[]);
-            if label == "post" { pass.set_bind_group(2, &target.post_depth_bg, &[]); }
-            else if label == "dof across" || label == "dof near" { pass.set_bind_group(2, &target.ssao_bgs[0], &[]); }
+            if label == "post" {
+                pass.set_bind_group(2, &target.post_depth_bg, &[]);
+            } else if label == "dof across" || label == "dof near" {
+                pass.set_bind_group(2, &target.ssao_bgs[0], &[]);
+            }
             pass.draw(0..3, 0..1);
+        };
+        if self.post_dof {
+            fullscreen(encoder, "dof across", &viewport.dof_h, &target.dof_bgs[0], &target.dof_views[0]);
+            fullscreen(encoder, "dof down", &self.dof_v, &target.dof_bgs[1], &target.dof_views[1]);
+            if self.post_dof_near {
+                for i in 0..11 {
+                    fullscreen(encoder, "dof near", &viewport.near_pipelines[i], &target.near_bgs[i], &target.near_views[i]);
+                }
+            }
         }
-        rs.queue.submit([encoder.finish()]);
+        crate::gpu_timing::mark(encoder, "gpu: dof");
+        fullscreen(encoder, "post", &viewport.post, &target.hdr_bg, &target.display_view);
+        crate::gpu_timing::mark(encoder, "gpu: post");
     }
 
     /// The last frame's fog (`Globals::fog`) and its linear colour, as
@@ -5171,6 +5142,8 @@ impl Renderer {
         frame: &Frame,
     ) -> Option<egui::TextureId> {
         let svc_t0 = Instant::now();
+        // (the last frame's post chain, had nobody recorded it)
+        self.finish_frame(rs);
         self.pool.flush();
         let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
         crate::gpu_timing::set_automatic(frame.quality.is_some());
@@ -5426,7 +5399,8 @@ impl Renderer {
         drop(r_scope);
         let r_scope = rustudio_core::bench::scope("r_per_frame_cull");
         // Per-frame items: moving, new and see-through parts.
-        let mut dyn_opaque: Vec<((usize, usize), InstanceRaw)> = Vec::new();
+        // (with each instance's bounding radius: the sun cascades cull by it)
+        let mut dyn_opaque: Vec<((usize, usize), InstanceRaw, f32)> = Vec::new();
         let mut dyn_decal: Vec<((usize, usize), InstanceRaw)> = Vec::new();
         let mut blended: Vec<(f32, (usize, usize), InstanceRaw)> = Vec::new();
         // Decals / Textures on a solid (or invisible) host: part of the
@@ -5484,7 +5458,7 @@ impl Renderer {
                     b.add_sphere(d.xf.pos, rad);
                 };
                 match pass_of(d) {
-                    Some(Pass::Opaque) => dyn_opaque.push((draw_key(d), raw)),
+                    Some(Pass::Opaque) => dyn_opaque.push((draw_key(d), raw, rad)),
                     Some(Pass::Decal) => {
                         see_bound(&mut see_bounds);
                         dyn_decal.push((draw_key(d), raw))
@@ -5642,6 +5616,11 @@ impl Renderer {
             label: Some("viewport"),
         });
         crate::gpu_timing::begin(device, queue, &mut encoder);
+        // The light grid's new voxels (written off this thread), before
+        // anything samples the grid.
+        for up in self.grid_uploads.drain(..) {
+            up.encode(&mut encoder, &self.lightgrid_tex, &self.localgrid_tex);
+        }
         // Skinned parts' vertices for this frame, before anything draws them.
         self.skin.encode(&mut encoder);
         crate::gpu_timing::mark(&mut encoder, "gpu: skinning");
@@ -5671,6 +5650,22 @@ impl Renderer {
             // Casters: static opaque cells that can reach the cascade's box
             // (trimmed like the view), plus this frame's moving opaque parts.
             let sp = frustum(cascade.caster_view_proj());
+            // This frame's moving casters that can reach the cascade's box
+            // (a skinned mesh's vertices can leave its box: kept). Each box
+            // holds only part of the view, cascade 0 the nearest studs, so
+            // a crowd of moving characters drew far more shadows than it cast.
+            let mut moving_ranges: Vec<((usize, usize), u32, u32)> = Vec::new();
+            for (i, (key, raw, rad)) in dyn_opaque.iter().enumerate() {
+                let (centre, rad) = raw_sphere(raw, *rad);
+                if !sphere_visible(&sp, centre, rad) && !self.meshes.get(key.0).is_some_and(|m| m.storage) {
+                    continue;
+                }
+                let at = i as u32;
+                match moving_ranges.last_mut() {
+                    Some(l) if l.0 == *key && l.2 == at => l.2 = at + 1,
+                    _ => moving_ranges.push((*key, at, at + 1)),
+                }
+            }
             let mut shadow_ranges: Vec<((usize, usize), u32, u32)> = Vec::new();
             // Small casters are trimmed by their distance from the camera. At
             // Shading detail Low, cascades 1..3 measure it from their own
@@ -5790,7 +5785,7 @@ impl Renderer {
                     }
                 }
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
-                for r in &opaque_runs {
+                for r in &moving_ranges {
                     cast(pass, r.0, r.1..r.2);
                 }
                 terrain(pass, false);
@@ -6486,81 +6481,15 @@ impl Renderer {
             c.composite(device, &mut encoder, globals_bg, &target.hdr_view, &target.scene_copy_view, &target.depth);
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: clouds composite");
-        self.encode_bloom(&mut encoder, target, globals.bloom[1]);
-        self.encode_blur(&mut encoder, target, globals.sky_rot[1]);
-        crate::gpu_timing::mark(&mut encoder, "gpu: bloom");
-        let mut fullscreen = |label: &str,
-                              pipeline: &wgpu::RenderPipeline,
-                              bg: &wgpu::BindGroup,
-                              views: &[&wgpu::TextureView]| {
-            let attachments: Vec<_> = views
-                .iter()
-                .map(|v| {
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: v,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })
-                })
-                .collect();
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label),
-                color_attachments: &attachments,
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, bg, &[]);
-            if label == "dof across" || label == "dof near" { pass.set_bind_group(2, &target.ssao_bgs[0], &[]); }
-            pass.draw(0..3, 0..1);
-        };
-        if globals.dof[2] > 0.0 || globals.dof[3] > 0.0 {
-            fullscreen("dof across", &viewport.dof_h, &target.dof_bgs[0], &[&target.dof_views[0]]);
-            fullscreen("dof down", &self.dof_v, &target.dof_bgs[1], &[&target.dof_views[1]]);
-            if globals.dof[2] >= DOF_CHEAP_BELOW { for i in 0..11 { fullscreen("dof near", &viewport.near_pipelines[i], &target.near_bgs[i], &[&target.near_views[i]]); } }
-        }
-        crate::gpu_timing::mark(&mut encoder, "gpu: dof");
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("post"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.display_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&viewport.post);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, &target.hdr_bg, &[]);
-            pass.set_bind_group(2, &target.post_depth_bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        crate::gpu_timing::mark(&mut encoder, "gpu: post");
+        // The post chain waits for the world GUIs and effects
+        // (`draw_world_gui`): `finish_frame` records it once, after them.
+        self.post_due = true;
         self.probe.flush(queue);
-        let r_scope = rustudio_core::bench::scope("r_finish");
-        let commands = encoder.finish();
-        drop(r_scope);
-        let r_scope = rustudio_core::bench::scope("r_submit");
-        queue.submit([commands]);
-        drop(r_scope);
-        if let Some(c) = self.clouds[cloud_slot].as_mut() {
-            c.after_submit();
-        }
+        // Prepare ends here: the render thread finishes (encodes) these
+        // passes while this thread goes on with the frame, and submits them
+        // with the post chain (RenderView::renderPerform, render_thread.rs).
+        let after = self.clouds[cloud_slot].as_mut().and_then(|c| c.after_submit());
+        crate::render_thread::finish(queue, vec![encoder], after);
         self.stats = stats;
         rustudio_core::bench::perf::end_frame(svc_t0.elapsed().as_secs_f64(), 0.0);
         draw_top::end_frame();
@@ -7899,34 +7828,12 @@ fn mip_levels(w: u32, h: u32) -> u32 {
     32 - w.max(h).leading_zeros()
 }
 
-/// An RGBA8 sRGB image followed by its mip levels (each half the size,
-/// 2×2 texels averaged in linear light; alpha averaged as is).
-/// PBR maps contain linear data; gamma-correct colour mips distort normals
-/// and roughness. Keep the channels in their encoded data space.
-fn data_mip_chain(mut w: u32, mut h: u32, rgba: &[u8]) -> Vec<u8> {
-    let mut out = rgba.to_vec();
-    let mut prev = rgba.to_vec();
-    while w > 1 || h > 1 {
-        let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
-        let mut next = vec![0; (nw * nh * 4) as usize];
-        for y in 0..nh { for x in 0..nw { for c in 0..4 {
-            let mut sum = 0u16;
-            for (dx, dy) in [(0,0), (1,0), (0,1), (1,1)] {
-                sum += prev[(((y*2+dy).min(h-1)*w + (x*2+dx).min(w-1))*4) as usize + c] as u16;
-            }
-            next[((y*nw+x)*4) as usize+c] = ((sum+2)/4) as u8;
-        }}}
-        out.extend_from_slice(&next);
-        prev = next;
-        w = nw; h = nh;
-    }
-    out
-}
-
+/// PBR maps hold linear data: their mips average the stored values (a
+/// gamma-correct colour mip would distort normals and roughness).
 #[test]
 fn pbr_mips_preserve_linear_channels() {
     let px = [0,0,0,0, 255,255,255,255, 0,0,0,0, 255,255,255,255];
-    assert_eq!(&data_mip_chain(2,2,&px)[16..], &[128;4]);
+    assert_eq!(&rustudio_core::texture::data_mip_chain(2,2,&px)[16..], &[128;4]);
 }
 
 /// Six square faces, each with its mip chain, layer-major (a cube upload).

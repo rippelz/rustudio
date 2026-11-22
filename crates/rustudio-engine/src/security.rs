@@ -93,8 +93,10 @@ fn legacy_granted(id: u8) -> u8 {
 fn sandbox_denied(id: u8) -> u8 {
     let _ = (SB_INTERNAL_TEST, SB_REMOTE_COMMAND, SB_ASSISTANT);
     match id {
-        // (A plugin reads RunService.RunState: measured.)
-        COMMAND | PLUGIN_IDENT => 0,
+        // (A plugin reads RunService.RunState: measured. The CoreScripts
+        // call RunService:IsEdit unguarded at start, StarterScript line 360,
+        // so their identity has it too.)
+        COMMAND | PLUGIN_IDENT | CORE => 0,
         _ => SB_PLUGIN_OR_OPEN_CLOUD,
     }
 }
@@ -366,6 +368,8 @@ fn internal_chunk(src: &[u8]) -> bool {
     s.starts_with(b"rustudio.")
         || s.starts_with(b"gui_input.")
         || s.starts_with(b"CoreGui.RobloxGui.CoreScripts/")
+        // The data model patch's entry CoreScript (runtime start_core_script).
+        || s == b"StarterScript"
         || s == b"StudioTestService"
         || s == b"geometry_ops"
         || s == b"geometry_nav"
@@ -522,11 +526,16 @@ pub fn index_hook(lua: &Lua, r: Ref, key: &str) -> mlua::Result<Option<Value>> {
             gate(lua, rule, key).map(|f| Some(Value::Function(f)))
         }
         MKind::Event => {
-            if check(lua, "connect", key, None, rule.read).is_ok() {
-                return Ok(None);
-            }
             // Studio's event exists even where rustudio has no behaviour:
-            // a signal whose Connect / Wait refuse.
+            // for a thread allowed to connect (the CoreScripts at identity
+            // 4), a signal nothing fires yet; for others, one whose Connect /
+            // Wait refuse.
+            if check(lua, "connect", key, None, rule.read).is_ok() {
+                return match index(lua, r, key) {
+                    Ok(v) => Ok(Some(v)),
+                    Err(_) => signal(lua, r, key).map(Some),
+                };
+            }
             match index(lua, r, key) {
                 Ok(v) => Ok(Some(v)),
                 Err(_) => signal(lua, r, key).map(Some),
@@ -612,6 +621,23 @@ pub fn install_globals(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
     g.set("__rs_identity", lua.create_function(|lua, ()| Ok(current(lua)))?)?;
     g.set("__rs_sec_event", lua.create_function(event_check)?)?;
+    // f(...) on a new thread at identity `id` (the library's RunService
+    // render-step binds run at their binder's identity, as connections do).
+    g.set(
+        "__rs_spawn_as",
+        lua.create_function(|lua, mut args: MultiValue| {
+            let id = match args.pop_front() {
+                Some(Value::Integer(i)) => i as u8,
+                Some(Value::Number(n)) => n as u8,
+                _ => GAME,
+            };
+            let Some(Value::Function(f)) = args.pop_front() else { return Ok(()) };
+            let th = crate::runtime::domains::assets_cloud::scene::create_thread(lua, f)?;
+            set(&th, id);
+            crate::runtime::resume(lua, &th, args.into_iter().collect());
+            Ok(())
+        })?,
+    )?;
     let names = lua.create_table()?;
     if let Some(r) = rules() {
         for (name, list) in &r.by_name {
@@ -679,7 +705,7 @@ pub fn seal(lua: &Lua) -> mlua::Result<()> {
             inst.raw_set("new", crate::cmeta::wrap(lua, f, false)?)?;
         }
     }
-    for k in ["__rs_identity", "__rs_sec_event", "__rs_sec_event_names", "__rs_plugin_asset"] {
+    for k in ["__rs_identity", "__rs_sec_event", "__rs_sec_event_names", "__rs_plugin_asset", "__rs_spawn_as"] {
         g.raw_set(k, Value::Nil)?;
     }
     Ok(())
@@ -1068,5 +1094,30 @@ mod tests {
         assert!(rule("Part", "Anchored").is_none());
         assert_eq!(rule("Player", "InputLatency").unwrap().read.missing(COMMAND), Some("RobloxEngine"));
         assert_eq!(rule("Instance", "SourceAssetId").unwrap().read.missing(COMMAND), Some("RobloxScript"));
+    }
+
+    /// A bound action runs at its binder's identity whatever thread the
+    /// input arrives on: the in-game menu's Escape (a CoreScript's
+    /// BindCoreAction) reads GuiService.SelectedCoreObject (RobloxScript).
+    #[test]
+    fn bound_action_runs_at_its_binders_identity() {
+        let (rt, _) = client("");
+        with_main_identity(&rt.lua, CORE, || {
+            rt.lua.load(r#"
+                game:GetService("ContextActionService"):BindCoreAction("T", function(_, state)
+                    if state == Enum.UserInputState.Begin then
+                        local ok = pcall(function() return game:GetService("GuiService").SelectedCoreObject end)
+                        print(if ok then "core read" else "core denied")
+                    end
+                end, false, Enum.KeyCode.Escape)
+            "#).set_name("=core").exec()
+        })
+        .unwrap();
+        with_main_identity(&rt.lua, GAME, || {
+            rt.lua.load(r#"__rs_input_event("Begin", "Keyboard", "Escape", 0, 0, 0, 0, 0, false)"#).set_name("=input").exec()
+        })
+        .unwrap();
+        let out = lines(rt);
+        assert!(has(&out, "core read"), "{out:?}");
     }
 }

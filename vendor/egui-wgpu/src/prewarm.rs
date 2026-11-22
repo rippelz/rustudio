@@ -155,3 +155,18 @@ pub fn destroy_later<T: Send + 'static>(textures: Vec<wgpu::Texture>, rest: T) {
     }
     drop_later((Destroy(textures), rest));
 }
+
+/// What the window painter runs before it touches the queue: rustudio's
+/// render thread join (the viewport texture egui shows was drawn there).
+static BEFORE_PAINT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+pub fn set_before_paint(f: fn()) {
+    let _ = BEFORE_PAINT.set(f);
+}
+
+#[cfg_attr(not(feature = "winit"), allow(dead_code))]
+pub(crate) fn before_paint() {
+    if let Some(f) = BEFORE_PAINT.get() {
+        f();
+    }
+}

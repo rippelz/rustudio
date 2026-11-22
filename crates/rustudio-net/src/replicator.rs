@@ -146,6 +146,14 @@ pub enum PropValue {
     /// A reference to another instance by server referent.
     Ref(Option<u64>),
     Enum(u32),
+    /// An enum value inside a tuple, array or dictionary with the enum type
+    /// its `u16` index names in the schema's enum table (game client
+    /// sessions only, [`SessionKind::GameClient`]; estimate: the index
+    /// matches the enum's place in the schema's table, e.g. `07 09 02 02` in
+    /// a TextChatMessage dictionary is Enum.TextChatMessageStatus value 2).
+    /// The writer sends the index back; a bare [`PropValue::Enum`] (index
+    /// unknown) goes as `0xffff`.
+    EnumItem { enum_type: String, value: u32 },
     Vector2([f32; 2]),
     Vector3([f32; 3]),
     Color3([f32; 3]),
@@ -306,6 +314,20 @@ pub struct SchemaClass {
     pub events: Vec<SchemaEvent>,
 }
 
+/// Which kind of replication session a [`Decoder`] reads and a [`Schema`]
+/// writes for. Team Create (Studio's cloud edit) and a player's session with
+/// a game server share the wire format but differ in a few places; each
+/// difference is gated on this, and Team Create keeps
+/// [`SessionKind::CloudEdit`], the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionKind {
+    /// Team Create: Studio editing the place with the cloud edit server.
+    #[default]
+    CloudEdit,
+    /// A player's session with a game server.
+    GameClient,
+}
+
 /// The replication schema (packet 0x97). Items index classes, class-local
 /// props, global props and global events through it.
 #[derive(Debug, Clone, Default)]
@@ -329,6 +351,10 @@ pub struct Schema {
     /// instead of v1. Set by bit 53 (`0x35`) of the header's
     /// engine configuration word.
     pub replication_pv_v2: bool,
+    /// The session this schema belongs to (the [`Decoder`]'s kind, set when
+    /// it reads the schema): the writer, which encodes against it, writes
+    /// the game-client-only layouts under [`SessionKind::GameClient`] only.
+    pub kind: SessionKind,
 }
 
 impl Schema {
@@ -464,7 +490,14 @@ impl Schema {
             });
         }
         if ety == 0x07 {
-            c.u16()?;
+            let index = c.u16()?;
+            let value = c.varint()? as u32;
+            // Team Create reads the bare value, as it always has.
+            let enum_type = self.enums.get(usize::from(index)).filter(|_| self.kind == SessionKind::GameClient);
+            return Ok(match enum_type {
+                Some(enum_type) => PropValue::EnumItem { enum_type: enum_type.clone(), value },
+                None => PropValue::Enum(value),
+            });
         }
         self.value_at_depth(ety, c, depth + 1, compress_content)
     }
@@ -596,7 +629,8 @@ impl Schema {
                     PropValue::Array(array)
                 }
             }
-            // 0x21 ContentId
+            // 0x21 ContentId: prefixed in NewObject items, property changes
+            // and event arguments; plain in join data's instance records.
             0x21 => PropValue::String(self.content_id(c, compress_content)?),
             // 0x22 SystemAddress
             0x22 => PropValue::Int(c.varint()? as i64),
@@ -1193,21 +1227,39 @@ fn terrain_packet(body: &[u8], streaming: bool) -> R<RepOp> {
     Ok(RepOp::Terrain { id, chunks })
 }
 
-/// SET_GLOBALS assigns the client's GUID namespace after seven flags.
-/// Native client parser:...
-/// The second flag enables an optional terrain block, not supported here.
-pub fn assigned_peer_scope(body: &[u8]) -> Result<u32, String> {
+/// SET_GLOBALS (`0x81`) assigns the client's instance namespace (its peer
+/// id). In a game client session: seven flag bytes, then a varint. The
+/// flags are StreamingEnabled, network filtering, three third-party
+/// permissions, on-demand ads (sent to clients with that capability) and
+/// CharacterAutoLoads [verified: Studio 0.746
+/// `ClientReplicator::processPacketV2`'s `0x81` branch: `readBool` × 7, then
+/// `deserializeUnsignedVarint` → `World::setLocalPeerId`]; no flag adds a
+/// block, so a server with filtering on sends the second flag set and the
+/// namespace right after the seventh. Team Create keeps the reading it was
+/// verified with: a set second flag is refused.
+pub fn assigned_peer_scope(kind: SessionKind, body: &[u8]) -> Result<u32, String> {
     let mut c = Cur::new(body);
-    c.u8().map_err(|e| format!("{e:?}"))?;
-    if c.u8().map_err(|e| format!("{e:?}"))? != 0 {
-        return Err("terrain globals block".into());
-    }
-    c.take(5).map_err(|e| format!("{e:?}"))?;
+    skip_global_flags(kind, &mut c)?;
     let scope = c.varint().map_err(|e| format!("{e:?}"))?;
     if scope <= 1 || scope > u32::MAX as u64 {
         return Err("invalid client namespace".into());
     }
     Ok(scope as u32)
+}
+
+/// SET_GLOBALS' seven flags (see [`assigned_peer_scope`]).
+fn skip_global_flags(kind: SessionKind, c: &mut Cur) -> Result<(), String> {
+    let e = |e: DecodeError| format!("{e:?}");
+    if kind == SessionKind::GameClient {
+        c.take(7).map_err(e)?;
+        return Ok(());
+    }
+    c.u8().map_err(e)?;
+    if c.u8().map_err(e)? != 0 {
+        return Err("terrain globals block".into());
+    }
+    c.take(5).map_err(e)?;
+    Ok(())
 }
 
 /// SET_GLOBALS' top-level service table, after the peer scope: a u32 (zero
@@ -1218,11 +1270,7 @@ pub fn assigned_peer_scope(body: &[u8]) -> Result<u32, String> {
 pub fn top_services(schema: &Schema, body: &[u8]) -> Result<Vec<(u64, String)>, String> {
     let mut c = Cur::new(body);
     let e = |e: DecodeError| format!("{e:?}");
-    c.u8().map_err(e)?;
-    if c.u8().map_err(e)? != 0 {
-        return Err("terrain globals block".into());
-    }
-    c.take(5).map_err(e)?;
+    skip_global_flags(schema.kind, &mut c)?;
     c.varint().map_err(e)?;
     c.take(4).map_err(e)?;
     let count = c.varint().map_err(e)?;
@@ -1265,15 +1313,34 @@ pub struct Decoder {
     pub ping_extra_float: bool,
     /// Streaming flag (set from `SET_GLOBALS` byte 0): gates the mode byte on `0x8d` terrain packets.
     pub terrain_streaming: bool,
+    /// Team Create or a player's game session: see [`SessionKind`]. Under
+    /// [`SessionKind::GameClient`], `cloud_edit` is false.
+    pub kind: SessionKind,
 }
 
 impl Decoder {
+    /// A decoder for a Team Create (cloud edit) session.
     pub fn new() -> Self {
         // Capability bit 51 is on in every Team Create session captured
         // (the f32 follows whenever flags & 0x10), and
         // nothing negotiates it here; off, every item after such a ping was
         // silently dropped (66 messages, whole instance batches among them).
         Self { ping_extra_float: true, terrain_streaming: true, ..Self::default() }
+    }
+
+    /// A decoder for a player's session with a game server.
+    pub fn game_client() -> Self {
+        Self { kind: SessionKind::GameClient, ..Self::new() }
+    }
+
+    /// This peer edits the place (Team Create) rather than plays it. Then
+    /// `ChangeAttributeItem` ends with a bool of attribute version info:
+    /// `ClientReplicator::readAttributeVersionInfo` reads it only when
+    /// `isCloudEdit()` and the common capability bit 1 (attribute
+    /// synchronization) are both set [verified: Studio 0.748 disassembly,
+    /// `0x106711410`].
+    pub fn cloud_edit(&self) -> bool {
+        self.kind == SessionKind::CloudEdit
     }
 
     /// Decode one message (`packet_id` = its first byte, `body` = the rest).
@@ -1398,14 +1465,23 @@ impl Decoder {
         let clen = c.u32()? as usize;
         let size = c.u32()? as usize;
         let d = unzstd(c.take(clen)?, size)?;
-        self.schema = Some(Schema::parse(&d)?);
+        let mut schema = Schema::parse(&d)?;
+        schema.kind = self.kind;
+        self.schema = Some(schema);
         Ok(())
     }
 
     fn data_msg(&mut self, body: &[u8], ops: &mut Vec<RepOp>) -> R<()> {
         let mut c = Cur::new(body);
         while c.left() > 0 && c.peek()? != 0 {
-            self.item(&mut c, ops)?;
+            let at = c.o;
+            let kind = body[at];
+            // (which item, where, and the bytes it starts with: a decode
+            // error is otherwise unplaceable in a packet of many items)
+            self.item(&mut c, ops).map_err(|e| {
+                let head: String = body[at..body.len().min(at + 24)].iter().map(|b| format!("{b:02x}")).collect();
+                DecodeError::Bad(format!("item {kind:#04x} at {at}/{} ({head}): {e:?}", body.len()))
+            })?;
         }
         Ok(())
     }
@@ -1434,8 +1510,14 @@ impl Decoder {
                 // NewObject carries an early property group (e.g. LocalScript
                 // Source), then the ordinary properties. Player's early group
                 // is empty (ff); it is not a universal fixed marker.
-                let (_, mut early_props) = self.props(ci, c)?;
-                let (class, props) = self.props(ci, c)?;
+                // In a game client session ContentId values here are
+                // prefixed (estimate: a game server's NewObject reads only
+                // so, `08 1a "/asset/?id=…"` being the prefix tag then the
+                // suffix), while join data's records carry them plain. Team
+                // Create reads them plain, as it always has.
+                let prefixed = self.kind == SessionKind::GameClient;
+                let (_, mut early_props) = self.props(ci, c, prefixed)?;
+                let (class, props) = self.props(ci, c, prefixed)?;
                 early_props.extend(props);
                 for (_, value) in &early_props {
                     if let PropValue::SharedHash(expected) = value {
@@ -1613,17 +1695,19 @@ impl Decoder {
             }
             // ChangeAttributeItem (Studio 0.748): ref,
             // varint-length name, varint-length value (one attribute body:
-            // type byte + value; the nil type 01 alone, or empty, removes it).
+            // type byte + value; the nil type 01 alone, or empty, removes it),
+            // then, in cloud edit only, the attribute version bool (see
+            // `cloud_edit`; 01 in every captured Team Create session; skipped
+            // there, the 01 read as a DeleteInstance whose "ref" was the next
+            // item). A game client session's stream has none.
             0x15 => {
                 let id = c.reference()?;
                 let name = c.varstr()?;
                 let n = c.varint()? as usize;
                 let value = c.take(n)?.to_vec();
-                // A trailing u8 (01 in every captured session, like
-                // ChangeProperty's version byte). Without it the 01 was read
-                // as a DeleteInstance whose "ref" was the next item: a bogus
-                // delete per attribute change and the rest of the message lost.
-                c.u8()?;
+                if self.cloud_edit() {
+                    c.u8()?;
+                }
                 if let Some(id) = id {
                     ops.push(RepOp::ChangeAttribute { id, name, value });
                 }
@@ -1890,8 +1974,10 @@ impl Decoder {
         Ok(())
     }
 
-    /// Class-local props until `ff`.
-    fn props(&self, ci: u16, c: &mut Cur) -> R<(String, Props)> {
+    /// Class-local props until `ff`; `prefixed`: ContentId (0x21) values
+    /// carry the schema's content prefix (NewObject items) or not (join data
+    /// records). A Content (0x3d) URI here is plain either way.
+    fn props(&self, ci: u16, c: &mut Cur, prefixed: bool) -> R<(String, Props)> {
         let s = self.schema()?;
         let cls = s
             .classes
@@ -1907,7 +1993,7 @@ impl Decoder {
                 .props
                 .get(usize::from(pi))
                 .ok_or(DecodeError::Bad(format!("{}: prop {pi}", cls.name)))?;
-            let v = s.value_with(p.ty, c, false)?;
+            let v = s.value_with(p.ty, c, prefixed && p.ty == 0x21)?;
             props.push((p.name.clone(), v));
         }
         Ok((cls.name.clone(), props))
@@ -1926,7 +2012,7 @@ impl Decoder {
                     .reference()?
                     .ok_or_else(|| DecodeError::Bad("nil instance record".into()))?;
                 let ci = c.u16()?;
-                let (class, props) = self.props(ci, &mut c)?;
+                let (class, props) = self.props(ci, &mut c, false)?;
                 let parent = c.reference()?;
                 Ok(RepOp::NewInstance {
                     id,
@@ -2033,12 +2119,16 @@ mod tests {
 
     #[test]
     fn globals_assign_the_client_namespace_after_flags() {
-        assert_eq!(
-            assigned_peer_scope(&[1, 0, 0, 0, 0, 0, 1, 0xac, 2, 0, 0, 0]).unwrap(),
-            300
-        );
-        assert!(assigned_peer_scope(&[1, 1, 0, 0, 0, 0, 1, 5]).is_err());
-        assert!(assigned_peer_scope(&[1, 0, 0, 0, 0, 0, 1, 1]).is_err());
+        for kind in [SessionKind::CloudEdit, SessionKind::GameClient] {
+            assert_eq!(assigned_peer_scope(kind, &[1, 0, 0, 0, 0, 0, 1, 0xac, 2, 0, 0, 0]).unwrap(), 300);
+            assert!(assigned_peer_scope(kind, &[1, 0, 0, 0, 0, 0, 1, 1]).is_err());
+        }
+        // Filtering on (the second flag), as a game server with it on sends:
+        // in a game client session the namespace still follows the seventh
+        // flag; Team Create keeps refusing it, as before.
+        let filtering = [0, 1, 1, 0, 1, 0, 1, 5, 0xb3, 1];
+        assert_eq!(assigned_peer_scope(SessionKind::GameClient, &filtering).unwrap(), 5);
+        assert!(assigned_peer_scope(SessionKind::CloudEdit, &filtering).is_err());
     }
 
     #[test]
@@ -2083,6 +2173,70 @@ mod tests {
         assert!(dec.skipped.is_empty(), "{:?}", dec.skipped);
         assert_eq!(ops.len(), 1, "{ops:?}");
         assert!(matches!(&ops[0], RepOp::ChangeAttribute { id: 0x30aa, name, value } if name == "Hp" && value.len() == 9));
+    }
+
+    /// A game server's ChangeAttribute ends at its value: the next item
+    /// follows at once (here a DeleteInstance, then a marker). Team Create's
+    /// keeps its version byte (`change_attribute_then_marker`'s bytes read
+    /// the same as before).
+    #[test]
+    fn game_client_change_attribute_has_no_version_byte() {
+        let attribute = |version: &[u8]| {
+            let mut body = vec![0x15, 1, 0xaa, 0x30, 0, 0, 2, b'H', b'p', 9, 0x06];
+            body.extend_from_slice(&50f64.to_le_bytes());
+            body.extend_from_slice(version);
+            body.extend_from_slice(&[0x01, 1, 0x6e, 0, 0, 0, 0x04, 123, 0, 0, 0, 0]);
+            body
+        };
+        let want = |ops: &[RepOp]| matches!(ops, [RepOp::ChangeAttribute { id: 0x30aa, .. }, RepOp::DeleteInstance { id: 0x6e }]);
+        let mut dec = decoder_as(SessionKind::GameClient);
+        assert!(!dec.cloud_edit());
+        let ops = dec.decode_frame(0x83, &attribute(&[]));
+        assert!(dec.errors.is_empty(), "{:?}", dec.errors);
+        assert!(want(&ops), "{ops:?}");
+        let mut dec = decoder();
+        assert!(dec.cloud_edit());
+        let ops = dec.decode_frame(0x83, &attribute(&[0x01]));
+        assert!(dec.errors.is_empty(), "{:?}", dec.errors);
+        assert!(want(&ops), "{ops:?}");
+    }
+
+    /// NewObject's ContentId values are prefixed in a game client session
+    /// (prefix tag, then the id) and plain in Team Create, as before.
+    #[test]
+    fn new_object_content_ids_are_prefixed_for_a_game_client() {
+        let decal = |kind: SessionKind| {
+            let mut dec = Decoder { kind, ..Decoder::new() };
+            dec.schema = Some(Schema {
+                classes: vec![SchemaClass {
+                    name: "Decal".into(),
+                    props: vec![SchemaProp { name: "Texture".into(), ty: 0x21 }],
+                    events: vec![],
+                }],
+                content_prefixes: vec!["rbxassetid://".into()],
+                kind,
+                ..Schema::default()
+            });
+            dec
+        };
+        let item = |value: &[u8]| {
+            let mut b = vec![0x02, 1, 0x10, 0, 0, 0, 0, 0, 0xff, 0];
+            b.extend_from_slice(value);
+            b.extend_from_slice(&[0xff, 1, 13, 0, 0, 0]);
+            b
+        };
+        let texture = |ops: &[RepOp]| match ops {
+            [RepOp::NewInstance { props, .. }] => props.iter().find(|(n, _)| n == "Texture").map(|(_, v)| v.clone()),
+            _ => None,
+        };
+        let want = Some(PropValue::String("rbxassetid://5".into()));
+        // Prefix 0 with an id (tag 01), zigzag 5.
+        let ops = decode_then_marker(&mut decal(SessionKind::GameClient), item(&[0x01, 0x0a]));
+        assert_eq!(texture(&ops), want);
+        let mut plain = vec![14u8];
+        plain.extend_from_slice(b"rbxassetid://5");
+        let ops = decode_then_marker(&mut decal(SessionKind::CloudEdit), item(&plain));
+        assert_eq!(texture(&ops), want);
     }
 
     #[test]
@@ -2163,10 +2317,15 @@ mod tests {
     }
 
     fn decoder() -> Decoder {
-        let mut dec = Decoder::new();
+        decoder_as(SessionKind::CloudEdit)
+    }
+
+    fn decoder_as(kind: SessionKind) -> Decoder {
+        let mut dec = Decoder { kind, ..Decoder::new() };
         let m = zmsg(&[], &schema_body(), true);
         assert!(dec.decode_frame(0x97, &m).is_empty());
         assert!(dec.errors.is_empty(), "{:?}", dec.errors);
+        assert_eq!(dec.schema.as_ref().unwrap().kind, kind);
         dec
     }
 

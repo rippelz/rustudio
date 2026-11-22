@@ -1577,6 +1577,19 @@ impl Physics {
     /// Full rebuild from the document.
     pub fn reconcile(&mut self, doc: &Document) {
         self.world = new_world(self.gravity);
+        // A new world numbers its bodies and colliders from (0, 0) again, so
+        // whatever is kept by handle belonged to the old one and starts over:
+        // the Studio solver's records (one-part mass records, boxes, sleep and
+        // level state, contacts), as `new` makes it, the characters' and the
+        // client link's. Kept, a character body built first in the new world
+        // took the old world's first loose part's one-part mass record: a 19.1
+        // character integrated as 1.68 under a Humanoid force sized for 19.1
+        // swung further every tick and was flung (test
+        // `character_in_a_rebuilt_world_stands_still`).
+        if let Some(sv) = self.studio.as_mut() {
+            **sv = crate::solver::StudioSolver::new(sv.path);
+        }
+        self.link.new_world();
         self.parts.clear();
         self.asms.clear();
         self.dyn_version += 1;
@@ -1593,8 +1606,7 @@ impl Physics {
         self.terrain_tris = 0;
         self.terrain = None;
         // The world is new: characters' bodies are built again by their owner.
-        self.hums.by_model.clear();
-        self.hums.of_part.clear();
+        self.hums.new_world();
         let Some(ws) = Self::workspace_of(doc) else {
             return;
         };
@@ -1738,10 +1750,25 @@ impl Physics {
         // (Sets are walked in ref order: with RUSTUDIO_DETERMINISTIC refs follow
         // creation order, and rapier's arena indices — the solver's body and contact
         // order — come out the same on every run.)
-        let mut stack: Vec<Ref> = seeds.into_iter().collect();
+        let mut stack: Vec<Ref> = seeds.iter().copied().collect();
         stack.sort_unstable_by_key(|r| rbx_dom_weak::ref_order(*r));
+        // A part that is anchored itself (or that another simulation moves)
+        // and already a fixed collider is rebuilt with its seed neighbours
+        // (they group with it) but not walked past: whatever else is joined
+        // to it was fixed by it and stays so. A classic place's map is one
+        // web of Snaps and Welds through its Baseplate (place 2828's: 1603
+        // parts); a regenerated model welded to that web made the walk
+        // rebuild every collider of the map.
+        let fixed_alone = |r: Ref| {
+            !seeds.contains(&r)
+                && self.parts.get(&r).is_some_and(|p| p.asm.is_none())
+                && (self.external.contains(&r) || matches!(doc.prop(r, "Anchored"), Some(Variant::Bool(true))))
+        };
         while let Some(r) = stack.pop() {
             if !all.insert(r) {
+                continue;
+            }
+            if fixed_alone(r) {
                 continue;
             }
             if let Some(id) = self.parts.get(&r).and_then(|p| p.asm) {
@@ -1752,6 +1779,7 @@ impl Physics {
             stack.extend(self.neighbours(r));
         }
         drop(b1);
+        rustudio_core::bench::add("pb_parts", 0.0, all.len() as u64);
         let b2 = rustudio_core::bench::scope("pb_drop");
         // 2. Drop what's there now.
         let mut all: Vec<Ref> = all.into_iter().collect();
@@ -2046,6 +2074,11 @@ impl Physics {
                 }
             }
         }
+        rustudio_core::bench::add("count: pfc_changed", changed.len() as f64, 1);
+        rustudio_core::bench::add("count: pfc_trees", trees.len() as f64, 1);
+        if all {
+            rustudio_core::bench::add("count: pfc_all", 1.0, 1);
+        }
         let mut seen: HashSet<Ref> = HashSet::default();
         let mut resized: HashSet<Ref> = HashSet::default();
         for c in changed {
@@ -2068,6 +2101,19 @@ impl Physics {
                 continue;
             }
             if !seen.insert(c) || !self.parts.get(&s).is_some_and(|pb| pb.asm.is_none()) {
+                continue;
+            }
+            // Most client marks are the server's own moves arriving in the
+            // client's copy: the same CFrame and Size values, bit for bit,
+            // with nothing followed to undo. Compared in place, before
+            // reading both parts' whole signatures (`part_sig`).
+            fn raw<'a>(d: &'a Document, r: Ref, k: &rbx_dom_weak::Ustr) -> Option<&'a Variant> {
+                d.dom.get_by_ref(r).and_then(|i| i.properties.get(k))
+            }
+            if !self.client_over.contains_key(&s)
+                && raw(client, c, &cframe) == raw(server, s, &cframe)
+                && raw(client, c, &size) == raw(server, s, &size)
+            {
                 continue;
             }
             let (Some((cx, csig)), Some((sx, ssig))) = (part_sig(client, c), part_sig(server, s)) else {
@@ -3346,6 +3392,21 @@ impl Physics {
         if self.touch_parts.is_some() && !self.touch_refresh {
             self.touch_pending.push(handle);
         }
+        // Into the query tree now, as Roblox does: Studio 0.747
+        // `ContactManager::onAssemblyAdded` (0x100275f5e) binds a new assembly
+        // into the broad phase at once, and the Humanoid's floor rays
+        // (`ControllerPartSensor::findFloorRaycast`, 0x100cb233c, through
+        // `ContactManager::raycastBatched`) query it the same frame. rapier's
+        // broad phase would only add it at the next step: a map regen's fresh
+        // ground went unseen for a frame and the character fell. The world's
+        // first build is indexed by its first step as a whole.
+        if self.steps > 0 {
+            let w = &mut self.world;
+            if let Some(co) = w.colliders.get(handle) {
+                let aabb = co.compute_broad_phase_aabb(&w.integration_parameters, &w.bodies);
+                w.broad_phase.set_aabb(&w.integration_parameters, handle, aabb);
+            }
+        }
     }
 
     /// Studio tests a part's overlaps only when it has a TouchTransmitter (a script
@@ -3474,13 +3535,6 @@ impl Physics {
                 self.pending_vel.insert(r, (v, left - 1));
             }
         }
-        let (hz, _, max_steps) = step_rate();
-        let h = 1.0 / hz;
-        // Discard elapsed time above the frame budget on a hitch. Keep the
-        // fractional remainder so ordinary frames stay on the 240 Hz grid.
-        let wanted = self.accum + dt.max(0.0);
-        self.accum = wanted.min(h * max_steps as f32);
-        let owed = ((wanted - self.accum) * 60.0) as u32;
         self.throttle.mode = doc
             .workspace()
             .and_then(|w| match doc.prop(w, "PhysicsEnvironmentalThrottle") {
@@ -3494,6 +3548,17 @@ impl Physics {
         if let Some(v) = *FORCE.get_or_init(|| std::env::var("RUSTUDIO_PHYSICS_ENV_THROTTLE").ok().and_then(|v| v.parse().ok())) {
             self.throttle.mode = crate::throttle::Mode::from_value(v);
         }
+        let (hz, _, _) = step_rate();
+        let h = 1.0 / hz;
+        // Studio's step count for a frame (0.746 `World::updateStepsRequiredForCyclicExecutive`,
+        // throttle.rs `max_world_steps`): at most 12 world steps, 4 while the environment is
+        // throttled to 40 % or less, and at most mech::PHYSICS_CARRY_MAX_STEPS of the rest kept
+        // for the next frame. Elapsed time above that is dropped: a slow frame slows the
+        // simulation instead of running an unbounded catch-up.
+        let max_steps = self.throttle.max_world_steps();
+        let wanted = self.accum + dt.max(0.0);
+        self.accum = wanted.min(h * (max_steps as f32 + mech::PHYSICS_CARRY_MAX_STEPS));
+        let owed = ((wanted - self.accum) * 60.0) as u32;
         let jsc = rustudio_core::bench::scope("ph_joints");
         {
             let _a = rustudio_core::bench::scope("pj_apply_joints");
@@ -3687,6 +3752,7 @@ impl Physics {
         // The environmental throttle decides per 60 Hz frame (a group of
         // maxLevel ticks); an unthrottled frame's wall time feeds its level
         // (its ticks may span two batches).
+        let ticks_before = self.steps;
         for _ in 0..max_steps {
             if self.accum <= due {
                 break;
@@ -3770,6 +3836,7 @@ impl Physics {
                 self.dump_tick(doc);
             }
         }
+        rustudio_core::bench::add("count: ph_ticks", (self.steps - ticks_before) as f64, 1);
         if studio {
             // Studio publishes moved poses after the frame's world steps.
             self.humanoid_solved();
@@ -5134,6 +5201,30 @@ mod tests {
     }
 
     #[test]
+    fn part_added_under_a_standing_humanoid_holds_it_at_once() {
+        // A map regen (place 2828) parents fresh ground under the character.
+        // Roblox's spatial queries see a part the frame it is parented, so the
+        // floor rays find it before the world steps again. (A new collider's
+        // slot is not in rapier's query tree until a step: the rays looked
+        // through it to whatever was below, or at nothing, and the character
+        // fell for a frame.)
+        let (mut doc, mut p) = hum_world(vec![]);
+        run(&mut p, &mut doc, 3);
+        let ws = doc.workspace().unwrap();
+        let slab = doc.dom.insert(
+            ws,
+            part("Slab", Vec3::new(0.0, 0.25, 0.0), true).with_property("Size", Vector3::new(20.0, 0.5, 20.0)),
+        );
+        doc.mark_tree(slab);
+        p.sync(&mut doc);
+        let sh = hum_shape_r15();
+        let root = Vec3::Y * (0.5 + sh.hip + sh.root_size.y * 0.5);
+        let floor = p.find_floor(root, Quat::IDENTITY, &sh, true, &HashSet::<Ref>::default()).expect("a floor");
+        assert_eq!(floor.part, Some(slab), "the floor rays find the part parented this frame");
+        assert!((floor.y - 0.5).abs() < 1e-3, "on the slab's top, not the floor below: {}", floor.y);
+    }
+
+    #[test]
     fn prepared_studio_step_publishes_only_at_completion() {
         let fixture = || hum_world(vec![part("Block", Vec3::Y * 100.0, false)]);
         let (mut doc, mut physics) = fixture();
@@ -5269,14 +5360,19 @@ mod tests {
         assert_eq!(p.env_owed, ENV_OWED_MAX);
     }
 
+    /// A hitch runs at most MAX_PHYSICS_STEPS and keeps at most
+    /// PHYSICS_CARRY_MAX_STEPS of the rest for the next frame (Studio 0.746
+    /// `World::updateStepsRequiredForCyclicExecutive`); the rest is dropped.
     #[test]
-    fn physics_hitch_keeps_no_step_debt() {
+    fn physics_hitch_keeps_at_most_four_steps_of_debt() {
         let (mut doc, mut physics) = hum_world(vec![]);
-        let (hz, _, max_steps) = step_rate();
+        let (hz, _, _) = step_rate();
         physics.step(&mut doc, 1.0);
-        assert_eq!(physics.steps, max_steps as u64);
+        assert_eq!(physics.steps, mech::MAX_PHYSICS_STEPS as u64);
         physics.step(&mut doc, 1.0 / hz);
-        assert_eq!(physics.steps, (max_steps + 1) as u64);
+        assert_eq!(physics.steps, (mech::MAX_PHYSICS_STEPS + 5) as u64);
+        physics.step(&mut doc, 1.0 / hz);
+        assert_eq!(physics.steps, (mech::MAX_PHYSICS_STEPS + 6) as u64);
     }
 
     #[test]
@@ -5347,6 +5443,115 @@ mod tests {
             run_hum(&doc, &mut p, &mut c, &mut yaw, Vec3::new(0.0, 0.0, -16.0), 1.5);
             assert_eq!(c.pos.y > 3.19 + h - 0.1, climbs, "step {h}: {:?}", c.pos);
         }
+    }
+
+    /// A rebuilt world (`reconcile`, on a sync that marks everything) hands out
+    /// body handles from (0, 0) again, and the Studio solver's records by handle
+    /// start over with it. Kept, the character's body, the first of its new
+    /// world, took the old world's first loose part's one-part mass record (the
+    /// solver integrated 1.68 where rapier and the Humanoid had 19.1), and the
+    /// Humanoid's force, sized for 19.1, swung it further every tick until it
+    /// fell through the floor. Here an R15 build (Massless limbs on a heavy
+    /// HumanoidRootPart) stands, with accessory Handles (Massless, CanCollide
+    /// false) joined after its body was built: its root stays put and upright.
+    #[test]
+    fn character_in_a_rebuilt_world_stands_still() {
+        use crate::humanoid::{Humanoid, StepIn};
+        if crate::solver::kind() == crate::solver::SolverKind::Rapier {
+            return;
+        }
+        let mut doc = Document::new_place();
+        let ws = doc.workspace().unwrap();
+        for name in ["SpawnLocation", "Baseplate"] {
+            if let Some(r) = doc.find_named(ws, name) {
+                doc.dom.destroy(r);
+            }
+        }
+        // The old world: one loose 2×1.2×1 part, body (0, 0), mass record 1.68.
+        let crate_part = doc.dom.insert(ws, part("Crate", Vec3::new(40.0, 20.0, 40.0), false).with_property("Size", Vector3::new(2.0, 1.2, 1.0)));
+        let mut p = Physics::new(&mut doc);
+        run(&mut p, &mut doc, 1);
+        doc.dom.destroy(crate_part);
+        doc.dom.insert(ws, part("Floor", Vec3::new(0.0, -1.0, 0.0), true).with_property("Size", Vector3::new(400.0, 2.0, 400.0)));
+        let sh = hum_shape_r15();
+        let full_hip = sh.root_size.y * 0.5 + sh.hip;
+        let model = doc.dom.insert(ws, InstanceBuilder::new("Model").with_name("Character"));
+        doc.dom.insert(model, InstanceBuilder::new("Humanoid"));
+        let at = |x: f32, y: f32| Vec3::new(x, y, 0.0);
+        // 2×2×1 at density 3.5: the whole character's 14.
+        let heavy = rbx_dom_weak::types::PhysicalProperties::Custom(rbx_dom_weak::types::CustomPhysicalProperties::new(3.5, 0.3, 0.5, 1.0, 1.0, 1.0));
+        let root = doc.dom.insert(
+            model,
+            part("HumanoidRootPart", at(0.0, full_hip), false).with_property("Size", Vector3::new(2.0, 2.0, 1.0)).with_property("CustomPhysicalProperties", heavy),
+        );
+        let limb = |name: &str, pos: Vec3, size: Vector3, collide: bool| {
+            part(name, pos, false).with_property("Size", size).with_property("Massless", true).with_property("CanCollide", collide)
+        };
+        for (name, pos, size, collide) in [
+            ("LowerTorso", at(0.0, full_hip - 0.8), Vector3::new(2.0, 0.4, 1.0), true),
+            ("UpperTorso", at(0.0, full_hip + 0.2), Vector3::new(2.0, 1.6, 1.0), true),
+            ("Head", at(0.0, full_hip + 1.6), Vector3::new(1.2, 1.2, 1.2), true),
+            ("LeftUpperLeg", at(-0.5, 1.0), Vector3::new(1.0, 2.0, 1.0), false),
+            ("RightUpperLeg", at(0.5, 1.0), Vector3::new(1.0, 2.0, 1.0), false),
+        ] {
+            doc.dom.insert(model, limb(name, pos, size, collide));
+        }
+        let parts_of = |doc: &Document| -> Vec<(Ref, Xform)> {
+            doc.dom
+                .descendants_of(model)
+                .filter(|i| doc::is_a(&i.class, "BasePart"))
+                .filter_map(|i| Some((i.referent(), xform_of(doc, i.referent())?)))
+                .collect()
+        };
+        // The character's parts are the Humanoid's; the world is rebuilt
+        // without the crate, so the character's body is its first.
+        p.skip.extend(parts_of(&doc).iter().map(|(r, _)| *r));
+        p.reconcile(&doc);
+        p.add_humanoid(&doc, model, root, &parts_of(&doc));
+        let root_at = xform_of(&doc, root).unwrap();
+        let mut hum = Humanoid::default();
+        let (mut worst_v, mut worst_w, mut lowest_up) = (0.0f32, 0.0f32, 1.0f32);
+        for frame in 0..180 {
+            if frame == 30 {
+                // The server's accessories arrive after the character was taken.
+                for (name, y) in [("Hat", full_hip + 2.4), ("Hair", full_hip + 1.8)] {
+                    let acc = doc.dom.insert(model, InstanceBuilder::new("Accessory").with_name(name));
+                    let handle = doc.dom.insert(acc, limb("Handle", at(0.0, y), Vector3::new(2.0, 1.0, 2.0), false));
+                    doc.mark_tree(acc);
+                    p.skip.insert(handle);
+                }
+                p.refresh_humanoid(&doc, model, root, &parts_of(&doc));
+            }
+            // Each part where the rig holds it, relative to the root (no animation).
+            let local: std::collections::HashMap<Ref, Xform> =
+                parts_of(&doc).into_iter().map(|(r, xf)| (r, Xform { pos: xf.pos - root_at.pos, rot: Mat3::IDENTITY })).collect();
+            p.set_humanoid_pose(model, &local, &local);
+            let (xf, _, _) = p.humanoid_root(model).unwrap();
+            let own: HashSet<Ref> = local.keys().copied().collect();
+            let floor = p.humanoid_floor(&doc, model, xf.pos, Quat::from_mat3(&xf.rot), &sh, true, &own);
+            hum.floor_target_y = floor.map_or(f32::INFINITY, |f| f.0.y + full_hip);
+            let step = StepIn {
+                floor: floor.map(|f| f.0),
+                full_hip,
+                cos_max_slope: 89f32.to_radians().cos(),
+                ladder: false,
+                jump_velocity: 50.0,
+                accel_scale: 1.0,
+                ceiling: false,
+            };
+            let ctl = hum_body::HumCtl { hum: hum.clone(), step, floor_part: floor.and_then(|f| f.1), hrp: root, last: Default::default(), level: 1, swim: None };
+            p.set_humanoid_ctl(model, Some(ctl));
+            p.sync(&mut doc);
+            p.step(&mut doc, DT);
+            hum = p.humanoid_ctl(model).unwrap().hum.clone();
+            let (xf, v, w) = p.humanoid_root(model).unwrap();
+            worst_v = worst_v.max(v.length());
+            worst_w = worst_w.max(w.length());
+            lowest_up = lowest_up.min(xf.rot.y_axis.y);
+        }
+        let (xf, _, _) = p.humanoid_root(model).unwrap();
+        assert!(worst_v < 1.0 && worst_w < 0.5 && lowest_up > 0.99, "standing: |v| up to {worst_v}, |ω| up to {worst_w}, up.y down to {lowest_up}");
+        assert!((xf.pos - root_at.pos).length() < 0.2, "stays where it stood: {:?} from {:?}", xf.pos, root_at.pos);
     }
 
     /// A Plane LinearVelocity's walk (Place A's pmove) goes up a ramp at exactly
@@ -6192,6 +6397,53 @@ mod tests {
             .with_property("Attachment0", a0).with_property("Attachment1", a1));
         let p = Physics::new(&mut doc);
         assert_eq!(p.counts().0, 1, "one assembly");
+    }
+
+    /// A model welded to an anchored map (a regenerated model, place 2828)
+    /// rebuilds the new parts and the anchored part they join, not the
+    /// whole web of anchored parts welded to it; a loose part welded to the
+    /// map stays fixed and one welded to the new part is fixed by it.
+    #[test]
+    fn welding_to_an_anchored_web_rebuilds_only_its_edge() {
+        let mut doc = Document::new_place();
+        let ws = doc.workspace().unwrap();
+        let chain: Vec<Ref> = (0..20)
+            .map(|i| doc.dom.insert(ws, part(&format!("M{i}"), Vec3::new(2.0 * i as f32, 30.0, 0.0), true)))
+            .collect();
+        for w in chain.windows(2) {
+            doc.dom.insert(w[0], InstanceBuilder::new("WeldConstraint").with_property("Part0", w[0]).with_property("Part1", w[1]));
+        }
+        let loose = doc.dom.insert(ws, part("Loose", Vec3::new(40.0, 30.0, 0.0), false));
+        doc.dom.insert(loose, InstanceBuilder::new("WeldConstraint").with_property("Part0", chain[19]).with_property("Part1", loose));
+        let mut p = Physics::new(&mut doc);
+        run(&mut p, &mut doc, 2);
+        let collider = |p: &Physics, r: Ref| p.parts[&r].collider;
+        let far = collider(&p, chain[10]);
+        let loose_before = collider(&p, loose);
+        // The regenerated model: a part welded to the map's first part, and
+        // an unanchored one welded to it.
+        let new = doc.dom.insert(ws, part("New", Vec3::new(-2.0, 30.0, 0.0), true));
+        let hang = doc.dom.insert(ws, part("Hang", Vec3::new(-4.0, 30.0, 0.0), false));
+        let j1 = doc.dom.insert(new, InstanceBuilder::new("WeldConstraint").with_property("Part0", new).with_property("Part1", chain[0]));
+        let j2 = doc.dom.insert(new, InstanceBuilder::new("WeldConstraint").with_property("Part0", new).with_property("Part1", hang));
+        for r in [new, hang, j1, j2] {
+            doc.mark_tree(r);
+        }
+        p.sync(&mut doc);
+        assert_eq!(collider(&p, chain[10]), far, "the rest of the map keeps its colliders");
+        assert_eq!(collider(&p, loose), loose_before, "so does what hangs off it");
+        assert!(p.parts[&new].asm.is_none() && p.parts[&hang].asm.is_none(), "the new parts are fixed");
+        assert_eq!(p.counts().0, 0, "nothing simulated");
+        // Unanchoring the new part: Hang still hangs off the map through it.
+        doc.set_prop_live(new, ustr("Anchored"), Variant::Bool(false));
+        p.sync(&mut doc);
+        assert!(p.parts[&new].asm.is_none() && p.parts[&hang].asm.is_none(), "held by the map");
+        // The weld to the map gone: New and Hang fall together.
+        doc.dom.transfer_within(j1, Ref::none());
+        doc.mark_tree(j1);
+        p.sync(&mut doc);
+        assert_eq!(p.counts().0, 1, "New and Hang are one loose assembly");
+        assert_eq!(collider(&p, chain[10]), far, "the map still untouched");
     }
 }
 

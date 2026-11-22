@@ -136,6 +136,14 @@ pub const OPTS: &[Opt] = &[
         kind: OptKind::Bool,
     },
     Opt {
+        key: "core_scripts",
+        cat: "Play",
+        label: "Roblox's CoreScripts (experimental)",
+        desc: "Play runs Roblox's own CoreScripts and CorePackages from Studio's data model patch (the in-game chat, top bar and menu) instead of rustudio's built-in menu and chat. Many of their engine calls are still missing (docs/ENGINE-GAPS.md). Next Play.",
+        env: "RUSTUDIO_CORE_SCRIPTS",
+        kind: OptKind::Bool,
+    },
+    Opt {
         key: "update_check",
         cat: "Updates",
         label: "Check for updates on start",
@@ -343,6 +351,15 @@ pub fn local_assets() -> Option<PathBuf> {
     resolve_local_assets(env("RUSTUDIO_LOCAL_ASSETS").as_deref(), saved("local_assets").as_ref())
 }
 
+/// Roblox's CoreScripts in Play (core_scripts.rs): `RUSTUDIO_CORE_SCRIPTS`
+/// when set (only "1" means on), then saved, then off.
+pub fn core_scripts() -> bool {
+    match env("RUSTUDIO_CORE_SCRIPTS") {
+        Some(v) => v == "1",
+        None => saved("core_scripts").and_then(|v| v.as_bool()).unwrap_or(false),
+    }
+}
+
 // ------------------------------------------------------------------ latched per Play
 
 /// 0 = not latched yet; otherwise 1 + value.
@@ -488,6 +505,7 @@ pub fn shown(o: &Opt) -> Shown {
         "spin_guard" => Shown::Bool(spin_guard_now()),
         "client_link" => Shown::Bool(client_link_now()),
         "live_data" => Shown::Bool(live_data_now()),
+        "core_scripts" => Shown::Bool(core_scripts()),
         "classic_death_sound" => Shown::Bool(classic_death_sound_fetch()),
         "update_check" => Shown::Bool(update_check()),
         "local_assets" => Shown::Path(local_assets().map(|p| p.display().to_string()).unwrap_or_default()),
@@ -500,9 +518,10 @@ pub fn inactive(o: &Opt) -> Option<&'static str> {
     (o.key == "spin_guard" && solver_now() == SolverKind::Rapier).then_some("Legacy solver")
 }
 
-/// The default of an on/off option (only Use live DataStores starts off).
+/// The default of an on/off option (Use live DataStores and Roblox's
+/// CoreScripts start off).
 pub fn bool_default(key: &str) -> bool {
-    key != "live_data"
+    !matches!(key, "live_data" | "core_scripts")
 }
 
 /// The dialog writes a value: defaults are removed from the file.

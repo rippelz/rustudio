@@ -927,16 +927,20 @@ impl UserData for LUDim2 {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
-        m.add_method("Lerp", |_, this, (o, a): (LUDim2, f32)| {
-            let l = |p: LUDim, q: LUDim| LUDim {
-                scale: p.scale + (q.scale - p.scale) * a,
-                offset: (p.offset as f32 + (q.offset - p.offset) as f32 * a).round() as i32,
-            };
-            Ok(LUDim2 {
-                x: l(this.x, o.x),
-                y: l(this.y, o.y),
-            })
-        });
+        // (`lerp` too, the old lowercase name: Roblox's CoreScripts' Console
+        // package still calls it.)
+        for name in ["Lerp", "lerp"] {
+            m.add_method(name, |_, this, (o, a): (LUDim2, f32)| {
+                let l = |p: LUDim, q: LUDim| LUDim {
+                    scale: p.scale + (q.scale - p.scale) * a,
+                    offset: (p.offset as f32 + (q.offset - p.offset) as f32 * a).round() as i32,
+                };
+                Ok(LUDim2 {
+                    x: l(this.x, o.x),
+                    y: l(this.y, o.y),
+                })
+            });
+        }
         m.add_meta_method(MetaMethod::ToString, |_, this, ()| {
             Ok(format!(
                 "{{{}, {}}}, {{{}, {}}}",
@@ -3259,11 +3263,7 @@ impl UserData for LCatalogSearchParams {
                     },
                 }
             };
-            // (the prop is IncludeOffSaleItems; Studio's text says IncludeOffSale)
-            let get = |k: &str| {
-                let k = if k == "IncludeOffSale" { "IncludeOffSaleItems" } else { k };
-                this.props.iter().find(|(n, _)| *n == k).map(|(_, v)| text(v)).unwrap_or_default()
-            };
+            let get = |k: &str| this.props.iter().find(|(n, _)| *n == k).map(|(_, v)| text(v)).unwrap_or_default();
             let keys = [
                 "SearchKeyword", "CategoryFilter", "SortType", "SortAggregation", "SalesTypeFilter",
                 "CreatorName", "Limit", "CreatorType", "BundleTypes", "AssetTypes", "IncludeOffSale",
@@ -3309,7 +3309,9 @@ fn catalog_search_params(lua: &Lua) -> LResult<LCatalogSearchParams> {
             ("SalesTypeFilter", e("SalesTypeFilter", "All")?),
             ("BundleTypes", Value::Table(lua.create_table()?)),
             ("AssetTypes", Value::Table(lua.create_table()?)),
-            ("IncludeOffSaleItems", Value::Boolean(false)),
+            // (Roblox's name, create.roblox.com CatalogSearchParams; scripts
+            // set `params.IncludeOffSale = true`)
+            ("IncludeOffSale", Value::Boolean(false)),
             ("CreatorName", Value::String(lua.create_string("")?)),
             ("CreatorType", e("CreatorTypeFilter", "All")?),
             ("CreatorId", Value::Number(0.0)),
@@ -4569,21 +4571,23 @@ pub fn install_font(lua: &Lua, g: &Table) -> LResult<()> {
     t.set(
         "fromEnum",
         lua.create_function(|_, e: Value| {
-            // Enum.Font items name their family (Enum.Font.Oswald → Oswald.json).
+            // Roblox's Font.fromEnum table (gui.rs `legacy_font`):
+            // BuilderSansMedium → BuilderSans.json Medium, SourceSansSemibold
+            // → SourceSansPro SemiBold, Legacy → LegacyArial; Gotham faces
+            // name GothamSSm.json as Roblox's do (drawn as Montserrat).
             let name = ud::<LEnumItem>(&e)
                 .map(|i| i.name)
-                .unwrap_or_else(|| "SourceSansPro".into());
-            let (family, bold) = match name.strip_suffix("Bold") {
-                Some(base) if !base.is_empty() => (base.to_string(), true),
-                _ => (name, false),
+                .unwrap_or_else(|| "SourceSans".into());
+            let (family, weight, italic) = crate::gui::legacy_font(&name);
+            let family = if family.ends_with("/Montserrat.json") && name.starts_with("Gotham") {
+                "rbxasset://fonts/families/GothamSSm.json".to_string()
+            } else {
+                family
             };
-            let mut f = font_from_parts(
-                format!("rbxasset://fonts/families/{family}.json"),
-                None,
-                None,
-            )?;
-            if bold {
-                f.0.weight = rbx_types::FontWeight::Bold;
+            let mut f = font_from_parts(family, None, None)?;
+            f.0.weight = rbx_types::FontWeight::from_u16(weight as u16).unwrap_or_default();
+            if italic {
+                f.0.style = rbx_types::FontStyle::Italic;
             }
             Ok(f)
         })?,

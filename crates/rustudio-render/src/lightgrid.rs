@@ -1086,11 +1086,14 @@ pub fn build_grid(
         (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
         _ => false,
     };
+    // (a turned sun keeps the kept build: skylight and occupancy don't
+    // depend on it, only the sun channel is swept again below)
     let kept = kept.filter(|(st, _, l)| {
-        st.origin == origin && st.shadows == shadows && st.sun == sun_bits && same_terrain(&st.terrain) && l.origin == origin
+        st.origin == origin && st.shadows == shadows && same_terrain(&st.terrain) && l.origin == origin
             && std::env::var_os("RUSTUDIO_LIGHTGRID_FULL").is_none()
     });
     if let Some((mut state, occ, mut locals)) = kept {
+        let sun_turned = state.sun != sun_bits;
         // The chunks a part that came, went or changed touches.
         let c = mech::LIGHTGRID_CHUNKS;
         let mut dirty = vec![false; c[0] * c[1] * c[2]];
@@ -1170,7 +1173,20 @@ pub fn build_grid(
         state.prims = table;
         let mut touched = None;
         skylight_update(&occ, &changed, &mut state.data, &mut state.sky_leave, &mut touched);
-        if shadows {
+        if shadows && sun_turned {
+            // The whole sun channel for the new sun (as a build from scratch
+            // over these voxels: no direction leaves it 255).
+            let mut grid = LightGrid { origin, data: std::mem::take(&mut state.data), local: Vec::new() };
+            if sun_params(sun).is_some() {
+                sunlight_leaving(&occ, &mut grid, sun, Some(&mut state.sun_leave));
+            } else {
+                grid.data.iter_mut().skip(1).step_by(2).for_each(|b| *b = 255);
+                state.sun_leave.fill(255);
+            }
+            state.data = grid.data;
+            state.sun = sun_bits;
+            touched = Some(([0; 3], [nx - 1, ny - 1, nz - 1]));
+        } else if shadows {
             sunlight_update(&occ, &changed, sun, &mut state.data, &mut state.sun_leave, &mut touched);
         }
         let patches = locals.refresh_occupancy(&occ, &changed_boxes);
@@ -1411,14 +1427,22 @@ mod tests {
         let mut local = first.grid.local.clone();
         let mut shown_grid = first.grid.data.clone();
         let mut kept = Some((first.state, first.occ, first.locals));
-        for step in 0..5 {
-            for _ in 0..(1 + step * 3) {
-                let i = (rnd() * prims.len() as f32) as usize % prims.len();
-                prims[i].0.pos += Vec3::new(rnd() * 6.0 - 3.0, rnd() * 4.0 - 2.0, rnd() * 6.0 - 3.0);
+        // (the sun turns at step 2 and again, alone, at step 5)
+        for step in 0..6 {
+            if step < 5 {
+                for _ in 0..(1 + step * 3) {
+                    let i = (rnd() * prims.len() as f32) as usize % prims.len();
+                    prims[i].0.pos += Vec3::new(rnd() * 6.0 - 3.0, rnd() * 4.0 - 2.0, rnd() * 6.0 - 3.0);
+                }
             }
             if step == 1 { prims.remove(7); }
             if step == 2 { let p = prim(&mut rnd); prims.push(p); }
             if step == 3 { prims[3].0.size *= 1.5; prims.swap(10, 400); }
+            let sun = match step {
+                0 | 1 => sun,
+                2..=4 => Vec3::new(-0.3, 0.7, 0.5).normalize(),
+                _ => Vec3::new(0.2, 0.9, 0.1).normalize(),
+            };
             let inc = build_grid(origin, &prims, terrain.clone(), true, sun, &lights, kept.take());
             assert!(inc.incremental, "step {step}");
             for p in &inc.patches { inc.locals.write(&mut local, p.lo, p.hi, &p.data); }

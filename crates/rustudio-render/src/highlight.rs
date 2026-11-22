@@ -473,6 +473,6 @@ impl HighlightPass {
                 pass.draw(0..3, 0..1);
             }
         }
-        crate::gpu_timing::submit(device, queue, "gpu: highlight", [encoder.finish()]);
+        crate::gpu_timing::submit(device, queue, "gpu: highlight", [encoder]);
     }
 }

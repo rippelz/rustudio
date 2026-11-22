@@ -122,6 +122,21 @@ impl Link {
         self.proxies.values().map(|p| p.body)
     }
 
+    /// A new world (`Physics::reconcile`): the stand-ins and fixed copies were
+    /// the old world's bodies and colliders, whose handles the new one hands
+    /// out again (dropping a stale stand-in would remove a new body). What the
+    /// client did to replicated parts (`hidden`, `nocollide`) stays.
+    pub(super) fn new_world(&mut self) {
+        self.proxies.clear();
+        self.part_body.clear();
+        self.proxy_colliders.clear();
+        self.friction.clear();
+        self.player = None;
+        self.player_root = None;
+        self.statics.clear();
+        self.statics_at = None;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.proxies.is_empty() && self.hidden.is_empty() && self.statics.is_empty() && self.nocollide.is_empty()
     }

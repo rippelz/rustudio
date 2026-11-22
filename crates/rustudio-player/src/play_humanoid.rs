@@ -809,10 +809,12 @@ impl Game {
 
     /// Builds the character's body when it has none (spawn, a rebuilt world).
     fn ensure_hum_body(&mut self, model: Ref, root: Ref) {
+        let mut seen = 0usize;
         let mut parts: Vec<(Ref, Xform)> = self
             .doc
             .dom
             .descendants_of(model)
+            .inspect(|_| seen += 1)
             .filter(|i| doc::is_a(&i.class, "BasePart"))
             .filter_map(|i| rustudio_render::scene::xform_of(&self.doc, i.referent()).map(|x| (i.referent(), x)))
             .collect();
@@ -826,6 +828,27 @@ impl Game {
             }
         }
         let Some(s) = self.play.as_mut() else { return };
+        // Every part the body is built from is the body's alone. One that came
+        // into the character after it was taken stays in the loose simulation
+        // as well unless it leaves it here: a part added to the character
+        // later (an AvatarSettings CollisionPart: Massless, colliding, welded
+        // to the root) had the body's copy of it press on its own fixed copy
+        // every tick, pushing the standing character back and forth along its
+        // facing by 10+ studs.
+        let loose: Vec<Ref> = parts.iter().map(|(r, _)| *r).filter(|r| !s.physics.skip.contains(r)).collect();
+        if !loose.is_empty() {
+            s.physics.skip.extend(loose.iter().copied());
+            s.physics.refresh(loose);
+        }
+        // And the rig carries it from the body part its joint holds it to (an
+        // accessory's AccessoryRigidConstraint, that CollisionPart's Weld), from
+        // the frame it and its joint are in the model: the journal's redo
+        // (play_npc.rs `npc_journal`) missed such a late CollisionPart, which
+        // then stood where it arrived, a stud off the moving root.
+        if let Some(ch) = s.character.as_mut().filter(|c| c.accessories_seen != seen) {
+            ch.accessories_seen = seen;
+            ch.rig.refresh_attached(&self.doc, model);
+        }
         if s.physics.has_humanoid(model) {
             s.physics.refresh_humanoid(&self.doc, model, root, &parts);
             return;

@@ -878,7 +878,7 @@ fn to_variant(v: &PropValue, name: &str) -> Option<Variant> {
         PropValue::SharedString(bytes) | PropValue::CachedSharedString { bytes, .. } => {
             Variant::SharedString(rbx_types::SharedString::new(bytes.clone()))
         }
-        PropValue::Enum(e) => Variant::Enum(rbx_types::Enum::from_u32(*e)),
+        PropValue::Enum(e) | PropValue::EnumItem { value: e, .. } => Variant::Enum(rbx_types::Enum::from_u32(*e)),
         PropValue::Vector2([x, y]) => Variant::Vector2(rbx_types::Vector2::new(*x, *y)),
         PropValue::Vector3([x, y, z]) => Variant::Vector3(rbx_types::Vector3::new(*x, *y, *z)),
         PropValue::Color3([r, g, b]) => Variant::Color3(rbx_types::Color3::new(*r, *g, *b)),

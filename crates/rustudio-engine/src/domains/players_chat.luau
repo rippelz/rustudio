@@ -356,6 +356,38 @@ local function source_of(ch, uid)
 	end
 end
 
+-- The default PrefixText: the sender's DisplayName and a colon in its name
+-- colour, its team's colour on a team, else the colour its Name hashes to
+-- (RobloxPlayer formats it with `<font color="#{}">{}</font>`; the palette
+-- and hash are the CoreScripts' ChatUIPrimitives computeNameColor, which
+-- matches the colours the Roblox client's chat draws names in).
+local NAME_COLORS = {
+	Color3.new(253 / 255, 41 / 255, 67 / 255),
+	Color3.new(1 / 255, 162 / 255, 1),
+	Color3.new(2 / 255, 184 / 255, 87 / 255),
+	BrickColor.new("Alder").Color,
+	BrickColor.new("Bright orange").Color,
+	BrickColor.new("Bright yellow").Color,
+	BrickColor.new("Light reddish violet").Color,
+	BrickColor.new("Brick yellow").Color,
+}
+local function name_color(player)
+	if player.Team ~= nil then return player.TeamColor.Color end
+	local name, sum = player.Name, 0
+	for i = 1, #name do
+		local b = string.byte(name, i)
+		local n = #name - i + 1
+		if #name % 2 == 1 then n -= 1 end
+		if n % 4 >= 2 then b = -b end
+		sum += b
+	end
+	return NAME_COLORS[sum % #NAME_COLORS + 1]
+end
+local function name_prefix(player)
+	if not player then return "" end
+	return string.format('<font color="#%s">%s:</font>', name_color(player):ToHex(), player.DisplayName)
+end
+
 local function new_message(fields)
 	local m = R.create("TextChatMessage")
 	local t = props(m)
@@ -419,7 +451,9 @@ local function view_line(m)
 	view.seq += 1
 	table.insert(view.lines, {
 		id = view.seq,
-		prefix = t.PrefixText or "",
+		-- (rustudio's own chat colours the name itself: the prefix's rich
+		-- text tags, `name_prefix`'s font colour among them, come off)
+		prefix = (string.gsub(t.PrefixText or "", "<[^>]*>", "")),
 		text = t.Text or "",
 		system = src == nil,
 		name_color = color,
@@ -489,7 +523,7 @@ M.SendAsync = function(self, text, metadata)
 		Status = STATUS.Sending,
 		MessageId = tostring(lp and lp.UserId or 0) .. "-" .. svc.HttpService:GenerateGUID(true),
 		Metadata = metadata ~= nil and tostring(metadata) or "",
-		PrefixText = lp and (lp.DisplayName .. ":") or "",
+		PrefixText = name_prefix(lp),
 	})
 	if src == nil or not src.CanSend then
 		props(m).Status = STATUS.Floodchecked
@@ -626,7 +660,7 @@ function __rs_pc_client_receive(channel, sender_id, text, metadata, id)
 		Status = STATUS.Success,
 		MessageId = id,
 		Metadata = metadata,
-		PrefixText = sender and (sender.DisplayName .. ":") or "",
+		PrefixText = name_prefix(sender),
 	})
 	run_incoming(m)
 	R.fire(channel, "MessageReceived", m)
@@ -694,31 +728,38 @@ local function server_setup()
 		folder.Parent = svc.TextChatService
 	end
 end
-local sourced = setmetatable({}, { __mode = "k" })
+-- The UserIds whose TextSources were made. A player who left is told by
+-- its id missing from GetPlayers, never through its Player: the host can
+-- remove that Player from this DataModel outright (no Destroy), and touching
+-- it would raise every frame.
+local sourced = {}
 local function server_sources()
 	if not set_up or not svc.TextChatService.CreateDefaultTextChannels then return end
 	local folder = svc.TextChatService:FindFirstChild("TextChannels")
 	if not folder then return end
+	local present = {}
 	for _, p in svc.Players:GetPlayers() do
-		if not sourced[p] then
-			sourced[p] = true
+		local uid = p.UserId
+		present[uid] = true
+		if not sourced[uid] then
+			sourced[uid] = true
 			for _, n in { "RBXSystem", "RBXGeneral" } do
 				local ch = folder:FindFirstChild(n)
-				if ch and not source_of(ch, p.UserId) then
+				if ch and not source_of(ch, uid) then
 					local s = R.create("TextSource")
 					s.Name = p.Name
-					__rs_set_raw(s, "UserId", p.UserId)
+					__rs_set_raw(s, "UserId", uid)
 					s.CanSend = n == "RBXGeneral"
 					s.Parent = ch
 				end
 			end
 		end
 	end
-	for p in sourced do
-		if p.Parent == nil then
-			sourced[p] = nil
+	for uid in sourced do
+		if not present[uid] then
+			sourced[uid] = nil
 			for _, ch in folder:GetChildren() do
-				local s = ch:IsA("TextChannel") and source_of(ch, p.UserId)
+				local s = ch:IsA("TextChannel") and source_of(ch, uid)
 				if s then s:Destroy() end
 			end
 		end

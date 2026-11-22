@@ -97,6 +97,7 @@ pub const METHODS: &[(&str, &str)] = &[
     ("RemoveTargetLocale", "LocalizationTable"),
     ("FormatByKey", "Translator"),
     ("Translate", "Translator"),
+    ("RobloxOnlyTranslate", "Translator"),
     ("GetTableEntries", "LocalizationService"),
     ("GetCorescriptLocalizations", "LocalizationService"),
 ];
@@ -1145,4 +1146,58 @@ pub fn chat_view(lua: &Lua) -> Option<ChatView> {
         });
     }
     Some(ChatView { tcs: tcs_on, lines, bubbles, window, bubble })
+}
+
+#[cfg(test)]
+mod tests {
+    use rbx_dom_weak::types::{Enum, Variant};
+    use rbx_dom_weak::InstanceBuilder;
+    use rustudio_core::doc::Document;
+    use rustudio_core::log::Level;
+
+    use crate::runtime::*;
+
+    /// The host can remove a Player that left from the server side's
+    /// DataModel outright (no Destroy, no Lua). The server's chat step still
+    /// drops that player's TextSources, without touching the removed Player
+    /// (before: "attempt to use an Instance that no longer exists" every
+    /// frame).
+    #[test]
+    fn chat_sources_of_a_removed_player_go_without_errors() {
+        let mut d = Document::new_place();
+        let root = d.dom.root_ref();
+        let players = d.find_child(root, "Players").unwrap_or_else(|| d.dom.insert(root, InstanceBuilder::new("Players").with_name("Players")));
+        let player = d.dom.insert(
+            players,
+            InstanceBuilder::new("Player").with_name("Leaver").with_property("UserId", Variant::Int64(42)),
+        );
+        let tcs = d
+            .find_child(root, "TextChatService")
+            .unwrap_or_else(|| d.dom.insert(root, InstanceBuilder::new("TextChatService").with_name("TextChatService")));
+        if let Some(i) = d.dom.get_by_ref_mut(tcs) {
+            i.properties.insert("ChatVersion".into(), Variant::Enum(Enum::from_u32(1)));
+            i.properties.insert("CreateDefaultTextChannels".into(), Variant::Bool(true));
+        }
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Play);
+        w.side = Side::Server;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        for _ in 0..5 {
+            rt.step(1.0 / 60.0);
+        }
+        let sources = |rt: &Runtime| {
+            let w = rt.world_mut().unwrap();
+            let d = w.d();
+            d.dom.descendants().filter(|i| i.class == "TextSource").count()
+        };
+        assert_eq!(sources(&rt), 2, "RBXSystem and RBXGeneral sources for the player");
+        rt.world_mut().unwrap().dm().dom.destroy(player);
+        for _ in 0..5 {
+            rt.step(1.0 / 60.0);
+        }
+        assert_eq!(sources(&rt), 0);
+        let out = rt.leave().output;
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+    }
 }

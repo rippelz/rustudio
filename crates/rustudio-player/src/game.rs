@@ -89,9 +89,11 @@ pub struct Game {
     /// Bumped whenever a downloaded asset arrives (parts waiting on one are redone).
     pub asset_gen: u64,
     pub draws_asset_gen: u64,
-    /// matpack::generation() and wrap::generation() last seen.
+    /// matpack::generation(), wrap::generation() and
+    /// skin::base_generation() last seen.
     pub material_gen: u64,
     pub wrap_gen: u64,
+    pub skin_gen: u64,
     /// Uploaded layered-clothing pieces: (fitting, piece) → (mesh, centre, extent).
     pub wrap_meshes: HashMap<(usize, usize), (u32, glam::Vec3, glam::Vec3)>,
     /// Fitting failures already reported.
@@ -199,6 +201,7 @@ impl Game {
             draws_asset_gen: 0,
             material_gen: 0,
             wrap_gen: 0,
+            skin_gen: 0,
             wrap_meshes: HashMap::new(),
             wrap_warned: Default::default(),
             terrain_tris: 0,
@@ -287,7 +290,11 @@ impl Game {
                     )
                 })
             });
-            if esc {
+            // With Roblox's CoreScripts running (core_scripts.rs) their own
+            // menu, hotbar and chat take the keys, Escape included; rustudio's
+            // stand-ins stay out of the way.
+            let core_ui = rustudio_core::rustudio_settings::core_scripts();
+            if esc && !core_ui {
                 self.toggle_game_menu();
             }
             // Presses this frame: a tap pressed and released within one frame
@@ -304,7 +311,7 @@ impl Game {
                             pressed: true,
                             repeat: false,
                             ..
-                        } if physical_key.unwrap_or(*key) != Key::Escape => {
+                        } if core_ui || physical_key.unwrap_or(*key) != Key::Escape => {
                             Some(physical_key.unwrap_or(*key))
                         }
                         _ => None,
@@ -316,7 +323,7 @@ impl Game {
                 // (A focused TextBox has them: game-processed, Enter included.)
                 let processed = self.gui.focus.is_some();
                 if let Some(s) = self.play.as_mut() {
-                    if !processed {
+                    if !processed && !core_ui {
                         s.game.hotbar_taps.extend(taps.iter().copied());
                     }
                     s.game.key_taps.extend(taps.into_iter().map(|k| (k, processed)));
@@ -409,7 +416,9 @@ impl Game {
             self.assets.wait_pending(std::time::Duration::from_secs(60));
         }
         let done = self.assets.poll();
-        if self.textures.poll_decoded() {
+        // (finished decodes, composites and mesh parses from the workers:
+        // the parts waiting on them are redone)
+        if self.textures.poll_decoded() | self.meshes.poll() {
             self.asset_gen += 1;
         }
         if rustudio_core::load_trace::on() {
@@ -433,6 +442,11 @@ impl Game {
         let wrap_gen = rustudio_render::wrap::generation();
         if wrap_gen != self.wrap_gen {
             self.wrap_gen = wrap_gen;
+            self.asset_gen += 1;
+        }
+        let skin_gen = rustudio_render::skin::base_generation();
+        if skin_gen != self.skin_gen {
+            self.skin_gen = skin_gen;
             self.asset_gen += 1;
         }
         for msg in std::mem::take(&mut self.assets.messages) {

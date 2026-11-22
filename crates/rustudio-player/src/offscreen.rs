@@ -153,7 +153,7 @@ pub fn run<A: eframe::App>(
             v.monitor_size = Some(egui::vec2(size[0] as f32, size[1] as f32));
         }
         app.raw_input_hook(&ctx, &mut raw);
-        let out = ctx.run_ui(raw, |ui| {
+        let mut out = ctx.run_ui(raw, |ui| {
             draw(&mut app, ui);
             // RawInput defaults to a 2048 atlas offscreen. Keep its packing
             // for small scenes, but grow to the device limit when epaint
@@ -183,6 +183,9 @@ pub fn run<A: eframe::App>(
         if let (Some(rs), Some(t)) = (rs.as_ref(), frame.as_ref()) {
             let jobs = ctx.tessellate(out.shapes, ppp);
             let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: size, pixels_per_point: ppp };
+            // (egui shows the viewport texture the frame drew: its commands
+            // are submitted first)
+            rustudio_render::render_thread::wait();
             let mut renderer = rs.renderer.write();
             for (id, deltas) in &out.textures_delta.set {
                 for delta in deltas {
@@ -207,7 +210,7 @@ pub fn run<A: eframe::App>(
                 });
                 renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
             }
-            rustudio_render::gpu_timing::submit(&rs.device, &rs.queue, "gpu: egui (offscreen)", extra.into_iter().chain([enc.finish()]));
+            rustudio_render::gpu_timing::submit_finished(&rs.device, &rs.queue, "gpu: egui (offscreen)", extra.into_iter().chain([enc.finish()]));
             for id in &out.textures_delta.free {
                 renderer.free_texture(id);
             }
@@ -235,6 +238,9 @@ pub fn run<A: eframe::App>(
                 });
             }
         }
+        // (applied above, or nothing to apply them to: epaint's debug
+        // build asserts a dropped delta was handled)
+        out.textures_delta.clear();
         if close {
             app.on_exit();
             return 0;
@@ -262,6 +268,13 @@ pub fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
     egui_wgpu::WgpuConfiguration {
         wgpu_setup: {
             let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+            // wgpu's build-config flags turn the Khronos validation layer on
+            // in every debug-assertions build (the dev profile): it checked
+            // every GPU call on the render thread and tore the device down
+            // under it at exit (a SIGSEGV in libVkLayer_khronos_validation
+            // while the render thread freed a buffer, a coredump's stack).
+            // WGPU_VALIDATION=1 / WGPU_DEBUG=1 still turn them on.
+            setup.instance_descriptor.flags = egui_wgpu::wgpu::InstanceFlags::empty().with_env();
             let descriptor = setup.device_descriptor.clone();
             // A real GPU before a software one, a native API before
             // OpenGL (gpu_caps::rank_adapters): on Windows an HD 4600's GL

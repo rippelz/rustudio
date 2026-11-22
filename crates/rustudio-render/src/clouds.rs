@@ -661,17 +661,21 @@ impl CloudsGpu {
         p.draw(0..3, 0..1);
     }
 
-    /// After the frame's submit: start mapping the sun cover copied this frame.
-    pub fn after_submit(&mut self) {
-        if self.readback == 1 {
-            self.readback = 2;
-            self.mapped.store(0, Ordering::Release);
-            let m = self.mapped.clone();
-            self.cover_buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+    /// The frame is recorded: what starts mapping the sun cover copied this
+    /// frame, to run once that frame is submitted (on the render thread).
+    pub fn after_submit(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.active = false;
+        if self.readback != 1 {
+            return None;
+        }
+        self.readback = 2;
+        self.mapped.store(0, Ordering::Release);
+        let (m, buf) = (self.mapped.clone(), self.cover_buf.clone());
+        Some(Box::new(move || {
+            buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
                 m.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release);
             });
-        }
-        self.active = false;
+        }))
     }
 
     /// No clouds this frame: forget the cover.

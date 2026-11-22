@@ -27,6 +27,7 @@ use rbx_reflection::{DataType, PropertyKind, PropertyTag, Scriptability};
 use rustudio_core::log::Level;
 use rustudio_core::doc::{self, Document};
 use crate::ltypes::*;
+use self::domains::world::part::EnterPose;
 use rustudio_core::math::Xform;
 use rustudio_core::mech;
 
@@ -194,6 +195,11 @@ pub struct World {
     /// dresses those models with its clothing, face and accessories).
     pub avatar: Option<crate::avatar::AvatarLook>,
     pub avatar_descs: HashSet<Ref>,
+    /// AvatarEditorService:BustAvatarFetchCache was called: the host fetches
+    /// the avatar again (the next character and `avatar` get the new one).
+    pub avatar_fetch_busted: bool,
+    /// DataModel:Shutdown (the menu's Leave): the host ends the session.
+    pub shutdown_requested: bool,
     /// Instances with at least one connection or waiter (fires on others are dropped early).
     pub listening: rustc_hash::FxHashSet<Ref>,
     /// Instances something ever connected to (or waited on) for a touch event
@@ -260,6 +266,13 @@ pub struct World {
     /// ones or freed any (`Runtime::gc_step` works faster then).
     pub orphans_seen: usize,
     pub gc_busy: bool,
+    /// Where in the watched list the collector's next pass starts (each pass
+    /// stops at its budget, mech::GC_PASS_MS, and the next goes on from there).
+    pub gc_cursor: usize,
+    /// Roblox's CoreScripts and CorePackages put in this DataModel
+    /// (`Runtime::install_core_scripts`): the modules' bytecode by instance
+    /// and the CoreScripts by name.
+    pub core_scripts: rustudio_core::core_scripts::Installed,
 }
 
 impl World {
@@ -664,6 +677,8 @@ impl World {
             groups: rustudio_core::collision_groups::shared(),
             avatar: None,
             avatar_descs: HashSet::new(),
+            avatar_fetch_busted: false,
+            shutdown_requested: false,
             listening: Default::default(),
             touch_refs: Default::default(),
             touch_rev: 0,
@@ -681,6 +696,8 @@ impl World {
             abs_all: true,
             orphans_seen: 0,
             gc_busy: true,
+            gc_cursor: 0,
+            core_scripts: Default::default(),
             requests: Default::default(),
             input: Default::default(),
             started: HashSet::new(),
@@ -1199,6 +1216,19 @@ fn bad_assign(prop: &str, expected: &str, got: &Value) -> mlua::Error {
     ))
 }
 
+/// A Lua string as text for a property, attribute or name. Roblox takes
+/// any bytes there (a script's `string.sub` can cut a name mid-character);
+/// rustudio's properties hold UTF-8, so the bytes that aren't are left out
+/// (estimate: what is read back never grows past what was set, so a
+/// shorten-until-it-fits loop still ends).
+pub fn lua_text(s: &mlua::String) -> String {
+    let b = s.as_bytes();
+    match std::str::from_utf8(&b) {
+        Ok(t) => t.to_owned(),
+        Err(_) => b.utf8_chunks().map(|c| c.valid()).collect(),
+    }
+}
+
 /// Converts a Lua value to a property's type. `existing` keeps the stored
 /// representation (Color3uint8 vs Color3).
 fn lua_to_variant(
@@ -1228,20 +1258,20 @@ fn lua_to_variant(
         VariantType::Float32 => Variant::Float32(number()? as f32),
         VariantType::Float64 => Variant::Float64(number()?),
         VariantType::String => match v {
-            Value::String(s) => Variant::String(s.to_str()?.to_string()),
+            Value::String(s) => Variant::String(lua_text(s)),
             Value::Number(n) => Variant::String(n.to_string()),
             Value::Integer(n) => Variant::String(n.to_string()),
             _ => return Err(bad_assign(prop, "string", v)),
         },
         VariantType::ContentId => match v {
-            Value::String(s) => Variant::ContentId(ContentId::from(s.to_str()?.to_string())),
+            Value::String(s) => Variant::ContentId(ContentId::from(lua_text(s))),
             Value::UserData(_) if opt_ud::<editable::LContent>(v).is_some() => Variant::ContentId(ContentId::from(
                 opt_ud::<editable::LContent>(v).and_then(|c| c.0.as_uri().map(str::to_string)).unwrap_or_default(),
             )),
             _ => return Err(bad_assign(prop, "string", v)),
         },
         VariantType::Content => match v {
-            Value::String(s) => Variant::Content(Content::from(s.to_str()?.to_string())),
+            Value::String(s) => Variant::Content(Content::from(lua_text(s))),
             Value::Nil => Variant::Content(Content::none()),
             Value::UserData(_) if opt_ud::<editable::LContent>(v).is_some() => {
                 opt_ud::<editable::LContent>(v).map(|c| c.variant()).unwrap_or(Variant::Content(Content::none()))
@@ -1347,7 +1377,7 @@ fn inst_meta(lua: &Lua, r: Ref) -> mlua::Result<(String, String, Ref)> {
         .d()
         .dom
         .get_by_ref(r)
-        .ok_or_else(|| rt_err("attempt to use an Instance that no longer exists"))?;
+        .ok_or_else(gone_err)?;
     Ok((i.class.to_string(), i.name.clone(), i.parent()))
 }
 
@@ -1358,8 +1388,12 @@ pub fn inst_class(lua: &Lua, r: Ref) -> mlua::Result<(rbx_dom_weak::Ustr, Ref)> 
         .d()
         .dom
         .get_by_ref(r)
-        .ok_or_else(|| rt_err("attempt to use an Instance that no longer exists"))?;
+        .ok_or_else(gone_err)?;
     Ok((i.class, i.parent()))
+}
+
+fn gone_err() -> mlua::Error {
+    rt_err("attempt to use an Instance that no longer exists")
 }
 
 /// What `inst.key` is for a class, as far as it depends only on the class:
@@ -1770,7 +1804,7 @@ fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv
             .d()
             .dom
             .get_by_ref(r)
-            .ok_or_else(|| rt_err("attempt to use an Instance that no longer exists"))?;
+            .ok_or_else(gone_err)?;
         let class_u = i.class;
         let rt = routes::route(class_u, key, atom);
         let got = if rt.child_only {
@@ -2646,10 +2680,10 @@ fn prop_get_plain(
 }
 
 pub fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
-    set_parent_opts(lua, r, new_parent, true, true)
+    set_parent_opts(lua, r, new_parent, true, true, EnterPose::Full)
 }
 
-fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scripts: bool) -> mlua::Result<()> {
+fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scripts: bool, pose: EnterPose) -> mlua::Result<()> {
     let (old, descendants, lost, snaps, enters_ws, stopped, gripped) = {
         let mut w = world(lua)?;
         let old = w
@@ -2724,6 +2758,7 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scr
         }
         let descendants: Vec<Ref> = w.d().dom.descendants_of(r).map(|i| i.referent()).collect();
         let snaps = if enters_ws {
+            let _s = rustudio_core::bench::scope("sp_weld_snaps");
             let (snaps, activated) = weld_snaps(w.d(), r);
             for (weld, rel) in activated {
                 set_weld_offset(w.dm(), weld, Some(rel));
@@ -2752,11 +2787,15 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scr
         store_prop(lua, part, "CFrame", Variant::CFrame(xf.to_cframe()))?;
     }
     if enters_ws {
+        let _s = rustudio_core::bench::scope("sp_enter_pose");
         let mut w = world(lua)?;
-        let moves = domains::world::part::entering_joint_moves(w.d(), &descendants);
+        let moves = domains::world::part::entering_joint_moves(w.d(), &descendants, pose);
         apply_assembly_pose(&mut w, moves);
     }
-    fire_parent_signals(lua, r, old, new_parent, descendants)?;
+    {
+        let _s = rustudio_core::bench::scope("sp_signals");
+        fire_parent_signals(lua, r, old, new_parent, descendants)?;
+    }
     // After the hierarchy signals (Studio: an AncestryChanged handler on the Tool still
     // reads CanCollide true; EquipTool has returned with it false): the queued
     // Immediate fires run first.
@@ -3479,6 +3518,14 @@ fn set_attr(lua: &Lua, r: Ref, name: &str, var: Option<Variant>) -> mlua::Result
     Ok(())
 }
 
+/// Whether `key` is a callback of `r`'s class in the API dump.
+fn api_callback(lua: &Lua, r: Ref, key: &str) -> bool {
+    let Some(class) = world(lua).ok().and_then(|w| w.d().class_of(r)) else { return false };
+    rustudio_core::api::get()
+        .and_then(|a| a.lookup(&class, key))
+        .is_some_and(|(_, m)| matches!(m.kind, rustudio_core::api::Kind::Callback))
+}
+
 fn set_callback(lua: &Lua, r: Ref, key: &str, value: Value) -> mlua::Result<()> {
     let mut c = cache(lua)?;
     match value {
@@ -3538,7 +3585,7 @@ fn newindex_routed(
     match key {
         "Name" => {
             let s = match &value {
-                Value::String(s) => s.to_str()?.to_string(),
+                Value::String(s) => lua_text(s),
                 Value::Number(n) => n.to_string(),
                 _ => return Err(bad_assign("Name", "string", &value)),
             };
@@ -3578,6 +3625,10 @@ fn newindex_routed(
         "OnInvoke" | "OnServerInvoke" | "OnClientInvoke" => {
             return set_callback(lua, r, key, value)
         }
+        // Any other callback member of the API dump (GuiService.
+        // SendCoreUiNotification, which NotificationScript2 assigns): kept
+        // for whatever invokes it.
+        _ if api_callback(lua, r, key) => return set_callback(lua, r, key, value),
         // Script.Enabled is Disabled turned round: places save Disabled, and
         // that is what decides whether it runs. Place B Newer's
         // MusicSystemInitializer parents ModernMusicGui and then sets its
@@ -3730,7 +3781,15 @@ fn newindex_routed(
         )));
     };
     let canon = info.canon.as_str();
-    if info.read_only {
+    // (A property rbx-dom calls read-only that the API dump lets the
+    // CoreScripts write, ScreenGui.OnTopOfCoreBlur: the security check
+    // already ran, so it takes the write.)
+    let api_writable = || {
+        rustudio_core::api::get()
+            .and_then(|a| a.lookup(class, key))
+            .is_some_and(|(_, m)| matches!(m.kind, rustudio_core::api::Kind::Property) && !m.read_only)
+    };
+    if info.read_only && !(security::current(lua) == security::CORE && api_writable()) {
         return Err(rt_err(format!(
             "Unable to assign property {key}. Property is read only"
         )));
@@ -4002,7 +4061,7 @@ fn arg_str(args: &MultiValue, i: usize, what: &str) -> mlua::Result<String> {
         // Studio's reflected string argument converts what it can
         // (GetService(true) is `'true' is not a valid Service name`,
         // GetService({}) `'{}' …`); only nil is missing.
-        Value::String(s) => Ok(s.to_str()?.to_string()),
+        Value::String(s) => Ok(lua_text(&s)),
         Value::Number(n) => Ok(n.to_string()),
         Value::Integer(n) => Ok(n.to_string()),
         Value::Boolean(b) => Ok(b.to_string()),
@@ -4383,7 +4442,7 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
         // the client still has the pair when it gets here.
         w.record(RepOp::Destroy(r));
     }
-    set_parent_opts(lua, r, Ref::none(), true, false)?;
+    set_parent_opts(lua, r, Ref::none(), true, false, EnterPose::Full)?;
     let immediate = {
         let mut w = world(lua)?;
         if w.mode == RunMode::Edit {
@@ -4422,7 +4481,7 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
             }
             w.fire(d, "Destroying", vec![]);
             drop(w);
-            set_parent_opts(lua, d, Ref::none(), false, false)?;
+            set_parent_opts(lua, d, Ref::none(), false, false, EnterPose::Full)?;
             world(lua)?.destroyed.insert(d);
             signal_timing::flush_immediate(lua);
             order.push((d, p));
@@ -4679,7 +4738,7 @@ fn attribute_value(v: &Value) -> mlua::Result<Option<Variant>> {
         Value::Boolean(b) => Some(Variant::Bool(*b)),
         Value::Number(x) => Some(Variant::Float64(*x)),
         Value::Integer(i) => Some(Variant::Float64(*i as f64)),
-        Value::String(s) => Some(Variant::String(s.to_str()?.to_string())),
+        Value::String(s) => Some(Variant::String(lua_text(s))),
         _ => {
             if let Some(e) = opt_ud::<LEnumItem>(v) {
                 Some(Variant::EnumItem(rbx_dom_weak::types::EnumItem {
@@ -5905,6 +5964,7 @@ impl Runtime {
         g.set(
             "__rs_kfs_parts",
             lua.create_function(|lua, kfs: LInst| {
+                let _s = rustudio_core::bench::scope("anim_kfs_parts");
                 let enum_name = |v: Option<Variant>, e: &str, dflt: &str| match v {
                     Some(Variant::Enum(x)) => LEnumItem::from_value(e, x.to_u32())
                         .map(|i| i.name)
@@ -6394,6 +6454,24 @@ impl Runtime {
         }
     }
 
+    /// Takes the CoreScripts core_scripts::install put in this side's
+    /// DataModel and starts the engine's entry CoreScript, StarterScript
+    /// (core_scripts.rs), which adds the others.
+    pub fn start_core_scripts(&self, installed: rustudio_core::core_scripts::Installed) -> Result<(), String> {
+        if let Ok(mut w) = world(&self.lua) {
+            w.core_scripts = installed;
+        }
+        // Under CoreGui: StarterScript hands `script.Parent` to
+        // AddCoreScriptLocal for several CoreScripts (StarterScript.lua),
+        // while its chunk keeps the bare name Roblox reports.
+        let core_gui = world(&self.lua).ok().and_then(|w| w.d().find_child(w.d().dom.root_ref(), "CoreGui")).unwrap_or_else(Ref::none);
+        match start_core_script(&self.lua, "StarterScript", core_gui, Some("StarterScript")) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err("the data model patch has no StarterScript".into()),
+            Err(e) => Err(describe_error(&e)),
+        }
+    }
+
     /// Builds this side's world-query cache (rays, region queries) ahead of
     /// the first script query.
     pub fn warm_queries(&self) {
@@ -6550,11 +6628,19 @@ impl Runtime {
             return Vec::new();
         }
         let root = w.d().dom.root_ref();
-        let candidates: Vec<Ref> = w.orphans.iter().copied().collect();
+        let mut candidates: Vec<Ref> = w.orphans.iter().copied().collect();
+        // Each pass starts where the last one stopped (its budget), so the
+        // unparented instances scripts still hold don't take every pass.
+        let from = w.gc_cursor % candidates.len();
+        candidates.rotate_left(from);
         let mut looked = 0usize;
         let mut freed: Vec<Ref> = Vec::new();
-        for r in candidates {
-            if looked >= budget {
+        let started = Instant::now();
+        let limit = Duration::from_secs_f64(mech::GC_PASS_MS / 1000.0);
+        w.gc_cursor = 0;
+        for (k, r) in candidates.into_iter().enumerate() {
+            if looked >= budget || started.elapsed() >= limit {
+                w.gc_cursor = from + k;
                 break;
             }
             let d = w.d();
@@ -7038,7 +7124,7 @@ pub(crate) fn place_chunk_name(full_name: &str) -> String {
 
 /// Compiles a script's Source with `script` bound in its own environment.
 fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
-    let (source, name) = {
+    let (source, name, core) = {
         let w = world(lua)?;
         let src = match w.d().prop(r, "Source") {
             Some(Variant::String(s)) => s,
@@ -7046,7 +7132,7 @@ fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
         };
         // A name with a NUL in it (an Place B script) can't be a chunk
         // name; Studio runs the script all the same.
-        (src, w.full_name(r).replace('\0', ""))
+        (src, w.full_name(r).replace('\0', ""), w.core_scripts.modules.get(&r).cloned())
     };
     let memory_category=domains::assets_cloud::scene::begin(lua,r)?;
     let result=(|| {
@@ -7058,6 +7144,14 @@ fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
     let env = crate::globals_parity::new_env(lua, Some(inst_value(lua, r)?))?;
     // A Script inside a loaded plugin's tree also gets `plugin`.
     domains::script_env(lua, r, &env)?;
+    // A module from Studio's data model patch (CorePackages, RobloxGui's
+    // Modules): Roblox's own bytecode.
+    if let Some(b) = core {
+        return lua.load(&b[..]).set_mode(mlua::chunk::ChunkMode::Binary)
+            .set_name(place_chunk_name(&name))
+            .set_environment(env)
+            .into_function();
+    }
     // Big sources compile once (the other side of Play, the next run):
     // bytecode_cache.rs.
     match crate::bytecode_cache::get(&source) {
@@ -7073,6 +7167,35 @@ fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
     })();
     domains::assets_cloud::scene::restore(lua,memory_category)?;
     result
+}
+
+/// Starts the CoreScript `name` of Studio's data model patch
+/// (`PatchRoot.CoreScripts`, core_scripts.rs) as a CoreScript instance under
+/// `parent`, at the CoreScript identity. Its chunk is `=` + `chunk`, else
+/// its full name: the names Roblox reports (`StarterScript`,
+/// `CoreGui.RobloxGui.CoreScripts/<Name>`) and security::internal_chunk
+/// knows. None when the patch has no such script.
+pub(crate) fn start_core_script(lua: &Lua, name: &str, parent: Ref, chunk: Option<&str>) -> mlua::Result<Option<Ref>> {
+    let (r, code, full) = {
+        let mut w = world(lua)?;
+        let Some(code) = w.core_scripts.scripts.get(name).cloned() else { return Ok(None) };
+        let r = w.dm().dom.insert(parent, InstanceBuilder::new("CoreScript").with_name(name));
+        if parent.is_none() {
+            w.orphans.insert(r);
+        } else {
+            w.dm().mark_tree(r);
+        }
+        w.structure_changed = true;
+        w.started.insert(r);
+        let full = chunk.map(str::to_string).unwrap_or_else(|| w.full_name(r));
+        (r, code, full)
+    };
+    let env = crate::globals_parity::new_env(lua, Some(inst_value(lua, r)?))?;
+    let f = lua.load(&code[..]).set_mode(mlua::chunk::ChunkMode::Binary).set_name(format!("={full}")).set_environment(env).into_function()?;
+    let th = domains::assets_cloud::scene::create_thread(lua, f)?;
+    security::set(&th, security::CORE);
+    resume(lua, &th, vec![]);
+    Ok(Some(r))
 }
 
 // ------------------------------------------------------- client ↔ server
@@ -7525,6 +7648,15 @@ impl Runtime {
         }
     }
 
+    /// [`Runtime::apply_parent`] for replication: what enters the Workspace
+    /// was posed by its sender, so only its new parts are posed against the
+    /// parts already here (`EnterPose::Replicated`).
+    pub fn apply_parent_replicated(&self, r: Ref, parent: Ref) {
+        if let Err(e) = set_parent_opts(&self.lua, r, parent, true, true, EnterPose::Replicated) {
+            report(&self.lua, &e);
+        }
+    }
+
     /// A property the editor (or undo, Team Create, a file sync) changed
     /// outside Lua, already in the document: Changed (a ValueBase's new
     /// value for Value) and its GetPropertyChangedSignal fire, as for a
@@ -7618,6 +7750,75 @@ mod tests {
             rt.step(1.0 / 60.0);
         }
         rt.leave().output
+    }
+
+    /// Text cut mid-character by `string.sub` (a display name shortened to
+    /// fit) is taken where Roblox takes any bytes: the whole characters stay.
+    #[test]
+    fn properties_names_and_attributes_take_non_utf8_strings() {
+        let out = run(r#"
+            local bad = "abcdef\xE2\x80" .. "..."
+            local f = Instance.new("Folder", workspace)
+            local v = Instance.new("StringValue", f)
+            v.Value = bad
+            v.Name = bad
+            f:SetAttribute("a", bad)
+            print("utf8", v.Value, v.Name, f:GetAttribute("a"), f:FindFirstChild(bad) == v)
+        "#);
+        assert!(out.iter().any(|(_, t)| t.starts_with("utf8 abcdef... abcdef... abcdef... true")), "{out:?}");
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+    }
+
+    /// What the CoreScripts' voice manager and the menu's Respawn call:
+    /// AvatarChatService answers a client without voice (its engine feature
+    /// on), and BustAvatarFetchCache asks the host for the avatar again.
+    #[test]
+    fn avatar_chat_service_has_no_features_and_respawn_busts_the_avatar() {
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Play);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        let r = security::with_main_identity(&rt.lua, security::CORE, || {
+            rt.lua
+                .load(r#"
+                    local acs = game:GetService("AvatarChatService")
+                    local f = acs:GetClientFeaturesAsync()
+                    print("acs", game:GetEngineFeature("AvatarChatServiceEnabled"), f,
+                        acs:IsEnabled(f, Enum.AvatarChatServiceFeature.UserAudio),
+                        acs:IsEnabled(4 + 32, Enum.AvatarChatServiceFeature.UserAudio),
+                        acs.ClientFeaturesInitialized, acs.ClientFeatures,
+                        #game:GetService("VideoCaptureService"):GetCameraDevices())
+                    game:GetService("AvatarEditorService"):BustAvatarFetchCache()
+                "#)
+                .set_name("=core")
+                .exec()
+        });
+        assert!(r.is_ok(), "{r:?}");
+        assert!(rt.world_mut().unwrap().avatar_fetch_busted);
+        let out = rt.leave().output;
+        assert!(out.iter().any(|(_, t)| t.starts_with("acs true 0 false true true 0 0")), "{out:?}");
+    }
+
+    /// The CoreScripts menu's Leave calls DataModel:Shutdown (LocalUser
+    /// security): it asks the host to end the session; a game script can't.
+    #[test]
+    fn menu_leave_shutdown_asks_the_host_to_end_play() {
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Play);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        let game = security::with_main_identity(&rt.lua, security::GAME, || {
+            rt.lua.load("game:Shutdown()").set_name("=game").exec()
+        });
+        assert!(game.is_err());
+        assert!(!rt.world_mut().unwrap().shutdown_requested);
+        let core = security::with_main_identity(&rt.lua, security::CORE, || {
+            rt.lua.load("game:Shutdown()").set_name("=core").exec()
+        });
+        assert!(core.is_ok(), "{core:?}");
+        assert!(rt.world_mut().unwrap().shutdown_requested);
     }
 
     #[test]

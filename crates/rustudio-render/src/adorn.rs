@@ -521,7 +521,8 @@ impl AdornPass {
                 pass.draw_indexed(0..mesh.indices, 0, idx as u32..(idx as u32 + 1));
             }
         }
-        queue.submit(Some(enc.finish()));
+        // (after the frame's own commands, in order: render_thread.rs)
+        crate::render_thread::perform(queue, vec![enc], None);
     }
 }
 

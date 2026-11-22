@@ -231,7 +231,7 @@ impl ProbeGpu {
             }
         }
         self.flush(queue);
-        crate::gpu_timing::submit(device, queue, "gpu: env probe default", [encoder.finish()]);
+        crate::gpu_timing::submit(device, queue, "gpu: env probe default", [encoder]);
     }
 
     /// After a face is drawn into face_msaa (resolved to face_resolve):

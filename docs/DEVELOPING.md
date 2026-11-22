@@ -27,6 +27,9 @@ rustudio place.rbxl --play --from-play --shots 5 --screenshot t.png \
 rustudio --write-corpus tools/fidelity/corpus   # regenerate the demo / control places
 cargo test --workspace           # unit tests (undo/redo, files, Luau runtime, physics, meshes, FBX, GUI, PKCE)
 ```
+`RUSTUDIO_CORE_SCRIPTS=1` runs Roblox's own CoreScripts in Play's client, from
+Studio's `ExtraContent/models/DataModelPatch/DataModelPatch.rbxm`
+(crates/rustudio-core/src/core_scripts.rs; experimental, docs/ENGINE-GAPS.md);
 `RUSTUDIO_GUI_DEBUG=1` logs GUI clicks and remote calls to Output;
 `RUSTUDIO_NO_GUI=1` hides every GUI (to tell GUI from 3D in a picture).
 

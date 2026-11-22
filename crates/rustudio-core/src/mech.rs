@@ -366,10 +366,15 @@ pub const PENDING_MAX: usize = 4096; // ...or as soon as this many are waiting
 pub const DYNAMIC_SETTLE_S: f32 = 5.0; // a per-frame part this long without changes rejoins the static batches
 pub const STATIC_REBUILD_MIN_S: f32 = 3.0; // static rebuilds (a full re-sort + upload) at most this often
 pub const DEPTH_BIAS_STEP: f32 = 4e-7; // per-part relative depth nudge (16 steps) against coplanar flicker
+pub const DRAW_SYNC_BUDGET_MS: f32 = 4.0; // the viewport resolves changed parts' draws (meshes, textures, clothing, decals, uploads) for at most this long a frame; the rest wait for the next (estimated: characters arriving with their meshes and clothing took tens of ms of one frame; a whole new scene is resolved at once)
+pub const ANIM_LOAD_BUDGET_MS: f64 = 4.0; // an Animator step loads (parses) new clips until this much is spent; tracks of the rest load next step, Length 0 meanwhile, as Roblox's clips load asynchronously (estimated: a character's dozen clips took hundreds of ms of one frame)
 pub const PHYSICS_SERIAL_MAX_AWAKE: usize = 512; // awake bodies up to which a world step runs on the stepping thread instead of rapier's rayon pool (fan-out costs more than it saves on small active sets). the NPC test place, 205 awake NPC bodies, release, load ~19: 2.5 ms of physics per frame on one thread against 4.6-7.7 ms on the pool
-pub const MAX_PHYSICS_STEPS: usize = 16; // 240 Hz world steps per frame at most = MAX_FRAME_DT × 240: Studio caps the game step at 1/15 s, slower frames slow the simulation instead of piling up
+pub const MAX_PHYSICS_STEPS: usize = 12; // 240 Hz world steps per frame at most (Studio 0.746 `World::updateStepsRequiredForCyclicExecutive` 0x100309f1e: min(floor(240·dt + carry), max(DFInt::MaxMissedWorldStepsRemembered, 12)), the flag 12 in `__GLOBAL__sub_I_World.cpp`; the same 12 in 0.255 per roblox-rs docs/DESIGN.md, Apache-2.0): slower frames slow the simulation instead of piling up
+pub const THROTTLED_MAX_PHYSICS_STEPS: usize = 4; // world steps per frame at most while the environmental throttle steps 40 % of frames or fewer (Studio 0.746, same function: the constant 4.0 at 0x108f46dc4 replaces the cap when the throttle's stepped fraction ≤ 0.4)
+pub const PHYSICS_CARRY_MAX_STEPS: f32 = 3.99999; // world steps of elapsed time a frame leaves for the next at most; the rest is dropped (Studio 0.746, same function: the carry is min(remainder, 3.99999 at 0x108f4bd38); 0.255 kept 1.99999 per roblox-rs docs/DESIGN.md)
 pub const PHYSICS_LENGTH_UNIT: f32 = 5.0; // rapier length scale in studs (sleep thresholds, contact tolerances) (estimated)
 pub const MAX_FRAME_DT: f32 = 1.0 / 15.0; // Play's game step per frame at most (Studio 0.746: PreAnimation dt and DistributedGameTime stop at 0.0667 s however long the frame; waits keep wall time)
+pub const PLAY_INPUT_POSE_WAIT_MS: f32 = 6.0; // after input, the display waits at most this long for the gameplay step carrying its RenderStepped pose; a slower step shows the last frame and lands on the next one (estimated: a 60 Hz frame's 16.7 ms less the main thread's own work)
 pub const SCRIPT_FRAME_BUDGET_MS: f64 = 6.0; // per side: waiting scripts past this resume next frame (estimated)
 pub const BENCH_TURN_DEG_PER_S: f32 = 36.0; // edit-mode benchmark camera turn rate
 pub const BODY_MOVER_P_SCALE: f32 = 1.0; // legacy BodyMover P/D read as force (torque) per stud (radian) and per stud/s (rad/s) (estimated)
@@ -507,6 +512,11 @@ pub const FX_LIGHT_CLAMP: f32 = 4.5; // an effect's linear light is held to this
 pub const GUI_TOP_INSET: f32 = 58.0; // GuiService:GetGuiInset() in Studio's Play (Studio, 863x675 view): ScreenGuis without IgnoreGuiInset start this far down
 pub const GUI_FONT_EM_PER_TEXT_SIZE: f32 = 1.04; // font em = TextSize × this / (line height per em): a line is TextSize tall; the 1.04 matches TextService widths ("START GAME" in Oswald 14/18/24/32 → 46/58/78/104 px in Studio)
 pub const GUI_LEGACY_TEXT_SCALE: f32 = 1.5; // Font.Legacy (Arimo) is drawn at TextSize x this: a default TextLabel (Legacy 8) in Studio 0.747 draws "row 1" 26 px wide, 8 px tall (checks/plugins/widgets/captures/studio-wleft.png), Arimo at TextSize 12; other sizes not measured
+pub const GUI_MESSAGE_FILL: [f32; 4] = [0.5, 0.5, 0.5, 0.5]; // a Message's full-screen box, RGBA (Studio 0.747 Message::renderFullScreen: Adorn::rect2d over the whole view in Color4 (0.5, 0.5, 0.5, 0.5); a black sky reads 64,64,64 under it in the Roblox client)
+pub const GUI_MESSAGE_TEXT_SIZE: f32 = 14.0; // Message / Hint text: Font Legacy at this size, white, centred (Studio 0.747 Message::renderFullScreen / Hint::render2d: setPropsForLegacyAdornDraw2DTextCall(size 14, Legacy, XAlign centre, YAlign centre); a Message adds a black stroke, a Hint none)
+pub const GUI_MIN_FONT_SIZE: f32 = 0.01; // a text size of 0 or NaN (TextSize 0, TextScaled in a 0-tall box) is laid out at this size: Roblox draws nothing, and epaint refuses 0 (estimated; anything this small draws no visible glyph)
+pub const GUI_HINT_HEIGHT: f32 = 20.0; // a Hint's bar: opaque black, this many px from the top of the view, full width (Studio 0.747 Hint::render2d)
+pub const GUI_TEXT_STROKE_OVERLAP: f32 = 3.0; // a text outline is eight offset copies of the glyphs, which overlap about this deep around the ink: each copy takes the alpha that this many copies add up to the stroke's (estimated; at 1 deep ExpChat's TextStrokeTransparency 0.5 drew a near-opaque black outline where the Roblox client's is faint, compared with a screenshot of its chat)
 pub const GUI_BUTTON_HOVER_DARKEN: f32 = 0.3; // AutoButtonColor: background darkened this much under the mouse (estimated)
 pub const GUI_BUTTON_PRESS_DARKEN: f32 = 0.5; // ... and while pressed (estimated)
 pub const GUI_SELECTION_RGB: [u8; 3] = [0, 162, 255]; // GuiService.SelectedObject outline (estimated)
@@ -896,6 +906,7 @@ pub const HUMANOID_AIR_ACCEL: f32 = 143.0;
 // Instance collector (crates/rustudio-engine/src/runtime.rs Runtime::collect, src/play.rs collect_garbage).
 pub const GC_INTERVAL: f64 = 0.5; // seconds of Play between collector passes
 pub const GC_BUDGET: usize = 20_000; // unparented instances looked at per pass and side
+pub const GC_PASS_MS: f64 = 4.0; // wall time a collector pass may take per side; the next pass (GC_INTERVAL later) goes on where it stopped (estimated: Roblox frees instances incrementally, its LuauGc job per-frame bounded)
 pub const GC_CYCLE_PASSES: usize = 2; // collector passes a Luau GC cycle is stepped over (each steps heap / this KB; keeps weak instance values clearing on quiet scripts)
 pub const GC_STEP_MIN_KB: usize = 256; // least Luau GC work per collector pass
 pub const GC_STEP_MAX_KB: usize = 16 * 1024; // most Luau GC work per collector pass (bounds the pass's time on huge heaps)
@@ -980,6 +991,11 @@ pub const GRASS_NEAR_SAMPLE_POINTS: [[f32; 2]; 32] = [
 /// A panel window (src/panels.rs) eframe couldn't show this many frames in
 /// a row is docked back into the main window (app.rs panel_windows).
 pub const PANEL_WINDOW_MAX_FAILS: u32 = 30;
+
+// Asset work off the render path (crates/rustudio-core/src/asset_work.rs, assets.rs MeshCache).
+pub const ASSET_WORK_THREADS: usize = 4; // most asset worker threads (half the cores, at least one; estimated)
+pub const MESH_UPLOAD_BUDGET_BYTES: usize = 8 << 20; // parsed mesh bytes uploaded per frame before the rest wait a frame (estimated: an R15 body part is ~0.1 MB; Roblox's render thread allows 128 MiB / 500 ms per call, DFInt::RenderMeshBulkUpload*, but there it doesn't stall the frame's gameplay)
+pub const MESH_UPLOAD_BUDGET_MS: f32 = 3.0; // mesh upload time per frame before the rest wait a frame (estimated; textures keep their 6 ms, Roblox's FInt::RenderTextureProcessingBudgetMilliseconds is 4)
 
 // --------------------------------------------------- physical properties
 

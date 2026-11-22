@@ -2284,8 +2284,11 @@ impl Game {
             .and_then(|c| c.world.as_ref())
             .is_none_or(|w| !w.core_gui_off.contains(name));
         let presentation = self.play.as_ref().and_then(|s| s.presentation.as_ref());
-        let chat_on = presentation.map_or_else(|| core_gui_on("Chat"), |view| view.chat_on);
-        let backpack_on = presentation.map_or_else(|| core_gui_on("Backpack"), |view| view.backpack_on);
+        // Roblox's CoreScripts draw their own chat, hotbar and menu
+        // (core_scripts.rs): rustudio's stand-ins stay hidden then.
+        let core_ui = rustudio_core::rustudio_settings::core_scripts();
+        let chat_on = !core_ui && presentation.map_or_else(|| core_gui_on("Chat"), |view| view.chat_on);
+        let backpack_on = !core_ui && presentation.map_or_else(|| core_gui_on("Backpack"), |view| view.backpack_on);
         open_chat &= chat_on;
         if !backpack_on {
             slots.clear();
@@ -2379,7 +2382,7 @@ impl Game {
             Some(v) if v.tcs && chat_on => draw_text_chat(&painter, rect, v, chat_open_now, &self.cam),
             _ => {
                 draw_legacy_chat(self, &painter, rect, chat_on);
-                if let Some(v) = view {
+                if let Some(v) = view.filter(|_| !core_ui) {
                     draw_chat_bubbles(&painter, rect, v, &self.cam);
                 }
                 None
@@ -2388,9 +2391,11 @@ impl Game {
         if let Some(s) = self.play.as_ref().and_then(|s| s.game.kicked.clone()) {
             draw_kicked(&painter, rect, &s);
         }
-        self.game_menu(ui, rect);
-        if !menu {
-            self.emote_wheel(ui, rect, &mut slots);
+        if !core_ui {
+            self.game_menu(ui, rect);
+            if !menu {
+                self.emote_wheel(ui, rect, &mut slots);
+            }
         }
         let mut sent: Option<String> = None;
         if let Some(s) = self.play.as_mut() {

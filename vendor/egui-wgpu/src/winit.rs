@@ -512,6 +512,7 @@ impl Painter {
         window: &Arc<winit::window::Window>,
     ) -> f32 {
         profiling::function_scope!();
+        crate::prewarm::before_paint();
 
         /// Guard to ensure that commands are always submitted to the renderer queue
         /// so that calls to [`write_buffer()`](https://docs.rs/wgpu/latest/wgpu/struct.Queue.html#method.write_buffer)

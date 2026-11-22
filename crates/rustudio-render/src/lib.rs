@@ -13,6 +13,7 @@
 pub mod quality;
 pub mod occlusion;
 pub mod render;
+pub mod render_thread;
 pub mod gpu_timing;
 pub mod gpu_health;
 pub mod gpu_caps;
@@ -27,6 +28,7 @@ pub mod skin_gpu;
 pub mod wrap;
 pub mod hsr;
 pub mod lightgrid;
+pub mod lightgrid_gpu;
 pub mod lightocc;
 pub mod matpack;
 pub mod grass_temporal;

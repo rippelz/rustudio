@@ -275,6 +275,21 @@ From the `NetworkClient` log lines [verified: exe]:
 
 [verified: exe/flags; "allowed to write everything" is inferred]
 
+The replication wire is the same format in both, with a few differences
+rustudio-net gates on `replicator::SessionKind` (`CloudEdit` for every Team
+Create path, `GameClient` for a player's session with a game server):
+
+- `ChangeAttributeItem` ends with the attribute version bool only in cloud
+  edit (Studio 0.748 `ClientReplicator::readAttributeVersionInfo`,
+  `0x106711410`, reads it under `isCloudEdit()`).
+- SET_GLOBALS is seven flag bytes then the namespace in a game client session
+  (Studio 0.746 `ClientReplicator::processPacketV2`, `0x81`); Team Create
+  keeps refusing a set second flag, as before.
+- Game client only: container enums carry their schema enum index both ways,
+  compressed CFrames (`0x1b`, `0x33`) are written, NewObject's first property
+  group holds `getPropertyGroup`'s types (Studio 0.746), and NewObject
+  ContentIds are read prefixed (estimate).
+
 ### Public reverse-engineering
 
 Nothing is on disk locally (searched `~/code`, `~/.local/share`, `~/Downloads`).

@@ -134,7 +134,8 @@ impl TextFitCache {
         self.spent[usize::from(self.screen)] += start.elapsed();
     }
 
-    fn probe(&mut self, ctx: &egui::Context, job: LayoutJob) -> Option<Arc<egui::Galley>> {
+    fn probe(&mut self, ctx: &egui::Context, mut job: LayoutJob) -> Option<Arc<egui::Galley>> {
+        sane_font_sizes(&mut job);
         let start = self.can_start_work().then(Instant::now)?;
         // TextScaled tries fractional sizes that never get painted. Keep
         // their glyphs away from the uploaded atlas and its world-GUI mips.
@@ -196,6 +197,7 @@ impl TextFitCache {
     fn layout(&mut self, ctx: &egui::Context, mut job: LayoutJob) -> Option<Arc<egui::Galley>> {
         // epaint normalizes the wrapping width before it stores the layout.
         job.wrap.max_width = job.wrap.max_width.round();
+        sane_font_sizes(&mut job);
         let key = text_job_hash(&job, ());
         if let Some(galley) = self.galleys.get(key).filter(|g| *g.job == job) {
             return Some(galley.clone());
@@ -629,12 +631,17 @@ impl Walk<'_, '_> {
                     }).collect();
                     let sum: f32 = ratios.iter().sum();
                     if sum > 0.0 {
-                        for (s, r) in sizes.iter_mut().zip(&ratios) {
+                        for ((k, s), r) in order.iter().zip(sizes.iter_mut()).zip(&ratios) {
                             let add = room * r / sum;
                             if vertical {
                                 s.y += add;
                             } else {
                                 s.x += add;
+                                // (as tall as it is at its new width:
+                                // Sizer::flex_heights)
+                                if add > 0.0 && enum_u32(d.prop(*k, "AutomaticSize")).unwrap_or(0) & 2 != 0 {
+                                    s.y = Sizer { d, m: &mut *self }.height_at_width(*k, s.x, content, dn.scale, 0);
+                                }
                             }
                         }
                         total += room;
@@ -734,6 +741,7 @@ impl Walk<'_, '_> {
         }
         let font = font_of(d, r);
         let family = self.gui.family(self.ctx, self.input.store, &font);
+        let text = super::ligatures::apply(&family, text);
         let size = num(d, r, "TextSize", 14.0) * scale * legacy_text_scale(&font);
         let k = self.em_per_size(&family);
         let mut f = TextFormat::simple(FontId::new(size * k, family), Color32::WHITE);
@@ -823,6 +831,15 @@ impl<M: AutoText> Sizer<'_, M> {
             Pos2::ZERO,
             egui::vec2((size.x - pl - pr).max(0.0), (size.y - pt - pb).max(0.0)),
         );
+        // Growing on X, its children measure with the room it can grow
+        // into, not its own (often 0) width: Roblox's Help tab nests
+        // AutomaticSize XY frames 0 wide around wrapped "Up arrow", which
+        // wrapped a letter per line.
+        let room_inner = if auto & 1 != 0 && room.is_finite() {
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(inner.width().max(room - pl - pr), inner.height()))
+        } else {
+            inner
+        };
         let mut ext = egui::Vec2::ZERO;
         if d.class_of(r)
             .is_some_and(|c| matches!(c.as_str(), "TextLabel" | "TextButton" | "TextBox"))
@@ -857,10 +874,19 @@ impl<M: AutoText> Sizer<'_, M> {
                 } else {
                     inner.width()
                 } + p[1] * scale;
+            let mut sizes: Vec<egui::Vec2> =
+                kids.iter().map(|k| self.auto_child_size(*k, inner, room_inner, scale, auto, depth + 1)).collect();
+            // A row that isn't growing on X fills its width as `children`
+            // lays it out: the items that flex wider are as tall as they
+            // are at their new width.
+            if !vertical && auto & 1 == 0 && depth < 8 {
+                let used = sizes.iter().map(|s| s.x).sum::<f32>() + gap * kids.len().saturating_sub(1) as f32;
+                let fill = enum_u32(d.prop(lay, "HorizontalFlex")) == Some(1);
+                self.flex_heights(&kids, &mut sizes, inner, inner.width() - used, fill, scale, depth + 1);
+            }
             let mut along = 0.0f32;
             let mut across = 0.0f32;
-            for (i, k) in kids.iter().enumerate() {
-                let s = self.auto_child_size(*k, inner, scale, auto, depth + 1);
+            for (i, s) in sizes.iter().enumerate() {
                 along += if vertical { s.y } else { s.x } + if i > 0 { gap } else { 0.0 };
                 across = across.max(if vertical { s.x } else { s.y });
             }
@@ -914,7 +940,7 @@ impl<M: AutoText> Sizer<'_, M> {
             }
         } else {
             for k in kids {
-                let s = self.auto_child_size(k, inner, scale, auto, depth + 1);
+                let s = self.auto_child_size(k, inner, room_inner, scale, auto, depth + 1);
                 let p = udim2(d, k, "Position");
                 let anchor = vec2(d, k, "AnchorPoint", [0.0, 0.0]);
                 let at = egui::vec2(
@@ -934,8 +960,19 @@ impl<M: AutoText> Sizer<'_, M> {
     /// Archimedes' window (an AutomaticSize Y button whose content sits in a
     /// `UDim2.new(1, 0, 1, -20)` frame: Studio shows the whole panel,
     /// checks/plugins/ref/corpus/screens/archimedes-click-main.jpg).
-    pub(super) fn auto_child_size(&mut self, k: Ref, inner: Rect, scale: f32, auto: u32, depth: usize) -> egui::Vec2 {
-        let mut s = self.own_size(k, inner, scale, depth);
+    /// `room_inner`: `inner` as wide as the parent can grow (children sized
+    /// by Scale on X still take `inner`).
+    pub(super) fn auto_child_size(
+        &mut self,
+        k: Ref,
+        inner: Rect,
+        room_inner: Rect,
+        scale: f32,
+        auto: u32,
+        depth: usize,
+    ) -> egui::Vec2 {
+        let base = if udim2(self.d, k, "Size")[0] != 0.0 { inner } else { room_inner };
+        let mut s = self.own_size(k, base, scale, depth);
         if depth >= 8 {
             return s;
         }
@@ -953,6 +990,62 @@ impl<M: AutoText> Sizer<'_, M> {
             }
         }
         s
+    }
+
+    /// A horizontal row's items grown by `room` (UIFlexItem FlexMode Grow,
+    /// or every item when the layout's HorizontalFlex is Fill), and those
+    /// growing on Y made as tall as their content is at the new width (an
+    /// item sized 0 wide measured first at 0: ExpChat's TextContainer wrapped
+    /// the typed text a word per line, the chat input 182 px tall).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn flex_heights(
+        &mut self,
+        kids: &[Ref],
+        sizes: &mut [egui::Vec2],
+        parent: Rect,
+        room: f32,
+        fill: bool,
+        scale: f32,
+        depth: usize,
+    ) {
+        let d = self.d;
+        if !room.is_finite() || room <= 0.0 || kids.is_empty() {
+            return;
+        }
+        let ratios: Vec<f32> = kids
+            .iter()
+            .map(|k| match child_of_class(d, *k, "UIFlexItem") {
+                Some(item) => flex_grow(d, item),
+                None => if fill { 1.0 } else { 0.0 },
+            })
+            .collect();
+        let sum: f32 = ratios.iter().sum();
+        if sum <= 0.0 {
+            return;
+        }
+        for ((k, s), r) in kids.iter().zip(sizes.iter_mut()).zip(&ratios) {
+            if *r > 0.0 {
+                s.x += room * r / sum;
+                if enum_u32(d.prop(*k, "AutomaticSize")).unwrap_or(0) & 2 != 0 {
+                    s.y = self.height_at_width(*k, s.x, parent, scale, depth);
+                }
+            }
+        }
+    }
+
+    /// An AutomaticSize Y object's height when it is `width` wide.
+    pub(super) fn height_at_width(&mut self, r: Ref, width: f32, parent: Rect, scale: f32, depth: usize) -> f32 {
+        let d = self.d;
+        let s = udim2(d, r, "Size");
+        let base = s[2] * parent.height() + s[3] * scale;
+        let c = self.content_size_in(r, egui::vec2(width, base), scale, 2, depth, width);
+        let mut y = base.max(c.y);
+        if let Some(c) = child_of_class(d, r, "UISizeConstraint") {
+            let min = vec2(d, c, "MinSize", [0.0, 0.0]);
+            let max = vec2(d, c, "MaxSize", [f32::INFINITY, f32::INFINITY]);
+            y = y.clamp(min[1], max[1].max(min[1]));
+        }
+        y
     }
 
     /// A GuiObject's size from Size, AutomaticSize and its constraints (and UIScale).
@@ -984,7 +1077,22 @@ impl<M: AutoText> Sizer<'_, M> {
             if auto & 1 != 0 {
                 size.x = size.x.max(c.x);
             }
-            if auto & 2 != 0 {
+            if auto == 3 {
+                // Growing on both axes, the content is laid out again at the
+                // width it settled on (within a UISizeConstraint's MaxSize):
+                // children sized by Scale on X and wrapped text take that
+                // width, and the height is what they need there. (Measured
+                // at the old width, ExpChat's translation notice, a
+                // 300 px-max XY frame of two wrapped labels, wrapped a
+                // character per line and filled its 400 px MaxSize height.)
+                if let Some(c) = child_of_class(d, r, "UISizeConstraint") {
+                    let min = vec2(d, c, "MinSize", [0.0, 0.0]);
+                    let max = vec2(d, c, "MaxSize", [f32::INFINITY, f32::INFINITY]);
+                    size.x = size.x.clamp(min[0], max[0].max(min[0]));
+                }
+                let c = self.content_size_in(r, size, scale, auto, depth, room);
+                size.y = size.y.max(c.y);
+            } else if auto & 2 != 0 {
                 size.y = size.y.max(c.y);
             }
         }
@@ -1738,6 +1846,7 @@ impl Walk<'_, '_> {
         }
         let font = font_of(d, r);
         let family = self.gui.family(self.ctx, self.input.store, &font);
+        let text = super::ligatures::apply(&family, text);
         let bold_face = font.1 >= 600;
         let rich = boolp(d, r, "RichText", false);
         let wrapped = boolp(d, r, "TextWrapped", false);
@@ -1805,7 +1914,7 @@ impl Walk<'_, '_> {
                     // Faux bold: egui has no synthetic bold, so a little extra spacing.
                     f.extra_letter_spacing = rs * 0.04;
                 }
-                job.append(&run.text, 0.0, f);
+                super::color_glyphs::append(&mut job, &run.text, f);
             }
             job.wrap.max_width = if wrap || truncate {
                 rect.width().max(1.0)
@@ -1913,7 +2022,26 @@ impl Walk<'_, '_> {
             }
         }
         if let Some((th, c)) = outline {
-            let tinted = outline_grad.as_ref().map(|gl| recolor_galley(&galley, pos, |p, _| gl.tint(p, c)));
+            // Roblox strokes the outline once at its transparency; the eight
+            // copies here overlap, so each takes a share of the alpha.
+            let a = c.a() as f32 / 255.0;
+            let per = 1.0 - (1.0 - a).powf(1.0 / mech::GUI_TEXT_STROKE_OVERLAP);
+            let c = if a > 0.0 { c.gamma_multiply(per / a) } else { c };
+            // A rich text run's own transparency fades its outline too
+            // (ExpChat's message body holds the name again as an invisible
+            // run to make room for it: it drew a black outline of the name).
+            let fill_a = (1.0 - tt) * me.alpha;
+            let fades = rich && fill_a > 0.0 && runs.iter().any(|run| run.transparency.is_some());
+            let tinted = (outline_grad.is_some() || fades).then(|| {
+                recolor_galley(&galley, pos, |p, v| {
+                    let base = outline_grad.as_ref().map_or(c, |gl| gl.tint(p, c));
+                    if fades {
+                        base.gamma_multiply((v.a() as f32 / 255.0 / fill_a).min(1.0))
+                    } else {
+                        base
+                    }
+                })
+            });
             for k in 0..8 {
                 let a = std::f32::consts::TAU * k as f32 / 8.0;
                 let at = pos + egui::vec2(a.cos(), a.sin()) * th;
@@ -2381,4 +2509,20 @@ mod layout_tests {
         out.textures_delta.clear();
     }
 
+}
+
+/// A TextSize of 0 (or a TextScaled label in a box with no height, or a NaN
+/// from a 0/0 scale) reaches here as a 0 or non-finite font size, which
+/// epaint's glyph cache rejects (debug assertion "Bad px_scale_factor: 0",
+/// a crash in gui_walk layout). Roblox draws such text as nothing; a tiny
+/// size draws nothing visible and keeps the layout's geometry (estimate).
+fn sane_font_sizes(job: &mut LayoutJob) {
+    for s in &mut job.sections {
+        let size = &mut s.format.font_id.size;
+        // (A tiny positive size, e.g. TextScaled in a box a hair tall,
+        // scales to a 0 px factor in epaint, which refuses it too.)
+        if !(size.is_finite() && *size >= rustudio_core::mech::GUI_MIN_FONT_SIZE) {
+            *size = rustudio_core::mech::GUI_MIN_FONT_SIZE;
+        }
+    }
 }

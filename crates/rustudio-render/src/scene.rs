@@ -61,6 +61,10 @@ pub struct ScenePart {
     /// Children / siblings whose changes alter this part's look (meshes,
     /// decals, clothing).
     pub deps: Vec<Ref>,
+    /// The deps whose CFrame changes this part's drawing (Bones skinning
+    /// it, body parts its fitted garments are skinned to); a move of any
+    /// other dep leaves it alone.
+    pub motion_deps: Vec<Ref>,
     /// A MeshPart with Bones / FaceControls (deps from skin.rs): redone
     /// when the rig changes.
     pub skinned: bool,
@@ -393,6 +397,29 @@ fn style_prop(name: &str) -> bool {
     )
 }
 
+/// Properties that never change how a part looks (physics and replication
+/// state the server streams for moving assemblies): a mark of one re-reads
+/// nothing. With many moving characters, NetworkIsSleeping, Velocity,
+/// numExpectedDirectChildren and CanCollide marks were a share of the
+/// parts re-read every frame (a count of re-read reasons).
+fn inert_prop(name: &str) -> bool {
+    matches!(
+        name,
+        "NetworkIsSleeping"
+            | "Velocity"
+            | "RotVelocity"
+            | "AssemblyLinearVelocity"
+            | "AssemblyAngularVelocity"
+            | "numExpectedDirectChildren"
+            | "CanCollide"
+            | "CanTouch"
+            | "CanQuery"
+            | "Massless"
+            | "CollisionGroup"
+            | "CollisionGroupId"
+    )
+}
+
 /// The parts to draw, kept up to date from the document's change journal so
 /// only changed parts are re-read each frame.
 #[derive(Default)]
@@ -409,6 +436,10 @@ pub struct Scene {
     is_part: HashMap<Ustr, bool>,
     /// Instance → parts whose look depends on it.
     owners: HashMap<Ref, Vec<Ref>>,
+    /// Instance → parts whose drawing also follows its CFrame (a subset
+    /// of `owners`, `ScenePart::motion_deps`): only these are re-read when
+    /// it moves.
+    motion_owners: HashMap<Ref, Vec<Ref>>,
     changes: SceneChanges,
     /// The voxel terrain needs re-meshing.
     pub terrain_dirty: bool,
@@ -577,6 +608,7 @@ impl Scene {
         self.index.clear();
         self.bounds.clear();
         self.owners.clear();
+        self.motion_owners.clear();
         self.changes = SceneChanges {
             full: true,
             ..Default::default()
@@ -597,10 +629,12 @@ impl Scene {
     }
 
     fn insert(&mut self, p: ScenePart) {
-        for d in &p.deps {
-            let o = self.owners.entry(*d).or_default();
-            if !o.contains(&p.r) {
-                o.push(p.r);
+        for (deps, owners) in [(&p.deps, &mut self.owners), (&p.motion_deps, &mut self.motion_owners)] {
+            for d in deps {
+                let o = owners.entry(*d).or_default();
+                if !o.contains(&p.r) {
+                    o.push(p.r);
+                }
             }
         }
         let b = bound_of(&p);
@@ -671,6 +705,9 @@ impl Scene {
                     {
                         rig = true;
                     }
+                    if inert_prop(name.as_str()) {
+                        continue;
+                    }
                     if self.index.contains_key(&r) {
                         if name == cframe {
                             moved.insert(r);
@@ -682,7 +719,14 @@ impl Scene {
                     } else if doc.class_of(r).is_some_and(|c| self.is_part_class(c)) {
                         full.insert(r);
                     }
-                    if let Some(o) = self.owners.get(&r) {
+                    // A move redraws only the parts that follow it (skinned
+                    // to its Bones, garments fitted over it): an R15 body
+                    // part's atlas colours come from its siblings, but not
+                    // their CFrames (every clothed R15 body part was re-read
+                    // whenever a sibling moved: nearly every character part
+                    // re-read per frame).
+                    let owners = if name == cframe { &self.motion_owners } else { &self.owners };
+                    if let Some(o) = owners.get(&r) {
                         // A SurfaceAppearance's Color is instance data in Studio
                         // (a per-frame tint re-reads no textures or meshes).
                         if name.as_str() == "Color" && doc.class_of(r).is_some_and(|c| c == "SurfaceAppearance") {
@@ -1295,8 +1339,25 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
     } else {
         0
     };
-    let skin_deps = (class == "MeshPart")
-        .then(|| crate::skin::deps_of(doc, r, mesh_asset.as_ref().map(|a| a.id.as_str())));
+    // Instances whose CFrame moves this part's drawing: the Bones skinning
+    // it (skin.rs) and, for the body part that draws a fitted garment, the
+    // other body parts (the garment is skinned to them, wrap.rs).
+    let mut motion_deps = if class == "MeshPart" {
+        crate::skin::deps_of(doc, r, mesh_asset.as_ref().map(|a| a.id.as_str()))
+    } else {
+        Vec::new()
+    };
+    let skinned = !motion_deps.is_empty();
+    if class == "MeshPart" && crate::wrap::draws_garment(doc, inst.parent(), r) {
+        if let Some(m) = doc.dom.get_by_ref(inst.parent()) {
+            for c in m.children() {
+                if *c != r && doc.dom.get_by_ref(*c).is_some_and(|i| i.children().iter().any(|k| doc.class_of(*k).is_some_and(|x| x == "WrapTarget"))) {
+                    motion_deps.push(*c);
+                }
+            }
+        }
+    }
+    deps.extend(motion_deps.iter().copied());
     Some(ScenePart {
         layer: None,
         r,
@@ -1315,25 +1376,9 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
         decal_size: if head_mesh || legacy_shape { draw_size } else { size },
         decal_offset: if legacy_shape { draw_offset } else { Vec3::ZERO },
         // A skinned MeshPart redraws when a Bone or its FaceControls changes (skin.rs).
-        skinned: skin_deps.as_ref().is_some_and(|d| !d.is_empty()),
-        deps: if class == "MeshPart" {
-            let mut deps = deps;
-            deps.extend(skin_deps.unwrap_or_default());
-            // The body part that draws a fitted garment redraws when the
-            // other body parts move (the garment is skinned to them, wrap.rs).
-            if crate::wrap::draws_garment(doc, inst.parent(), r) {
-                if let Some(m) = doc.dom.get_by_ref(inst.parent()) {
-                    for c in m.children() {
-                        if *c != r && doc.dom.get_by_ref(*c).is_some_and(|i| i.children().iter().any(|k| doc.class_of(*k).is_some_and(|x| x == "WrapTarget"))) {
-                            deps.push(*c);
-                        }
-                    }
-                }
-            }
-            deps
-        } else {
-            deps
-        },
+        skinned,
+        deps,
+        motion_deps,
         draw_offset,
         draw_rot,
         light,
@@ -1554,5 +1599,49 @@ mod tests {
         assert_eq!(scene.parts.len(), 1);
         assert_eq!(scene.parts[0].r, part);
         assert_eq!(scene.parts[0].layer, Some(live));
+    }
+
+    /// An R15 body part's clothing atlas takes its cell colours from its
+    /// siblings, not their CFrames: a moving sibling is a transform write
+    /// (`moved`), its Color redraws the atlas, physics state nothing.
+    #[test]
+    fn a_moving_body_part_leaves_its_siblings_alone() {
+        use rbx_dom_weak::types::{CFrame, Color3uint8, Matrix3, Vector3};
+        let mut doc = Document::new_place();
+        let ws = doc.default_parent();
+        let at = |y: f32| Variant::CFrame(CFrame::new(Vector3::new(0.0, y, 0.0), Matrix3::identity()));
+        let model = doc.insert(ws, InstanceBuilder::new("Model").with_name("Avatar"));
+        doc.insert(model, InstanceBuilder::new("Humanoid"));
+        doc.insert(model, InstanceBuilder::new("Shirt").with_property("ShirtTemplate", Variant::String("rbxassetid://1".into())));
+        let part = |name: &str, mesh: &str, y: f32| {
+            InstanceBuilder::new("MeshPart")
+                .with_name(name)
+                .with_property("MeshId", Variant::String(mesh.into()))
+                .with_property("CFrame", at(y))
+        };
+        let upper = doc.insert(model, part("UpperTorso", "rbxassetid://2", 4.0));
+        let lower = doc.insert(model, part("LowerTorso", "rbxassetid://3", 3.0));
+        let mut scene = Scene::default();
+        scene.sync(&mut doc);
+        scene.take_changes();
+        assert!(scene.get(upper).is_some_and(|p| p.deps.contains(&lower) && !p.motion_deps.contains(&lower)));
+
+        doc.set_prop_live(lower, rbx_dom_weak::ustr("CFrame"), at(2.0));
+        scene.sync(&mut doc);
+        let c = scene.take_changes();
+        assert_eq!(c.moved, vec![lower]);
+        assert!(c.changed.is_empty() && c.restyled.is_empty(), "a move re-read {:?} {:?}", c.changed, c.restyled);
+
+        doc.set_prop_live(lower, rbx_dom_weak::ustr("Color"), Variant::Color3uint8(Color3uint8::new(10, 20, 30)));
+        scene.sync(&mut doc);
+        let c = scene.take_changes();
+        assert_eq!(c.restyled, vec![lower]);
+        assert_eq!(c.changed, vec![upper]);
+
+        doc.set_prop_live(lower, rbx_dom_weak::ustr("NetworkIsSleeping"), Variant::Bool(true));
+        doc.set_prop_live(lower, rbx_dom_weak::ustr("AssemblyLinearVelocity"), Variant::Vector3(Vector3::new(1.0, 0.0, 0.0)));
+        scene.sync(&mut doc);
+        let c = scene.take_changes();
+        assert!(c.changed.is_empty() && c.moved.is_empty() && c.restyled.is_empty() && c.removed.is_empty());
     }
 }

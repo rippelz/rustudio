@@ -152,7 +152,9 @@ fn entries_from_lua(v: &Value) -> mlua::Result<Vec<Entry>> {
         let field = |name: &str| -> mlua::Result<String> {
             match row.raw_get::<Value>(name)? {
                 Value::String(s) => Ok(s.to_str()?.to_string()),
-                Value::Nil if name == "Example" || name == "Context" || name == "Key" => Ok(String::new()),
+                // (Source may be left out too: UIBlox's Translator sets
+                // key-only entries, which Roblox's clients take.)
+                Value::Nil if name == "Example" || name == "Context" || name == "Key" || name == "Source" => Ok(String::new()),
                 _ => Err(rt_err(format!(
                     "Entry at index {i} had invalid Key/Source/Context: Entry at index {i} \"{name}\" was not a string."
                 ))),
@@ -327,6 +329,7 @@ pub const METHODS: &[(&str, &str)] = &[
     ("RemoveTargetLocale", "LocalizationTable"),
     ("FormatByKey", "Translator"),
     ("Translate", "Translator"),
+    ("RobloxOnlyTranslate", "Translator"),
     ("GetTableEntries", "LocalizationService"),
     ("GetCorescriptLocalizations", "LocalizationService"),
 ];
@@ -509,7 +512,9 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Resu
             }
             Err(rt_err(format!("Key {key} not found for locale {}", t.locale)))
         }
-        "Translate" => {
+        // RobloxOnlyTranslate (the CoreScripts' own, RobloxScriptSecurity):
+        // the same lookup as Translate.
+        "Translate" | "RobloxOnlyTranslate" => {
             let ctx = opt_inst(&arg(args, 1));
             let text = s_arg(args, 2)?;
             let t = state(lua)?.translators.get(&this).cloned().unwrap_or(Translator { table: None, locale: "en-us".into() });

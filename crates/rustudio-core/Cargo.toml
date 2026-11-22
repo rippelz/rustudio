@@ -14,6 +14,9 @@ rustudio-account = { path = "../rustudio-account" }
 libc = "0.2"
 rbx_dom_weak = "4"
 rbx_binary = "3"
+# DataModelPatch.rbxm's compressed chunks (core_scripts.rs; rbx_binary's own)
+zstd = "0.13"
+lz4_flex = "0.13"
 rbx_xml = "3"
 rbx_reflection_database = "3"
 rbx_reflection = "7"

@@ -305,6 +305,131 @@ rustudio's `os.clock` now counts like Studio's (from the process start) and
 the harness passes Studio's reading at Play (`RUSTUDIO_CLOCK_BASE`): Place A
 camera 75 → 100 with the 2° tolerance unchanged.
 
+## Roblox's CoreScripts from the data model patch (opt-in)
+
+`RUSTUDIO_CORE_SCRIPTS=1` (or Studio Settings > rustudio > Play > Roblox's
+CoreScripts) makes Play put Studio's `DataModelPatch.rbxm` in the client
+(crates/rustudio-core/src/core_scripts.rs) and start its `StarterScript` at
+the CoreScript identity (4). On the control place (Studio
+version-8d7a1009c17e4ff8's patch: 49190 modules, 79 CoreScripts, about
+350 ms to load) StarterScript now runs to its end with no CoreScript error
+in Output: Roblox's top bar draws (Roblox menu, chat and "more" buttons in
+the Builder Icons font) and so does the player list; rustudio's own menu,
+chat, hotbar and emote wheel stay hidden while it's on.
+
+Closed on the way (API dump members; stubs only where a Play session has no
+backend, each noted in the code):
+
+- ScriptContext:AddCoreScriptLocal; DataModel DefineFast*/GetFast*/
+  GetEngineFeature/SetFlagVersion/GetPlaySessionId; settings() flags for
+  CoreScripts.
+- GuiService: SetTopbarInset/TopbarInset, SetMenuIsOpen, SetGlobalGuiInset,
+  GetResolutionScale and the UI-scale/safe-zone/hardware-viewport getters,
+  error getters, Add/RemoveCenterDialog, Add/Remove(Special)Key,
+  GetNotificationTypeList, SendCoreUiNotification (any API-dump callback is
+  now kept).
+- StarterGui:RegisterSetCore / RegisterGetCore behind SetCore / GetCore;
+  ContextActionService core actions (ahead of game actions).
+- MessageBusService, MemStorageService, LocalStorageService /
+  AppStorageService, IXPService (layers loaded, no variables),
+  HttpService:RequestInternal (roblox.com APIs through the login session).
+- RunService / UserInputService / Player / PlayerScripts / UserGameSettings /
+  RenderSettings / VRService / AvatarChatService / ThirdPartyUserService
+  members the CoreScripts read; HumanoidDescription.NumberEmotesLoaded;
+  InsertService:LoadLocalAsset; UDim2:lerp; LocalizationTable:SetEntries
+  without Source; analytics, ads, notifications, achievements and capture
+  gallery as stubs.
+- Rendering: CoreGui ScreenGuis (also inside Folders) draw above PlayerGui;
+  GSUB ligatures for icon fonts; rbxasset:// reaches Studio's ExtraContent.
+
+Client flags (crates/rustudio-core/src/client_flags.rs): Play loads
+Roblox's public PCDesktopClient settings (25 850 flags) and the CoreScripts
+take today's variants. With all of them, on a TextChatService copy of the
+control place, StarterScript and the CoreScripts start with no error in
+Output; about 8 s into Play the "Chrome" top bar draws (Roblox logo, menu
+and chat buttons), with ExpChat's chat window and input bar and the newer
+player list. Clicking the menu button opens Chrome's menu (Switch avatar,
+Music, Report, Leaderboard, Emotes, Inventory, Respawn); clicking the input
+bar, typing and Enter puts the message in the chat window. Closed for this:
+Player.ChatAvailabilityStatus, AudioFocusService, SessionService,
+ExperienceService, TelemetryService (stubs), LinkingService,
+HttpService:GetUserAgent, Translator:RobloxOnlyTranslate,
+GuiService:GetClosestDialogToPosition / GetClosestVisibleDialogToPosition;
+SetCore / GetCore handlers run at their registrant's identity (a game
+LocalScript's SetCore reaching a CoreScript handler that needs LocalUser).
+Engine features (GetEngineFeature) have no public source and read false,
+except AvatarChatServiceEnabled: AvatarChatService answers a client without
+voice or camera chat (ClientFeatures 0, IsEnabled tests a bit of a mask,
+EnableVoice false), VideoCaptureService:GetCameraDevices an empty list, and
+VoiceChatCore's CoreVoiceManager (which needs the service) no longer errors.
+AvatarEditorService:BustAvatarFetchCache (the menu's Respawn) fetches the
+signed-in avatar again for the next character. String properties, names,
+attributes and string arguments take any Lua bytes, as Roblox does; bytes
+that aren't UTF-8 are left out (estimate: rustudio holds UTF-8 text).
+
+Menu and styles (round 2): Foundation (the CoreScripts' UI kit) styles its
+objects through StyleSheets with tags (".size-full", ".row ::UIListLayout").
+Fixed in gui_input.luau: tags and names with "-" in selectors; pseudo-instance
+selectors ("::UIListLayout", "::UIPadding", "::UIFlexItem", "::UICorner"),
+which make and style one modifier per matched element; rule data held
+strongly (a parented StyleRule's Lua object could be collected and its
+properties lost); equal-priority rules applied in sheet order. With those
+the settings menu's Leave / Respawn / Resume row draws as in Roblox and
+Resume closes the menu. AutomaticSize XY frames lay their content out again
+at the width they settle on (ExpChat's translation notice was 300x400; now
+its text height). TextService:GetTextSize / GetTextBoundsAsync measure with
+rustudio's text layout; GetTextSizeOffsetAsync answers 0 (Medium text,
+estimate). rbxthumb:// thumbnails (the People tab's headshot) come from the
+thumbnails API. Lua signals and render-step binds run at their connector's
+identity.
+
+Performance: style matching ran over every descendant of each StyleLink's
+parent every frame, RobloxGui's 45 000 CoreScript modules included. It now
+skips scripts and their children; destroyed-instance sweeps run twice a
+second. Round 3: matching reads each styled tree in one engine call
+(gui_input.rs `style_tree`) and only the elements holding a selector's
+first tag, and reruns per StyleLink only when the DataModel's journal shows
+its tree changed (an element added / moved / removed, a Name / Tags /
+Interactable write), for all links when a sheet, rule, query or the view
+changes (and hover / press / focus when a rule has a :state), with no 2 s
+timer. A rerun with the settings menu open: 150-250 ms -> 8-20 ms (debug).
+
+Look (round 3, compared with the real client's captures):
+- Styles no longer override what an instance sets itself (Roblox's styling
+  guide, "Modified properties"): Foundation's icons keep their Builder Icons
+  FontFace and TextSize over the "text-defaults" / "x-default-text-size"
+  rules, so `microphone`, `arrow-medium-up` and the rest draw as glyphs
+  (they drew as Builder Sans 8 text).
+- RobloxGui is ZIndexBehavior Sibling: the settings menu's Leave / Respawn /
+  Resume row and the Help tab's grid draw over the menu's background, not
+  dimmed under it.
+- The default chat PrefixText is `<font color="#…">DisplayName:</font>` in
+  the team colour, else the CoreScripts' computeNameColor colour;
+  RobloxEmoji's colour glyphs (the verified badge U+E000) draw in their COLR
+  layers' colours (gui_color_glyphs.rs); rich text `color = "…"` with spaces
+  parses.
+- Text outlines: a run's own transparency fades its outline (ExpChat's
+  invisible copy of the name drew a black outline over it), and the eight
+  outline copies share the stroke's alpha (mech GUI_TEXT_STROKE_OVERLAP).
+- A row's flex-grown items that grow on Y are as tall as they are at their
+  new width (the chat input grew to 182 px while typing).
+- An AutomaticSize X object's children measure with the room it can grow
+  into (the Help tab's key column, AutomaticSize XY frames 0 wide around
+  wrapped "Up arrow", wrapped a letter per line).
+- TextFits before the first layout measures TextBounds against the box
+  (SettingsHub's version footer turned TextScaled on and drew over itself).
+- Setting Font sets FontFace to Font.fromEnum of it, and Font.fromEnum maps
+  as Roblox's does (BuilderSansMedium → BuilderSans Medium, Gotham →
+  GothamSSm): the settings rows set Font = BuilderSans and drew in
+  LegacyArial at its 1.5× size. Section headers are text-heading-small
+  (Builder Sans Bold 25, the Foundation token) in content-emphasis white.
+
+Still open: the Respawn confirmation page draws its text tiny.
+TextService:GetTextSizeOffsetAsync is still a stub. The Help tab wraps
+"Drop tool", "Use tool" and "Mouse lock" (Roblox doesn't) and its Camera
+movement / Menu items groups are not on screen; setting FontFace doesn't
+set Font back; `<stroke>` rich text tags are read but not drawn.
+
 ## Next (open, by how much they block real games)
 
 1. **Soft spot lights** (render): Studio spreads a SpotLight's light well
@@ -318,3 +443,9 @@ camera 75 → 100 with the 2° tolerance unchanged.
 4. ~~GuiService.MenuOpened / MenuClosed with an in-game Esc menu~~ (round 13).
 5. Gamepad input (GamepadConnected / Disconnected, gamepad KeyCodes).
 6. The rest of `missing_game_members_by_class` in the coverage report.
+7. ~~Message / Hint drew nothing~~ (place 2828's regen scripts show
+   "Regenerating …" with one): drawn as Studio 0.747's `Message::render2d` /
+   `Hint::render2d` do (MECHANICS.md, GUI).
+8. Model / BasePart `MakeJoints` is a no-op (Roblox makes Snap / Weld joints
+   from touching parts' SurfaceTypes); joints saved in a model still load as
+   instances.

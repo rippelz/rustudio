@@ -70,8 +70,12 @@ local LuaSignal = {}
 LuaSignal.__index = LuaSignal
 -- A userdata like the engine's signals (typeof "RBXScriptSignal").
 function LuaSignal.new() return __rs_make_signal({ handlers = {} }, LuaSignal) end
+-- A handler runs at the identity of the thread that connected it, as the
+-- engine's signals do (a CoreScript's handler on UserGameSettings.Changed
+-- keeps its capabilities whoever changes the setting).
+local sig_identity, sig_spawn_as = __rs_identity, __rs_spawn_as
 function LuaSignal:Connect(fn)
-    local c = { Connected = true, fn = fn }
+    local c = { Connected = true, fn = fn, ident = sig_identity() }
     local list = self.handlers
     function c.Disconnect() c.Connected = false; local i = table.find(list, c); if i then table.remove(list, i) end end
     c.disconnect = c.Disconnect
@@ -91,7 +95,7 @@ function LuaSignal:Wait()
 end
 function LuaSignal:Fire(...)
     for _, c in table.clone(self.handlers) do
-        if c.Connected then task.spawn(c.fn, ...) end
+        if c.Connected then sig_spawn_as(c.ident, c.fn, ...) end
     end
 end
 
@@ -118,6 +122,61 @@ local ugs_values = {
     HasEverUsedVR = false,
     ChatVisible = true,
     PlayerHeight = 5,
+    -- The settings only the CoreScripts read and write (RobloxScriptSecurity
+    -- in the API dump), at a fresh install's values (estimates; transparency
+    -- 1 and Medium text are GuiService's documented defaults).
+    PreferredTransparency = 1,
+    -- (the per-axis sensitivities start at MouseSensitivity's 0.52: estimate)
+    MouseSensitivityFirstPerson = Vector2.new(0.52, 0.52),
+    MouseSensitivityThirdPerson = Vector2.new(0.52, 0.52),
+    PreferredTextSize = Enum.PreferredTextSize.Medium,
+    StudioPreferredTextSize = Enum.PreferredTextSize.Medium,
+    ReducedMotion = false,
+    ReadAloud = false,
+    BadgeVisible = true,
+    PlayerListVisible = true,
+    PlayerNamesEnabled = true,
+    PerformanceStatsVisible = false,
+    OnScreenProfilerEnabled = false,
+    MicroProfilerWebServerEnabled = false,
+    MicroProfilerWebServerIP = "",
+    MicroProfilerWebServerPort = 0,
+    StartMaximized = false,
+    StartScreenPosition = Vector2.zero,
+    StartScreenSize = Vector2.zero,
+    CameraMode = Enum.CustomCameraMode.Default,
+    PeoplePageLayout = Enum.PeoplePageLayout.Card,
+    UIScaleMultiplierHundredths = 100,
+    UiNavigationKeyBindEnabled = true,
+    GraphicsQualityLevel = 0,
+    GraphicsOptimizationMode = Enum.GraphicsOptimizationMode.Balanced,
+    MaxQualityEnabled = false,
+    QualityResetLevel = 0,
+    FramerateCap = 0,
+    HapticStrength = 1,
+    PartyVoiceVolume = 1,
+    VoiceChatVolume = 1,
+    MasterVolumeStudio = 1,
+    ChatTranslationEnabled = false,
+    ChatTranslationToggleEnabled = false,
+    ChatTranslationFTUXShown = false,
+    ChatTranslationLocale = "",
+    DefaultCameraID = "",
+    OnboardingsCompleted = "",
+    IsUsingCameraYInverted = false,
+    IsUsingGamepadCameraSensitivity = false,
+    AllTutorialsDisabled = false,
+    UsedCoreGuiIsVisibleToggle = false,
+    UsedCustomGuiIsVisibleToggle = false,
+    UsedHideHudShortcut = false,
+    VREnabled = false,
+    VRComfortSetting = Enum.VRComfortSetting.Comfort,
+    VRSafetyBubbleMode = Enum.VRSafetyBubbleMode.NoOne,
+    VRRotationIntensity = 1,
+    VRSmoothRotationEnabledCustomOption = false,
+    VRThirdPersonFollowCamEnabled = false,
+    VRThirdPersonFollowCamEnabledCustomOption = false,
+    VignetteEnabledCustomOption = true,
 }
 -- Studio's are Instances: a
 -- UserSettings named "GlobalBasicSettings" holding the UserGameSettings;
@@ -305,6 +364,12 @@ end
 function M.TweenSizeAndPosition(self, size, pos, dir, style, t, override, cb)
     return gui_tween(self, { Size = size, Position = pos }, dir, style, t, override, cb)
 end
+-- The CoreScripts' own copies (RobloxScriptSecurity, same parameters): the
+-- same tweens, kept apart from a game's in Roblox (estimate: one tween per
+-- object here).
+M.TweenPositionInternal = M.TweenPosition
+M.TweenSizeInternal = M.TweenSize
+M.TweenSizeAndPositionInternal = M.TweenSizeAndPosition
 
 -- Humanoid:GetLimb(part) → Enum.Limb (R6 names), GetBodyPartR15(part) →
 -- Enum.BodyPartR15, GetMoveVelocity() = MoveDirection × WalkSpeed.
@@ -536,8 +601,10 @@ local function load_sequence(id)
             if state == false then return nil, true end
             if state == true then
                 -- Decoded natively (anim domain): Studio's Animator loads its
-                -- clips on either side, without InsertService.
-                local ok, model = pcall(__rs_anim_asset, n)
+                -- clips on either side, without InsertService. The decode
+                -- runs on a worker: nil, true until it is done.
+                local ok, model, decoding = pcall(__rs_anim_asset, n)
+                if ok and decoding then return nil, true end
                 if ok and model then
                     kfs = model:FindFirstChildWhichIsA("KeyframeSequence", true)
                         or model:FindFirstChildWhichIsA("CurveAnimation", true)
@@ -770,10 +837,40 @@ local function action_matches(k, input)
     end
     return false
 end
+-- An action runs at the identity of the thread that bound it, as signal
+-- handlers do (the menu's Escape, a CoreScript's, reads
+-- GuiService.SelectedCoreObject, RobloxScript).
 local function bind(name, fn, touch, priority, ...)
     action_seq += 1
-    actions[name] = { fn = fn, inputs = { ... }, priority = priority, seq = action_seq, touch = touch }
+    actions[name] = { name = name, fn = fn, inputs = { ... }, priority = priority, seq = action_seq, touch = touch, ident = sig_identity() }
 end
+-- One action's handler at its binder's identity: (ok, result). One that
+-- yields has no result yet: nil, which sinks the input (estimate: Roblox
+-- documents a handler returning nothing as Sink, not one that yields).
+local function call_action(a, state, input)
+    local out
+    sig_spawn_as(a.ident, function()
+        out = table.pack(pcall(a.fn, a.name, state, input))
+    end)
+    if not out then return true, nil end
+    return out[1], out[2]
+end
+-- The CoreScripts' own actions (BindCoreAction, RobloxScriptSecurity): a
+-- stack of their own ahead of every game action, so the menu's Escape and
+-- the chat's "/" reach them first (estimate: Roblox documents only that core
+-- bindings exist). Kept under a key games can't name.
+local CORE = "\0core:"
+function M.BindCoreAction(self, name, fn, touch, ...)
+    bind(name, fn, touch, Enum.ContextActionPriority.Medium.Value, ...)
+    actions[CORE .. name], actions[name] = actions[name], nil
+    actions[CORE .. name].core = true
+end
+function M.BindCoreActionAtPriority(self, name, fn, touch, priority, ...)
+    bind(name, fn, touch, tonumber(priority) or Enum.ContextActionPriority.Medium.Value, ...)
+    actions[CORE .. name], actions[name] = actions[name], nil
+    actions[CORE .. name].core = true
+end
+function M.UnbindCoreAction(self, name) actions[CORE .. tostring(name)] = nil end
 function M.BindAction(self, name, fn, touch, ...)
     bind(name, fn, touch, Enum.ContextActionPriority.Medium.Value, ...)
 end
@@ -789,11 +886,21 @@ function M.GetBoundActionInfo(self, name)
 end
 function M.GetAllBoundActionInfo(self)
     local out = {}
-    for name in actions do out[name] = M.GetBoundActionInfo(self, name) end
+    for name, a in actions do
+        if not a.core then out[name] = M.GetBoundActionInfo(self, name) end
+    end
+    return out
+end
+function M.GetBoundCoreActionInfo(self, name) return M.GetBoundActionInfo(self, CORE .. tostring(name)) end
+function M.GetAllBoundCoreActionInfo(self)
+    local out = {}
+    for _, a in actions do
+        if a.core then out[a.name] = M.GetBoundActionInfo(self, CORE .. a.name) end
+    end
     return out
 end
 function M.GetButton() return nil end
-for _, n in { "SetTitle", "SetDescription", "SetImage", "SetPosition", "BindActivate", "UnbindActivate" } do
+for _, n in { "SetTitle", "SetDescription", "SetImage", "SetPosition", "BindActivate", "UnbindActivate", "BindCoreActivate", "UnbindCoreActivate" } do
     M[n] = function() end
 end
 
@@ -812,6 +919,7 @@ local function run_actions(input, state)
             end
         end
         table.sort(list, function(x, y)
+            if (x.a.core == true) ~= (y.a.core == true) then return x.a.core == true end
             if x.a.priority ~= y.a.priority then return x.a.priority > y.a.priority end
             return x.a.seq > y.a.seq
         end)
@@ -821,7 +929,7 @@ local function run_actions(input, state)
     local got, sunk = {}, false
     for _, e in list do
         if actions[e.name] == e.a then
-            local ok, r = pcall(e.a.fn, e.name, state, input)
+            local ok, r = call_action(e.a, state, input)
             if not ok then
                 task.spawn(error, r, 0)
             end
@@ -981,10 +1089,17 @@ function M.GetGuiInset()
 end
 function M.GetEmotesMenuOpen() return false end
 function M.GetInspectMenuEnabled() return false end
--- PlayerScripts: the camera / movement mode lists shown in the settings menu.
-for _, n in { "RegisterTouchCameraMovementMode", "RegisterComputerCameraMovementMode", "RegisterTouchMovementMode", "RegisterComputerMovementMode",
-    "ClearComputerCameraMovementModes", "ClearComputerMovementModes", "ClearTouchCameraMovementModes", "ClearTouchMovementModes" } do
-    M[n] = function() end
+-- PlayerScripts: the camera / movement mode lists the PlayerModule
+-- registers and the settings menu (a CoreScript) reads back with
+-- GetRegistered* (RobloxScriptSecurity). One list per kind per DataModel.
+local registered_modes = {}
+for _, kind in { "TouchCameraMovementMode", "ComputerCameraMovementMode", "TouchMovementMode", "ComputerMovementMode" } do
+    registered_modes[kind] = {}
+    M["Register" .. kind] = function(self, mode)
+        if not table.find(registered_modes[kind], mode) then table.insert(registered_modes[kind], mode) end
+    end
+    M["Clear" .. kind .. "s"] = function() table.clear(registered_modes[kind]) end
+    M["GetRegistered" .. kind .. "s"] = function() return table.clone(registered_modes[kind]) end
 end
 
 -------------------------------------------------------------------- Camera
@@ -1146,22 +1261,25 @@ function M.SetSharedTable(self, name, t) shared_tables[name] = t end
 ---------------------------------------------------------------- RunService
 -- Bound functions run every frame in priority order (lowest first), before
 -- RenderStepped's own connections; one that yields doesn't hold up the rest.
+-- Each runs at the identity of the script that bound it (a CoreScript's
+-- bind keeps its capabilities whoever bound first).
+local rs_identity, rs_spawn_as = __rs_identity, __rs_spawn_as
 local render_steps, render_order, render_conn = {}, {}, nil
 local function render_sort()
     render_order = {}
-    for name, e in render_steps do table.insert(render_order, { name = name, p = e.p, n = e.n, fn = e.fn }) end
+    for name, e in render_steps do table.insert(render_order, { name = name, p = e.p, n = e.n, fn = e.fn, ident = e.ident }) end
     table.sort(render_order, function(a, b) if a.p ~= b.p then return a.p < b.p end return a.n < b.n end)
 end
 local render_seq = 0
 function M.BindToRenderStep(self, name, priority, fn)
     render_seq += 1
     local p = if typeof(priority) == "EnumItem" then priority.Value else tonumber(priority)
-    render_steps[name] = { p = p or 0, n = render_seq, fn = fn }
+    render_steps[name] = { p = p or 0, n = render_seq, fn = fn, ident = rs_identity() }
     render_sort()
     if not render_conn then
         render_conn = self.RenderStepped:Connect(function(dt)
             for _, e in render_order do
-                if render_steps[e.name] and render_steps[e.name].fn == e.fn then task.spawn(e.fn, dt) end
+                if render_steps[e.name] and render_steps[e.name].fn == e.fn then rs_spawn_as(e.ident, e.fn, dt) end
             end
         end)
     end

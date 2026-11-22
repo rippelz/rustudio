@@ -56,7 +56,68 @@ pub fn base(id: &str, bytes: &[u8]) -> Option<Arc<Base>> {
     if let Some(b) = BASES.lock().ok()?.get(id) {
         return b.clone();
     }
-    let b = rustudio_core::mesh::parse(bytes).ok().and_then(|m| {
+    let b = parse_base(bytes);
+    if let Ok(mut g) = BASES.lock() {
+        g.insert(id.to_string(), b.clone());
+    }
+    rustudio_core::assets::bump_mesh_generation();
+    b
+}
+
+/// Skinned bases being parsed on the asset workers (`base_async`), each
+/// with its ticket: one forgotten meanwhile (`forget_base`) is dropped.
+static PARSING: std::sync::LazyLock<Mutex<(u64, HashMap<String, u64>)>> =
+    std::sync::LazyLock::new(|| Mutex::new((0, HashMap::new())));
+
+/// Bumped when a skinned base parsed on the asset workers is in.
+static BASE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Changes when `base_async` has a new base ready (the parts waiting on it
+/// are redone).
+pub fn base_generation() -> u64 {
+    BASE_GEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// `base`, parsed on the asset workers (as Roblox's MeshContentProvider
+/// parses meshes on its worker, asset_work.rs): Some once parsed (None
+/// inside: not skinned), None while it parses.
+pub fn base_async(id: &str, bytes: Arc<Vec<u8>>) -> Option<Option<Arc<Base>>> {
+    if !rustudio_core::assets::place_content_ok(id) {
+        return Some(None);
+    }
+    if let Some(b) = BASES.lock().ok()?.get(id) {
+        return Some(b.clone());
+    }
+    if rustudio_core::assets::sync_decode() {
+        return Some(base(id, &bytes));
+    }
+    let mut p = PARSING.lock().ok()?;
+    if p.1.contains_key(id) {
+        return None;
+    }
+    p.0 += 1;
+    let ticket = p.0;
+    p.1.insert(id.to_string(), ticket);
+    let id = id.to_string();
+    rustudio_core::asset_work::spawn(move || {
+        let b = parse_base(&bytes);
+        let Ok(mut p) = PARSING.lock() else { return };
+        if p.1.get(&id) != Some(&ticket) {
+            return;
+        }
+        p.1.remove(&id);
+        if let Ok(mut g) = BASES.lock() {
+            g.insert(id, b);
+        }
+        drop(p);
+        rustudio_core::assets::bump_mesh_generation();
+        BASE_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    });
+    None
+}
+
+fn parse_base(bytes: &[u8]) -> Option<Arc<Base>> {
+    rustudio_core::mesh::parse(bytes).ok().and_then(|m| {
         let skin = m.skin.clone()?;
         if skin.corner_bones.len() != m.positions.len() || skin.bones.is_empty() {
             return None;
@@ -79,12 +140,7 @@ pub fn base(id: &str, bytes: &[u8]) -> Option<Arc<Base>> {
             skin,
             facs: rustudio_core::mesh::parse_mesh_facs(bytes),
         }))
-    });
-    if let Ok(mut g) = BASES.lock() {
-        g.insert(id.to_string(), b.clone());
-    }
-    rustudio_core::assets::bump_mesh_generation();
-    b
+    })
 }
 
 /// The skinned base of a mesh already parsed by `base`, without its bytes.
@@ -92,6 +148,9 @@ pub fn base(id: &str, bytes: &[u8]) -> Option<Arc<Base>> {
 pub fn forget_base(id: &str) {
     if let Ok(mut b) = BASES.lock() {
         b.remove(id);
+    }
+    if let Ok(mut p) = PARSING.lock() {
+        p.1.remove(id);
     }
     rustudio_core::assets::bump_mesh_generation();
     rig_changed();
@@ -211,19 +270,10 @@ pub fn has_bones(doc: &Document, part: Ref) -> bool {
     }
     let index = all.entry(doc.id).or_default();
     if index.gen != gen {
-        *index = RigIndex::build(doc, gen);
+        *index = RigIndex { gen, ..Default::default() };
     }
-    // No Bone or FaceControls anywhere (most places): nothing to walk. The
-    // assembly walk below ran per mesh part on every redo of the draws,
-    // seconds a frame in a place with thousands of jointed mesh parts.
-    if index.bone_above.is_empty() && index.face_above.is_empty() {
-        return false;
-    }
-    if index.face_above.contains(&part) || index.bone_above.contains(&part) {
+    if *index.parts.entry(part).or_insert_with(|| rigged_below(doc, part, true)) {
         return true;
-    }
-    if index.bone_above.is_empty() {
-        return false;
     }
     // A Bone under another part of its assembly (`bone_hosts`): the joints
     // under its model, grouped once per model.
@@ -232,23 +282,27 @@ pub fn has_bones(doc: &Document, part: Ref) -> bool {
     }) else {
         return false;
     };
-    if !index.models.contains_key(&model) {
-        let rig = ModelRig::build(doc, model, &index.bone_above);
-        index.models.insert(model, rig);
-    }
-    let rig = &index.models[&model];
-    rig.group.get(&part).is_some_and(|g| rig.with_bones[*g as usize])
+    // (a model with no Bone below it has nothing to group: most places. A
+    // Bone under a part outside the model, jointed to it from inside, is
+    // not seen; avatar and importer rigs keep theirs inside: estimated)
+    let rig = index.models.entry(model).or_insert_with(|| {
+        let _s = rustudio_core::bench::scope("skin_model_rig");
+        rigged_below(doc, model, false).then(|| ModelRig::build(doc, model))
+    });
+    rig.as_ref().is_some_and(|rig| rig.group.get(&part).is_some_and(|g| rig.with_bones[*g as usize]))
 }
 
-/// Where a document's Bones and FaceControls are (for `has_bones`), valid
-/// until the rig changes, as the bone lookups are.
+/// Which parts are skinned (for `has_bones`), valid until the rig changes,
+/// as the bone lookups are: filled in per part and per model as they are
+/// asked about. (It was a walk of the whole document on every rig change:
+/// 10 ms each time a character with a dynamic head arrived.)
 #[derive(Default)]
 struct RigIndex {
     gen: u64,
-    /// Every instance with a Bone / a FaceControls below it.
-    bone_above: std::collections::HashSet<Ref>,
-    face_above: std::collections::HashSet<Ref>,
-    models: HashMap<Ref, ModelRig>,
+    /// Part → a Bone or FaceControls is below it.
+    parts: HashMap<Ref, bool>,
+    /// Model → its jointed groups (None: no Bone below the model).
+    models: HashMap<Ref, Option<ModelRig>>,
 }
 
 /// The rigid joints under one model as groups of jointed parts (what
@@ -259,8 +313,13 @@ struct ModelRig {
     with_bones: Vec<bool>,
 }
 
+/// Whether a Bone (or, with `face`, a FaceControls) is below `r`.
+fn rigged_below(doc: &Document, r: Ref, face: bool) -> bool {
+    doc.dom.descendants_of(r).any(|i| i.class == "Bone" || (face && i.class == "FaceControls"))
+}
+
 impl ModelRig {
-    fn build(doc: &Document, model: Ref, bone_above: &std::collections::HashSet<Ref>) -> Self {
+    fn build(doc: &Document, model: Ref) -> Self {
         let mut slot: HashMap<Ref, u32> = HashMap::new();
         let mut parent: Vec<u32> = Vec::new();
         fn find(parent: &mut [u32], mut i: u32) -> u32 {
@@ -290,30 +349,11 @@ impl ModelRig {
         for (r, i) in slot {
             let g = find(&mut parent, i);
             group.insert(r, g);
-            with_bones[g as usize] |= bone_above.contains(&r);
-        }
-        ModelRig { group, with_bones }
-    }
-}
-
-impl RigIndex {
-    fn build(doc: &Document, gen: u64) -> Self {
-        let mut index = RigIndex { gen, ..Default::default() };
-        for i in doc.dom.descendants() {
-            let set = match i.class.as_str() {
-                "Bone" => &mut index.bone_above,
-                "FaceControls" => &mut index.face_above,
-                _ => continue,
-            };
-            let mut cur = i.parent();
-            while let Some(p) = doc.dom.get_by_ref(cur) {
-                if !set.insert(cur) {
-                    break;
-                }
-                cur = p.parent();
+            if !with_bones[g as usize] {
+                with_bones[g as usize] = rigged_below(doc, r, false);
             }
         }
-        index
+        ModelRig { group, with_bones }
     }
 }
 

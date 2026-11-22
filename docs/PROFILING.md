@@ -79,6 +79,18 @@ Instructions are the unit when both captures counted them, else ms.
 Before trusting a ms `slower` under ~30 %, repeat both captures or switch to
 `--instr`.
 
+## The render thread
+
+The viewport is recorded on the main thread (prepare) and finished and
+submitted on `rustudio-render` (perform, `rustudio-render/src/render_thread.rs`;
+Roblox's `RenderView::renderPrepare` / `renderPerform`). The scene's passes
+are finished there as soon as `render` returns and submitted with the post
+chain (`finish_frame`, after the world GUIs and effects) in one submit.
+egui's paint and the next frame's first upload join it first, so no frame
+of latency is added. Bench sections: `render_thread_perform` (the thread's
+time, a call a job) and `render_thread_wait` (the main thread waiting for
+it, category Wait). `RUSTUDIO_RENDER_THREAD=0` performs on the main thread.
+
 ## Categories
 
 Frame, Render (CPU side), GPU (timestamp queries, on the GPU lane), UI

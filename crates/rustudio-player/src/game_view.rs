@@ -96,6 +96,42 @@ fn mesh_texture_uvt(tiling: Option<[f32; 4]>, w: f32, h: f32) -> [f32; 4] {
     }
 }
 
+/// A SurfaceAppearance's composite, made on an asset worker
+/// (TextureCache::composite): its colour map; NormalMap xy, RoughnessMap
+/// and MetalnessMap (`maps` 0..3, absent ones flat) packed into one map at
+/// the colour map's `w` × `h` with its data mip chain; the emissive mask
+/// (`maps` 3).
+fn surface_composite(
+    base: rustudio_core::assets::PixelSource,
+    maps: Vec<Option<rustudio_core::assets::PixelSource>>,
+    w: u32,
+    h: u32,
+) -> Option<rustudio_core::assets::Composite> {
+    let base = base.get()?;
+    let px: Vec<_> = maps.iter().map(|m| m.as_ref().and_then(|m| m.get())).collect();
+    let mut packed = vec![0; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let at = ((y * w + x) * 4) as usize;
+            packed[at..at + 4].copy_from_slice(&[128, 128, 255, 0]);
+            for (k, im) in px.iter().take(3).enumerate() {
+                if let Some(im) = im {
+                    let q = (((y * im.height / h) * im.width + x * im.width / w) * 4) as usize;
+                    if k == 0 {
+                        packed[at..at + 2].copy_from_slice(&im.pixels[q..q + 2]);
+                    } else {
+                        packed[at + 1 + k] = im.pixels[q];
+                    }
+                }
+            }
+        }
+    }
+    let mut c = rustudio_core::assets::Composite::new(std::sync::Arc::unwrap_or_clone(base));
+    c.mask = px.get(3).cloned().flatten();
+    c.packed = Some((w, h, rustudio_core::texture::data_mip_chain(w, h, &packed)));
+    Some(c)
+}
+
 /// Terrain water is drawn in pieces of this many consecutive triangles,
 /// each frustum-culled (sync_terrain).
 const WATER_PIECE_TRIS: usize = 4096;
@@ -557,7 +593,7 @@ impl Game {
     /// `sync_draws` for one scene: the world's, or (`layered`) the parts
     /// in ViewportFrames, each in its frame's renderer layer.
     fn sync_draws_of(&mut self, layered: bool, live_redo: &[Ref]) {
-        use rustudio_core::assets::{clothing_role, composite_over, template_box, ClothingLayer};
+        use rustudio_core::assets::{clothing_role, composite_over, template_box, ClothingLayer, Composed, Composite, PixelSource};
         use rustudio_render::render::{PartDraw, TexMode};
         let mut changes = self.scene.take_changes();
         changes.changed.extend(live_redo.iter().copied().filter(|r| self.scene.get(*r).is_some()));
@@ -582,6 +618,7 @@ impl Game {
             && changes.moved.is_empty()
             && changes.restyled.is_empty()
             && !regen
+            && self.draw_cache.deferred.is_empty()
         {
             return;
         }
@@ -658,11 +695,13 @@ impl Game {
                 }
             }
         }
-        let mut todo: Vec<Ref> = if changes.full {
-            scene.parts.iter().map(|p| p.r).collect()
+        // What the last frame's budget left goes first.
+        let mut todo: Vec<Ref> = std::mem::take(&mut draw_cache.deferred);
+        if changes.full {
+            todo.extend(scene.parts.iter().map(|p| p.r));
         } else {
-            changes.changed
-        };
+            todo.extend(changes.changed);
+        }
         todo.extend(restyle_full);
         if regen {
             // A part waiting only on textures is redone when one of them can
@@ -699,7 +738,22 @@ impl Game {
         todo.extend(drawers);
         let mut seen = std::collections::HashSet::new();
         todo.retain(|r| seen.insert(*r));
-        for r in todo {
+        // A whole new scene resolves at once; otherwise at most a budget's
+        // worth a frame (characters and their meshes, textures and
+        // clothing arriving together took tens of ms of one frame), the
+        // rest next frame, as Roblox streams such parts in.
+        // Runs on the simulated clock (--fixed-dt captures) resolve all.
+        let budget = (!changes.full && !rustudio_core::sim_clock::on())
+            .then(|| std::time::Duration::from_secs_f32(rustudio_core::mech::DRAW_SYNC_BUDGET_MS / 1000.0));
+        let started = std::time::Instant::now();
+        let mut todo = todo.into_iter();
+        while let Some(r) = todo.next() {
+            if budget.is_some_and(|b| started.elapsed() >= b) {
+                draw_cache.deferred.push(r);
+                draw_cache.deferred.extend(todo);
+                rustudio_core::bench::add("count: sd_deferred", draw_cache.deferred.len() as f64, 1);
+                break;
+            }
             let Some(sp) = scene.get(r) else { continue };
             renderer.set_layer(r, sp.layer);
             // Layered garments are drawn with the body parts they fit.
@@ -794,9 +848,14 @@ impl Game {
                     // the Bones' current frames (skin.rs).
                     let _skin_scope = rustudio_core::bench::scope("sd_skin");
                     if asset.fit_to_part && rustudio_render::skin::part_has_bones(&self.doc, sp.r, &asset.id) {
-                        // (the parsed base once there is one: no fetch of the bytes per redo)
+                        // (the parsed base once there is one: no fetch of the
+                        // bytes per redo; parsed on the asset workers, the
+                        // part drawn at rest until then)
                         let base = rustudio_render::skin::cached_base(&asset.id).or_else(|| match assets.content(&asset.id, dir) {
-                            rustudio_core::assets::Fetch::Ready(bytes) => rustudio_render::skin::base(&asset.id, &bytes),
+                            rustudio_core::assets::Fetch::Ready(bytes) => rustudio_render::skin::base_async(&asset.id, bytes).unwrap_or_else(|| {
+                                waiting = true;
+                                None
+                            }),
                             _ => None,
                         });
                         {
@@ -893,35 +952,30 @@ impl Game {
                             waiting |= ids.iter().zip(&maps).any(|(id, im)| id.as_ref().is_some_and(|id| !textures.failed(id)) && im.is_none());
                             let (w, h) = (t.width.max(2), t.height.max(2));
                             if !waiting {
-                                // The packed normal/roughness/metalness map is
-                                // built only when the composite isn't cached
-                                // (it was built per part: a full-size pixel
-                                // loop for every SurfaceAppearance part).
-                                let made = textures.composite_index(&key);
-                                let index = if made.is_some() { made } else {
-                                    let base = textures.pixels(tid, dir, assets);
-                                    let px: Vec<Option<std::sync::Arc<rustudio_core::texture::Rgba>>> = ids.iter().zip(&maps)
-                                        .map(|(id, m)| id.as_ref().filter(|_| m.is_some()).and_then(|id| textures.pixels(id, dir, assets)))
-                                        .collect();
-                                    let index = textures.composite(&key, || base.as_deref().cloned(), &mut |im, slot| {
-                                        rustudio_render::render::reuse_texture_slot(slot);
-                                        let mut packed = vec![0; (w * h * 4) as usize];
-                                        for y in 0..h { for x in 0..w {
-                                            let at = ((y * w + x) * 4) as usize;
-                                            packed[at..at+4].copy_from_slice(&[128,128,255,0]);
-                                            for (k, im) in px.iter().take(3).enumerate() { if let Some(im) = im {
-                                                let q = (((y * im.height / h) * im.width + x * im.width / w) * 4) as usize;
-                                                if k == 0 { packed[at..at+2].copy_from_slice(&im.pixels[q..q+2]); }
-                                                else { packed[at+1+k] = im.pixels[q]; }
-                                            }}
-                                        }}
-                                        renderer.add_texture_surface(&device, &queue, im.width, im.height, &im.pixels,
-                                            px[3].as_ref().map(|m| (m.width, m.height, m.pixels.as_slice())), Some((w,h,&packed)))
-                                    });
-                                    textures.release_pixels(std::iter::once(tid.as_str()).chain(ids.iter().flatten().map(|i| i.as_str())));
-                                    index
+                                // The colour map with its packed normal /
+                                // roughness / metalness map and emissive mask,
+                                // made on an asset worker (`surface_composite`);
+                                // the plain colour map is drawn until then.
+                                let composed = match textures.composite_index(&key) {
+                                    Some(i) => Composed::Ready(i),
+                                    None => {
+                                        let base = textures.pixel_source(tid, dir, assets);
+                                        let px: Vec<Option<PixelSource>> = ids.iter().zip(&maps)
+                                            .map(|(id, m)| id.as_ref().filter(|_| m.is_some()).and_then(|id| textures.pixel_source(id, dir, assets)))
+                                            .collect();
+                                        let inputs: Vec<&str> = std::iter::once(tid.as_str()).chain(ids.iter().flatten().map(|i| i.as_str())).collect();
+                                        let c = textures.composite(&key, &inputs, move || surface_composite(base?, px, w, h), &mut |c, slot| {
+                                            rustudio_render::render::reuse_texture_slot(slot);
+                                            renderer.add_texture_surface(&device, &queue, c.image.width, c.image.height, &c.image.pixels,
+                                                c.mask.as_ref().map(|m| (m.width, m.height, m.pixels.as_slice())),
+                                                c.packed.as_ref().map(|(w, h, p)| (*w, *h, p.as_slice())))
+                                        });
+                                        textures.release_pixels(inputs);
+                                        c
+                                    }
                                 };
-                                if let Some(index) = index { d.texture = Some(index); }
+                                waiting |= composed.pending();
+                                if let Some(index) = composed.index() { d.texture = Some(index); }
                                 if let Some((_, strength)) = &sp.emissive { d.emissive = *strength; }
                             }
                         }
@@ -939,32 +993,37 @@ impl Game {
                             }) {
                                 Some(_) => {
                                     let key = format!("emissive|{tid}|{mask_id}");
-                                    let made = textures.composite_index(&key);
-                                    let index = if made.is_some() { made } else {
-                                        let base = textures.pixels(tid, dir, assets);
-                                        let mask = textures.pixels(mask_id, dir, assets);
-                                        let index = match (base, mask) {
-                                            (Some(base), Some(mask)) => textures.composite(
+                                    let composed = match textures.composite_index(&key) {
+                                        Some(i) => Composed::Ready(i),
+                                        None => {
+                                            let base = textures.pixel_source(tid, dir, assets);
+                                            let mask = textures.pixel_source(mask_id, dir, assets);
+                                            let c = textures.composite(
                                                 &key,
-                                                || Some((*base).clone()),
-                                                &mut |im, slot| {
+                                                &[tid.as_str(), mask_id.as_str()],
+                                                move || {
+                                                    let mut c = Composite::new(std::sync::Arc::unwrap_or_clone(base?.get()?));
+                                                    c.mask = Some(mask?.get()?);
+                                                    Some(c)
+                                                },
+                                                &mut |c, slot| {
                                                     rustudio_render::render::reuse_texture_slot(slot);
                                                     renderer.add_texture_emissive(
                                                         &device,
                                                         &queue,
-                                                        im.width,
-                                                        im.height,
-                                                        &im.pixels,
-                                                        Some((mask.width, mask.height, &mask.pixels)),
+                                                        c.image.width,
+                                                        c.image.height,
+                                                        &c.image.pixels,
+                                                        c.mask.as_ref().map(|m| (m.width, m.height, m.pixels.as_slice())),
                                                     )
                                                 },
-                                            ),
-                                            _ => None,
-                                        };
-                                        textures.release_pixels([tid.as_str(), mask_id.as_str()]);
-                                        index
+                                            );
+                                            textures.release_pixels([tid.as_str(), mask_id.as_str()]);
+                                            c
+                                        }
                                     };
-                                    if let Some(i) = index {
+                                    waiting |= composed.pending();
+                                    if let Some(i) = composed.index() {
                                         d.texture = Some(i);
                                         d.emissive = *strength;
                                     }
@@ -992,6 +1051,7 @@ impl Game {
             let has_mesh = sp.mesh_asset.is_some() && d.custom_mesh.is_some();
             if let Some((name, shirt, pants)) = &sp.clothing {
                 if let Some(role) = clothing_role(name) {
+                    let _sc = rustudio_core::bench::scope("sd_clothing");
                     let box_mesh = *clothing_meshes.entry(name.clone()).or_insert_with(|| {
                         let (p, n, u) = template_box(&role);
                         renderer.add_mesh(&device, &p, &n, &u)
@@ -1000,47 +1060,27 @@ impl Game {
                     // R15 body MeshParts: their own UVs into their cell of
                     // the composited atlas (assets::r15_composite), as Studio.
                     let r15 = sp.r15_look.filter(|_| has_mesh);
+                    // (made on the asset workers: `waiting` until uploaded,
+                    // the part drawn without its clothing meanwhile)
                     if let (Some(_), Some(asset)) = (r15, &sp.mesh_asset) {
                         let key = format!("r15-clothing|{name}|{}", asset.id);
-                        mesh = match clothing_meshes.get(&key) {
-                            Some(i) => Some(*i),
-                            None => match assets.content(&asset.id, dir) {
-                                rustudio_core::assets::Fetch::Ready(bytes) => {
-                                    let made = rustudio_core::assets::mesh_for_upload(&bytes).and_then(|(p, n, uv)| {
-                                        let uv = rustudio_core::assets::r15_atlas_uvs(name, &uv)?;
-                                        Some(renderer.add_mesh(&device, &p, &n, &uv))
-                                    });
-                                    let i = made.unwrap_or(box_mesh);
-                                    clothing_meshes.insert(key, i);
-                                    Some(i)
-                                }
-                                _ => {
-                                    waiting = true;
-                                    None
-                                }
-                            },
-                        };
+                        let part = name.clone();
+                        let made = meshes.derived(&key, &asset.id, dir, assets, move |bytes| {
+                            let (p, n, uv) = rustudio_core::assets::mesh_for_upload(bytes)?;
+                            let uv = rustudio_core::assets::r15_atlas_uvs(&part, &uv)?;
+                            Some((p, n, uv))
+                        }, &mut |p, n, uv| renderer.add_mesh(&device, p, n, uv));
+                        mesh = made.map(|m| m.unwrap_or(box_mesh));
                     } else if let (true, Some(asset)) = (has_mesh, &sp.mesh_asset) {
                         let key = format!("body-clothing|{name}|{}", asset.id);
-                        mesh = match clothing_meshes.get(&key) {
-                            Some(i) => Some(*i),
-                            None => match assets.content(&asset.id, dir) {
-                                rustudio_core::assets::Fetch::Ready(bytes) => {
-                                    let made = rustudio_core::assets::mesh_for_upload(&bytes).and_then(|(p, n, _)| {
-                                        let uv = rustudio_core::assets::body_template_uvs(name, &p)?;
-                                        Some(renderer.add_mesh(&device, &p, &n, &uv))
-                                    });
-                                    // Unreadable mesh: the template box.
-                                    let i = made.unwrap_or(box_mesh);
-                                    clothing_meshes.insert(key, i);
-                                    Some(i)
-                                }
-                                _ => {
-                                    waiting = true;
-                                    None
-                                }
-                            },
-                        };
+                        let part = name.clone();
+                        let made = meshes.derived(&key, &asset.id, dir, assets, move |bytes| {
+                            let (p, n, _) = rustudio_core::assets::mesh_for_upload(bytes)?;
+                            let uv = rustudio_core::assets::body_template_uvs(&part, &p)?;
+                            Some((p, n, uv))
+                        }, &mut |p, n, uv| renderer.add_mesh(&device, p, n, uv));
+                        // Unreadable mesh: the template box.
+                        mesh = made.map(|m| m.unwrap_or(box_mesh));
                     }
                     let mut img = |id: &Option<String>| {
                         id.as_ref().and_then(|id| {
@@ -1052,6 +1092,11 @@ impl Game {
                         })
                     };
                     let (s, p) = (img(shirt), img(pants));
+                    let inputs: Vec<&str> = shirt.iter().chain(pants.iter()).map(|i| i.as_str()).collect();
+                    let mut upload = |c: &rustudio_core::assets::Composite, slot: Option<u32>| {
+                        rustudio_render::render::reuse_texture_slot(slot);
+                        renderer.add_texture(&device, &queue, c.image.width, c.image.height, &c.image.pixels)
+                    };
                     let r15_tex = r15.and_then(|look| {
                         // Both images settled (loaded, or absent) first.
                         if (shirt.is_some() && s.is_none()) || (pants.is_some() && p.is_none()) {
@@ -1059,46 +1104,52 @@ impl Game {
                         }
                         let key = format!("r15|{shirt:?}|{pants:?}|{}", look.key());
                         if let Some(i) = textures.composite_index(&key) {
-                            return Some(i);
+                            return Some(Composed::Ready(i));
                         }
-                        // (clothing images are small: decoded again here)
-                        let spx = s.and(shirt.as_ref()).and_then(|id| textures.pixels(id, dir, assets));
-                        let ppx = p.and(pants.as_ref()).and_then(|id| textures.pixels(id, dir, assets));
-                        textures.composite(
+                        let spx = s.and(shirt.as_ref()).and_then(|id| textures.pixel_source(id, dir, assets));
+                        let ppx = p.and(pants.as_ref()).and_then(|id| textures.pixel_source(id, dir, assets));
+                        Some(textures.composite(
                             &key,
-                            || rustudio_core::assets::r15_composite(&look, spx.as_deref(), ppx.as_deref()),
-                            &mut |im, slot| {
-                                rustudio_render::render::reuse_texture_slot(slot);
-                                renderer.add_texture(&device, &queue, im.width, im.height, &im.pixels)
+                            &inputs,
+                            move || {
+                                let (s, p) = (spx.and_then(|x| x.get()), ppx.and_then(|x| x.get()));
+                                rustudio_core::assets::r15_composite(&look, s.as_deref(), p.as_deref()).map(Composite::new)
                             },
-                        )
+                            &mut upload,
+                        ))
                     });
                     let tex = if r15.is_some() { r15_tex } else { match role.layer {
-                        ClothingLayer::Shirt => s.as_ref().map(|t| t.index),
-                        ClothingLayer::Pants => p.as_ref().map(|t| t.index),
+                        ClothingLayer::Shirt => s.as_ref().map(|t| Composed::Ready(t.index)),
+                        ClothingLayer::Pants => p.as_ref().map(|t| Composed::Ready(t.index)),
                         ClothingLayer::Torso => {
                             let key = format!("torso|{shirt:?}|{pants:?}");
-                            let made = textures.composite_index(&key);
-                            let (sp, pp) = if made.is_some() { (None, None) } else {
-                                (s.and(shirt.as_ref()).and_then(|id| textures.pixels(id, dir, assets)),
-                                 p.and(pants.as_ref()).and_then(|id| textures.pixels(id, dir, assets)))
-                            };
-                            textures.composite(
-                                &key,
-                                || composite_over(pp.as_deref(), sp.as_deref()),
-                                &mut |im, slot| {
-                                    rustudio_render::render::reuse_texture_slot(slot);
-                                    renderer.add_texture(
-                                        &device, &queue, im.width, im.height, &im.pixels,
+                            Some(match textures.composite_index(&key) {
+                                Some(i) => Composed::Ready(i),
+                                None => {
+                                    let spx = s.and(shirt.as_ref()).and_then(|id| textures.pixel_source(id, dir, assets));
+                                    let ppx = p.and(pants.as_ref()).and_then(|id| textures.pixel_source(id, dir, assets));
+                                    textures.composite(
+                                        &key,
+                                        &inputs,
+                                        move || {
+                                            let (s, p) = (spx.and_then(|x| x.get()), ppx.and_then(|x| x.get()));
+                                            composite_over(p.as_deref(), s.as_deref()).map(Composite::new)
+                                        },
+                                        &mut upload,
                                     )
-                                },
-                            )
+                                }
+                            })
                         }
                     } };
-                    if tex.is_none() {
+                    let tex = tex.and_then(|t| {
+                        waiting |= t.pending();
+                        t.index()
+                    });
+                    // (a mesh body part's clothing UVs come with its clothing mesh)
+                    if tex.is_none() || (mesh.is_none() && has_mesh) {
                         waiting = true;
                     }
-                    if let Some(tex) = tex {
+                    if let (Some(tex), true) = (tex, mesh.is_some() || !has_mesh) {
                         if let Some(mesh) = mesh {
                             d.custom_mesh = Some(mesh);
                         }
@@ -1160,6 +1211,7 @@ impl Game {
                 - scene::f32_of(self.doc.prop(sp.r, "LocalTransparencyModifier"))
                     .unwrap_or(0.0)
                     .clamp(0.0, 1.0);
+            let sd_decals = rustudio_core::bench::scope("sd_decals");
             for dec in &sp.decals {
                 if dec.base_surface && variant_maps.is_some() {
                     continue;
@@ -1407,6 +1459,7 @@ impl Game {
                     cast_shadow: false,
                 });
             }
+            drop(sd_decals);
             // Layered clothing fitted onto this body part (wrap.rs).
             let is_target = self.doc.dom.get_by_ref(r).is_some_and(|i| {
                 i.children()
@@ -1414,6 +1467,7 @@ impl Game {
                     .any(|c| self.doc.class_of(*c).is_some_and(|k| k == "WrapTarget"))
             });
             if is_target {
+                let _sw = rustudio_core::bench::scope("sd_wrap");
                 let model = self
                     .doc
                     .dom
@@ -1610,6 +1664,7 @@ impl Game {
             } else {
                 draw_cache.style.remove(&r);
             }
+            let _si = rustudio_core::bench::scope("sd_set_item");
             let mut all = Vec::with_capacity(1 + extra.len());
             all.push(d);
             all.extend(extra);
@@ -1999,6 +2054,10 @@ impl Game {
     /// The part (resolved to its top-level Model unless Alt is held) under a point.
 
     pub fn sync_view_draws(&mut self, ctx: &egui::Context) {
+        // (the last frame's commands are submitted before this one writes
+        // the buffers they read: egui's paint joined it already, unless
+        // nothing was painted)
+        rustudio_render::render_thread::wait();
         {
             let _s = rustudio_core::bench::scope("vp_sync_draws");
             self.sync_draws();
@@ -2177,6 +2236,9 @@ impl Game {
             if std::env::var_os("RUSTUDIO_NO_GUI").is_none() && show_gui {
                 let _g = rustudio_core::bench::scope("gui_draw");
                 gui.sync_roots(doc);
+                if playing {
+                    gui.draw_messages(&ctx, &painter, assets, doc, rect);
+                }
                 gui.draw(
                     &ctx,
                     &painter,
@@ -2292,6 +2354,9 @@ impl Game {
             // The same tone curve rule as the 3D view (lighting::tone_curve_on).
             let curve = rustudio_render::lighting::tone_curve_on(&self.doc).then_some(mech::TONE_CURVE);
             r.draw_world_gui(rs, ctx.font_texture_update(), &self.gui.world_batches, self.effects.drawn(), curve);
+            // The post chain over the scene and its effects, on to the
+            // render thread with the rest of the frame's commands.
+            r.finish_frame(rs);
             // 3D viewport adornments (Team Create collaborator camera gizmos, adorn.rs).
             r.draw_adorn(rs, &self.extra_adorn);
             // Highlights last, over the finished image (highlight.rs).
@@ -2372,7 +2437,7 @@ pub struct LightingState {
     lightgrid_inputs: Option<(Vec<u32>, Option<std::sync::Arc<Vec<u8>>>)>,
     lightgrid_lights: Vec<rustudio_render::render::LightRaw>,
     #[allow(clippy::type_complexity)]
-    lightgrid_job: Option<std::sync::mpsc::Receiver<(rustudio_render::lightgrid::GridBuild, f64, Vec<((String, u32), Vec<(Vec3, Vec3)>)>, bool)>>,
+    lightgrid_job: Option<std::sync::mpsc::Receiver<(rustudio_render::lightgrid::GridBuild, Option<rustudio_render::lightgrid_gpu::GridUpload>, f64, Vec<((String, u32), Vec<(Vec3, Vec3)>)>, bool)>>,
     /// The last full build's state (lightgrid::GridState): the next build
     /// redoes only what changed parts touch.
     lightgrid_state: Option<rustudio_render::lightgrid::GridState>,
@@ -2391,7 +2456,7 @@ pub struct LightingState {
     lightgrid_locals: Option<rustudio_render::lightgrid::LocalLights>,
     lightgrid_local_dirty: bool,
     #[allow(clippy::type_complexity)]
-    lightgrid_local_job: Option<std::sync::mpsc::Receiver<(rustudio_render::lightgrid::LocalLights, Vec<rustudio_render::lightgrid::LocalPatch>, f64)>>,
+    lightgrid_local_job: Option<std::sync::mpsc::Receiver<(rustudio_render::lightgrid::LocalLights, Option<rustudio_render::lightgrid_gpu::GridUpload>, f64)>>,
     /// Parts blocking local lights (lightocc.rs): the grid last asked for
     /// (first voxel, studs per voxel, document) and the one on the GPU,
     /// last rebuild, parts changed since, and the worker filling the next.
@@ -2575,16 +2640,14 @@ impl Game {
         }
         if let Some(rx) = &st.lightgrid_local_job {
             match rx.try_recv() {
-                Ok((locals, patches, ms)) => {
+                Ok((locals, upload, ms)) => {
                     // (the worker's own time, in the bench as a call per job)
                     rustudio_core::bench::add("lightgrid_local_job", ms, 1);
                     // (no full build starts while this runs, so the grid it
                     // re-lit is still the one shown; if not, rebuild)
                     if st.lightgrid_shown == Some(locals.origin) {
-                        if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
-                            for p in &patches {
-                                renderer.set_localgrid_region(&rs.queue, p);
-                            }
+                        if let (Some(renderer), Some(up)) = (self.renderer.as_mut(), upload) {
+                            renderer.upload_lightgrid(up);
                         }
                         st.lightgrid_local_dirty = !locals.matches_lights(&st.lightgrid_lights);
                         st.lightgrid_locals = Some(locals);
@@ -2602,7 +2665,9 @@ impl Game {
         }
         if let Some(rx) = &st.lightgrid_job {
             match rustudio_core::sim_clock::job_recv(rx) {
-                Ok((build, ms, learnt, pending)) => {
+                Ok((build, upload, ms, learnt, pending)) => {
+                    // (the upload was made ready on the job's thread: taking
+                    // it here only queues copies for the next frame)
                     let _apply = rustudio_core::bench::scope("lt_grid_apply");
                     rustudio_core::bench::add("lightgrid_job", ms, 1);
                     // (hulls the job worked out; one still computing on the
@@ -2611,10 +2676,8 @@ impl Game {
                     if pending {
                         st.lightgrid_dirty = true;
                     }
-                    if build.incremental {
-                        rustudio_core::bench::add("lightgrid_job_incremental", 0.0, 1);
-                    }
-                    let rustudio_render::lightgrid::GridBuild { mut grid, patches, occ, locals, state, incremental, changed } = build;
+                    rustudio_core::bench::add(if build.incremental { "lightgrid_job_incremental" } else { "lightgrid_job_full" }, 0.0, 1);
+                    let rustudio_render::lightgrid::GridBuild { grid, occ, locals, state, .. } = build;
                     st.lightgrid_occ = Some(occ);
                     st.lightgrid_state = Some(state);
                     if let Ok(points) = std::env::var("RUSTUDIO_LIGHTGRID_DEBUG") {
@@ -2626,27 +2689,13 @@ impl Game {
                             eprintln!("LIGHTGRID camera={:?} origin={:?} pos={:?} sky={:?}", self.cam.pos, grid.origin, pos, grid.sky_at(v));
                         }
                     }
-                    if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
-                        if !incremental {
-                            renderer.set_lightgrid(&rs.queue, &grid.data);
-                        } else if let Some((lo, hi)) = changed {
-                            // (only the voxels this build changed: the rest
-                            // of the texture is the last build's already)
-                            renderer.set_lightgrid_region(&rs.queue, &grid.data, lo, hi);
-                        }
-                        if incremental {
-                            // (over the channel the last build left there:
-                            // the same grid, kept up by the local path since)
-                            for p in &patches {
-                                renderer.set_localgrid_region(&rs.queue, p);
-                            }
-                        } else {
-                            renderer.set_localgrid(&rs.queue, &grid.local);
-                        }
+                    if let (Some(renderer), Some(up)) = (self.renderer.as_mut(), upload) {
+                        renderer.upload_lightgrid(up);
                         st.lightgrid_shown = Some(grid.origin);
-                        // (the GPU has the channel; it's kept as `locals`)
-                        grid.local = Vec::new();
-                        st.fx.grid = Some(std::sync::Arc::new(grid));
+                        // (the last grid's bytes are let go on the drop thread)
+                        if let Some(old) = st.fx.grid.replace(std::sync::Arc::new(grid)) {
+                            egui_wgpu::prewarm::drop_later(old);
+                        }
                         st.lightgrid_local_dirty = !locals.matches_lights(&st.lightgrid_lights);
                         st.lightgrid_locals = Some(locals);
                     }
@@ -2672,6 +2721,10 @@ impl Game {
             st.lightgrid_sun = sun_key;
             st.lightgrid_dirty = true;
         }
+        // (the build takes the sun as the key holds it: a rebuild for parts
+        // alone then keeps the last build's sun channel instead of sweeping
+        // it again for a sun a hair away)
+        let sun = if shadows { (Vec3::from_array(sun_key.map(|v| v as f32)) / 512.0).normalize_or(sun) } else { sun };
         let key = (origin, self.doc.id);
         let moved = st.lightgrid_key != Some(key);
         let since = st.lightgrid_at.map(|t| rustudio_core::sim_clock::since(t).as_secs_f32());
@@ -2752,7 +2805,7 @@ impl Game {
             let mut inputs: Vec<u32> = Vec::with_capacity(prims.len() * 18 + 8);
             inputs.extend(origin.map(|v| v as u32));
             inputs.push(u32::from(shadows));
-            inputs.extend(sun.to_array().map(f32::to_bits));
+            inputs.extend(sun_key.map(|v| v as u32));
             for (i, (p, boxes)) in prims.iter().enumerate() {
                 if unresolved.binary_search_by_key(&i, |u| u.0).is_ok() {
                     // (not known yet: never the same as a build that knew it)
@@ -2797,8 +2850,16 @@ impl Game {
                 (Some(s), Some(o), Some(l)) if st.lightgrid_shown == Some(origin) => Some((s, o, l)),
                 _ => None,
             };
+            if kept.is_none() {
+                // (why a build starts from scratch: the grid moved on, or
+                // there is no last build; the job's own full builds less
+                // these changed terrain or GlobalShadows)
+                rustudio_core::bench::add(if st.lightgrid_shown.is_some_and(|o| o != origin) { "lightgrid_full_moved" } else { "lightgrid_full_first" }, 0.0, 1);
+            }
             let (tx, rx) = std::sync::mpsc::channel();
             let mut prims = prims;
+            // (the GPU-ready bytes are written on the job's thread too)
+            let device = self.render_state.as_ref().map(|rs| rs.device.clone());
             std::thread::spawn(move || {
                 let t0 = std::time::Instant::now();
                 // The hull boxes the gather didn't know, as it worked them out.
@@ -2829,8 +2890,9 @@ impl Game {
                         prims[i].1 = Some(unit.iter().map(|(lo, hi)| (*lo * size, *hi * size)).collect());
                     }
                 }
-                let build = rustudio_render::lightgrid::build_grid(origin, &prims, terrain, shadows, sun, &local_lights, kept);
-                let _ = tx.send((build, t0.elapsed().as_secs_f64() * 1e3, learnt, pending));
+                let mut build = rustudio_render::lightgrid::build_grid(origin, &prims, terrain, shadows, sun, &local_lights, kept);
+                let upload = device.map(|d| rustudio_render::lightgrid_gpu::GridUpload::of_build(&d, &mut build));
+                let _ = tx.send((build, upload, t0.elapsed().as_secs_f64() * 1e3, learnt, pending));
             });
             st.lightgrid_job = Some(rx);
             st.lightgrid_key = Some(key);
@@ -2849,9 +2911,7 @@ impl Game {
                     match locals.update(&occ, &st.lightgrid_lights, mech::LIGHTGRID_LOCAL_PATCH_MAX) {
                         Ok(patches) => {
                             if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
-                                for p in &patches {
-                                    renderer.set_localgrid_region(&rs.queue, p);
-                                }
+                                renderer.upload_lightgrid(rustudio_render::lightgrid_gpu::GridUpload::of_patches(&rs.device, &patches));
                             }
                             st.lightgrid_local_dirty = false;
                         }
@@ -2860,11 +2920,13 @@ impl Game {
                             // lights' fields), handed back with its patches.
                             let lights = st.lightgrid_lights.clone();
                             let mut locals = st.lightgrid_locals.take().expect("locals");
+                            let device = self.render_state.as_ref().map(|rs| rs.device.clone());
                             let (tx, rx) = std::sync::mpsc::channel();
                             std::thread::spawn(move || {
                                 let t0 = std::time::Instant::now();
                                 let patches = locals.update(&occ, &lights, usize::MAX).unwrap_or_default();
-                                let _ = tx.send((locals, patches, t0.elapsed().as_secs_f64() * 1e3));
+                                let upload = device.map(|d| rustudio_render::lightgrid_gpu::GridUpload::of_patches(&d, &patches));
+                                let _ = tx.send((locals, upload, t0.elapsed().as_secs_f64() * 1e3));
                             });
                             st.lightgrid_local_job = Some(rx);
                             st.lightgrid_local_dirty = false;
@@ -3111,6 +3173,9 @@ pub struct DrawCache {
     pub xf: std::collections::HashMap<Ref, Xform>,
     /// Parts with a mesh or texture still loading.
     pub waiting: std::collections::HashSet<Ref>,
+    /// Parts to resolve that the last frame's budget (`DRAW_SYNC_BUDGET_MS`)
+    /// left for the next one, oldest first.
+    deferred: Vec<Ref>,
     /// Per part: (loaded mesh, textured, decals, clothed) for the self-test.
     flags: std::collections::HashMap<Ref, [u32; 4]>,
     /// Parts drawn as one instance a restyle can patch: the factor from the

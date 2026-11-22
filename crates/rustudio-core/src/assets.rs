@@ -322,6 +322,23 @@ pub fn resolve(id: &str, doc_dir: Option<&Path>) -> Option<PathBuf> {
             {
                 return Some(alt);
             }
+            // ... or in its ExtraContent, which the client serves under
+            // rbxasset:// too (the CoreScripts' icon font,
+            // rbxasset://LuaPackages/Packages/_Index/BuilderIcons/…, and
+            // rbxasset://models/ServerCoreScripts.rbxm live there).
+            if let Some(alt) = content_dir()
+                .canonicalize()
+                .ok()
+                .and_then(|c| c.parent().map(|s| s.join("ExtraContent").join(rest)))
+                .filter(|a| a.is_file())
+                .or_else(|| {
+                    crate::default_scripts::studio_dir()
+                        .map(|s| s.join("ExtraContent").join(rest))
+                        .filter(|a| a.is_file())
+                })
+            {
+                return Some(alt);
+            }
             // The retired death sound: Studio plays sounds/oof.ogg (its 2022
             // replacement) for it; rustudio plays the classic Oof once fetched.
             if matches!(rest.to_ascii_lowercase().as_str(), "sounds/uuhhh.mp3" | "sounds/uuhhh.wav") {
@@ -1171,6 +1188,9 @@ impl AssetStore {
         if let Some(b) = generated(id) {
             return Fetch::Ready(b);
         }
+        if id.starts_with("rbxthumb://") {
+            return thumbnail(id);
+        }
         if let Some(a) = asset_ref(id) {
             return self.fetch(a);
         }
@@ -1229,7 +1249,22 @@ pub type MeshUpload<'a> = dyn FnMut(&[Vec3], &[Vec3], &[Vec2], &[glam::Vec4], &[
 /// (`None`: a new one), so the slot itself stays with the renderer.
 pub type TextureUpload<'a> = dyn FnMut(&Rgba, Option<u32>) -> u32 + 'a;
 
-/// Loaded meshes by content id (None = failed for good).
+/// A mesh parsed and normalised on the asset workers, waiting for its upload.
+type Parsed = Result<((Vec<Vec3>, Vec<Vec3>, Vec<Vec2>, Vec3, Vec<glam::Vec4>, Vec<glam::Vec4>, Vec3), mesh::MeshLods), String>;
+
+fn parse_for_upload(bytes: &[u8]) -> Parsed {
+    mesh::parse_with_lods(bytes)
+        .or_else(|_| mesh::parse(bytes).map(|mesh| (mesh, mesh::MeshLods::default())))
+        .and_then(|(mesh, lods)| normalize_mesh(mesh).map(|geometry| (geometry, lods)))
+}
+
+/// Positions, normals and UVs of a mesh made from another's bytes
+/// (`MeshCache::derived`).
+pub type DerivedMesh = (Vec<Vec3>, Vec<Vec3>, Vec<Vec2>);
+
+/// Loaded meshes by content id (None = failed for good). Meshes are parsed
+/// on the asset workers (asset_work.rs) and uploaded under a per-frame
+/// budget; until then a part's mesh is pending.
 #[derive(Default)]
 pub struct MeshCache {
     entries: HashMap<String, Option<LoadedMesh>>,
@@ -1243,6 +1278,17 @@ pub struct MeshCache {
     uvless: std::collections::HashSet<String>,
     /// Messages for the Output panel (one per new failure).
     pub messages: Vec<String>,
+    /// Parses running on the asset workers and finished ones not uploaded
+    /// yet, keyed like `entries`.
+    parses: crate::asset_work::Jobs<Parsed>,
+    /// Meshes made from another mesh's bytes (`derived`): key → index
+    /// (None: nothing to make), and their jobs.
+    derived: HashMap<String, Option<u32>>,
+    deriving: crate::asset_work::Jobs<Option<DerivedMesh>>,
+    /// This frame's upload time and bytes, and whether one waits for the next.
+    upload_ms: f32,
+    upload_bytes: usize,
+    deferred: bool,
 }
 
 impl MeshCache {
@@ -1278,27 +1324,8 @@ impl MeshCache {
         if !roblox {
             return self.get(id, doc_dir, store, upload);
         }
-        let key = format!("{id}#novc");
-        if let Some(e) = self.entries.get(&key) {
-            return *e;
-        }
-        let mut dropped = |p: &[Vec3], n: &[Vec3], u: &[Vec2], _c: &[glam::Vec4], planes: &[glam::Vec4], lods: &mesh::MeshLods| upload(p, n, u, &[], planes, lods);
         // (loaded apart from a MeshPart's coloured copy of the same mesh)
-        let had = self.entries.remove(id);
-        bump_mesh_generation();
-        let got = self.get(id, doc_dir, store, &mut dropped);
-        let failed = self.entries.contains_key(id);
-        self.entries.remove(id);
-        bump_mesh_generation();
-        if let Some(h) = had {
-            self.entries.insert(id.to_string(), h);
-            bump_mesh_generation();
-        }
-        if got.is_some() || failed {
-            self.entries.insert(key, got);
-            bump_mesh_generation();
-        }
-        got
+        self.load(&format!("{id}#novc"), id, false, doc_dir, store, upload)
     }
 
     pub fn get(
@@ -1323,51 +1350,146 @@ impl MeshCache {
             bump_mesh_generation();
             return Some(mesh);
         }
+        self.load(id, id, true, doc_dir, store, upload)
+    }
+
+    /// The mesh of `id` cached as `key`: loaded, parsing (None; its part is
+    /// redone when `poll` sees it finish), or parsed and uploaded now when
+    /// this frame's budget allows.
+    fn load(
+        &mut self,
+        key: &str,
+        id: &str,
+        colors: bool,
+        doc_dir: Option<&Path>,
+        store: &mut AssetStore,
+        upload: &mut MeshUpload,
+    ) -> Option<LoadedMesh> {
         if !store.allows(id) {
             return None;
         }
-        if let Some(e) = self.entries.get(id) {
+        if let Some(e) = self.entries.get(key) {
             return *e;
         }
-        let loaded = match store.content(id, doc_dir) {
-            Fetch::Pending => return None,
-            Fetch::Unavailable(why) => {
-                if asset_ref(id).is_none() {
-                    self.messages.push(format!(
-                        "Mesh {id} not loaded ({why}); showing a placeholder"
-                    ));
-                }
-                self.reasons.insert(id.to_string(), format!("not fetched: {why}"));
-                None
-            }
-            Fetch::Ready(bytes) => match mesh::parse_with_lods(&bytes)
-                .or_else(|_| mesh::parse(&bytes).map(|mesh| (mesh, mesh::MeshLods::default())))
-                .and_then(|(mesh, lods)| normalize_mesh(mesh).map(|geometry| (geometry, lods))) {
-                Ok(((pos, nrm, uv, extent, mut colors, planes, center), lods)) => {
-                    // A union with UsePartColor: its own Color, not its children's.
-                    if id.ends_with("#partcolor") {
-                        colors.clear();
+        let parsed = match self.parses.take(key) {
+            Some(p) => p,
+            None if self.parses.running(key) => return None,
+            None => match store.content(id, doc_dir) {
+                Fetch::Pending => return None,
+                Fetch::Unavailable(why) => {
+                    if asset_ref(id).is_none() {
+                        self.messages.push(format!(
+                            "Mesh {id} not loaded ({why}); showing a placeholder"
+                        ));
                     }
-                    if uv.iter().all(|t| *t == Vec2::ZERO) {
-                        self.uvless.insert(id.to_string());
-                    }
-                    Some(LoadedMesh {
-                        index: upload(&pos, &nrm, &uv, &colors, &planes, &lods),
-                        extent,
-                        center,
-                    })
+                    self.reasons.insert(id.to_string(), format!("not fetched: {why}"));
+                    self.entries.insert(key.to_string(), None);
+                    bump_mesh_generation();
+                    return None;
                 }
-                Err(e) => {
-                    self.messages
-                        .push(format!("Mesh {id} not loaded: {e}; showing a placeholder"));
-                    self.reasons.insert(id.to_string(), format!("not decoded: {e}"));
-                    None
+                Fetch::Ready(bytes) if sync_decode() => parse_for_upload(&bytes),
+                Fetch::Ready(bytes) => {
+                    self.parses.start(key, move || parse_for_upload(&bytes));
+                    return None;
                 }
             },
         };
-        self.entries.insert(id.to_string(), loaded);
+        if self.over_budget() && !sync_decode() {
+            self.parses.put_back(key.to_string(), parsed);
+            self.deferred = true;
+            return None;
+        }
+        let loaded = match parsed {
+            Ok(((pos, nrm, uv, extent, mut corner_colors, planes, center), lods)) => {
+                // A union with UsePartColor: its own Color, not its children's.
+                if !colors || id.ends_with("#partcolor") {
+                    corner_colors.clear();
+                }
+                if uv.iter().all(|t| *t == Vec2::ZERO) {
+                    self.uvless.insert(id.to_string());
+                }
+                let t0 = std::time::Instant::now();
+                let index = upload(&pos, &nrm, &uv, &corner_colors, &planes, &lods);
+                self.uploaded(t0, pos.len() * 40 + corner_colors.len() * 16 + planes.len() * 16);
+                Some(LoadedMesh { index, extent, center })
+            }
+            Err(e) => {
+                self.messages
+                    .push(format!("Mesh {id} not loaded: {e}; showing a placeholder"));
+                self.reasons.insert(id.to_string(), format!("not decoded: {e}"));
+                None
+            }
+        };
+        self.entries.insert(key.to_string(), loaded);
         bump_mesh_generation();
         loaded
+    }
+
+    /// A mesh made from `id`'s bytes by `build` (classic clothing's UVs on
+    /// a body mesh …), made on the asset workers: Some(Some(index)) made,
+    /// Some(None) nothing to make (`build` gave nothing, or the bytes can't
+    /// be had), None while it is on its way.
+    pub fn derived(
+        &mut self,
+        key: &str,
+        id: &str,
+        doc_dir: Option<&Path>,
+        store: &mut AssetStore,
+        build: impl FnOnce(&[u8]) -> Option<DerivedMesh> + Send + 'static,
+        upload: &mut dyn FnMut(&[Vec3], &[Vec3], &[Vec2]) -> u32,
+    ) -> Option<Option<u32>> {
+        if let Some(e) = self.derived.get(key) {
+            return Some(*e);
+        }
+        let made = match self.deriving.take(key) {
+            Some(m) => m,
+            None if self.deriving.running(key) => return None,
+            None => match store.content(id, doc_dir) {
+                Fetch::Pending => return None,
+                Fetch::Unavailable(_) => {
+                    self.derived.insert(key.to_string(), None);
+                    return Some(None);
+                }
+                Fetch::Ready(bytes) if sync_decode() => build(&bytes),
+                Fetch::Ready(bytes) => {
+                    self.deriving.start(key, move || build(&bytes));
+                    return None;
+                }
+            },
+        };
+        if self.over_budget() && !sync_decode() {
+            self.deriving.put_back(key.to_string(), made);
+            self.deferred = true;
+            return None;
+        }
+        let index = made.map(|(p, n, uv)| {
+            let t0 = std::time::Instant::now();
+            let index = upload(&p, &n, &uv);
+            self.uploaded(t0, p.len() * 32);
+            index
+        });
+        self.derived.insert(key.to_string(), index);
+        Some(index)
+    }
+
+    fn over_budget(&self) -> bool {
+        self.upload_ms > crate::mech::MESH_UPLOAD_BUDGET_MS || self.upload_bytes >= crate::mech::MESH_UPLOAD_BUDGET_BYTES
+    }
+
+    fn uploaded(&mut self, t0: std::time::Instant, bytes: usize) {
+        self.upload_ms += t0.elapsed().as_secs_f32() * 1000.0;
+        self.upload_bytes += bytes;
+    }
+
+    /// Collects the workers' finished meshes and starts the frame's upload
+    /// budget; true when one can be uploaded (the caller bumps its asset
+    /// generation so the parts waiting on them are redone).
+    pub fn poll(&mut self) -> bool {
+        self.upload_ms = 0.0;
+        self.upload_bytes = 0;
+        let parsed = self.parses.poll();
+        let derived = self.deriving.poll();
+        std::mem::take(&mut self.deferred) | parsed | derived
     }
 
     /// A live EditableMesh copy (runtime/editable.rs): built from the mesh
@@ -1405,9 +1527,11 @@ impl MeshCache {
         self.entries.get(id).copied().flatten()
     }
 
-    /// Drops `id` so it loads again.
+    /// Drops `id` so it loads again (a parse of its old bytes still running
+    /// is dropped when it finishes).
     pub fn forget(&mut self, id: &str) {
         self.entries.remove(id);
+        self.parses.forget(id);
         bump_mesh_generation();
         self.uvless.remove(id);
     }
@@ -1456,7 +1580,9 @@ fn parse_upload_budget(v: Option<&str>) -> usize {
     }
 }
 
-fn sync_decode() -> bool {
+/// RUSTUDIO_SYNC_DECODE=1 (and --fixed-dt): texture decodes, mesh parses
+/// and composites are made in the frame that asks, not on the workers.
+pub fn sync_decode() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Fixed-step captures must not race wall-clock workers. Decode and upload
     // in the requesting frame, rather than blocking workers whose memory
@@ -1479,13 +1605,86 @@ pub struct LoadedTexture {
 /// Released pixels kept around for the next composite that shares them.
 const LOOSE_PIXELS_BYTES: usize = 64 << 20;
 
+/// A composite made on the asset workers ([`TextureCache::composite`]):
+/// the image and its sRGB mip chain and, for a SurfaceAppearance, its
+/// emissive mask and packed normal / roughness / metalness map (width,
+/// height, level 0 and its data mip chain: `texture::data_mip_chain`).
+pub struct Composite {
+    pub image: Rgba,
+    pub mips: Option<Vec<u8>>,
+    pub mask: Option<Arc<Rgba>>,
+    pub packed: Option<(u32, u32, Vec<u8>)>,
+}
+
+impl Composite {
+    /// A plain composite image, its mip chain made here (on the worker).
+    pub fn new(image: Rgba) -> Self {
+        Composite { mips: texture::mip_chain_for(&image), image, mask: None, packed: None }
+    }
+}
+
+/// Uploads a composite; the second argument is the texture slot it replaces.
+pub type CompositeUpload<'a> = dyn FnMut(&Composite, Option<u32>) -> u32 + 'a;
+
+/// Where a composite is ([`TextureCache::composite`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Composed {
+    /// Made and on the GPU.
+    Ready(u32),
+    /// Being made on the asset workers (or waiting for its upload); the
+    /// slot of the one it replaces while that is still shown.
+    Pending(Option<u32>),
+    /// Nothing to make from its inputs.
+    Failed,
+}
+
+impl Composed {
+    /// The texture to draw now.
+    pub fn index(self) -> Option<u32> {
+        match self {
+            Composed::Ready(i) | Composed::Pending(Some(i)) => Some(i),
+            _ => None,
+        }
+    }
+
+    pub fn pending(self) -> bool {
+        matches!(self, Composed::Pending(_))
+    }
+}
+
+/// An image's pixels for a composite made on the asset workers: the kept
+/// pixels, or its file's bytes, decoded there.
+#[derive(Clone)]
+pub enum PixelSource {
+    Pixels(Arc<Rgba>),
+    Bytes(Arc<Vec<u8>>),
+}
+
+impl PixelSource {
+    pub fn get(&self) -> Option<Arc<Rgba>> {
+        match self {
+            PixelSource::Pixels(p) => Some(p.clone()),
+            PixelSource::Bytes(b) => texture::decode(b).ok().map(Arc::new),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct TextureCache {
     entries: HashMap<String, Option<LoadedTexture>>,
     /// Why an entry is None (fetch or decode error).
     reasons: HashMap<String, String>,
-    /// Composites (clothing): key → GPU index.
+    /// Composites (clothing, SurfaceAppearance): key → GPU index.
     composites: HashMap<String, u32>,
+    /// Composites being made on the asset workers, and made ones waiting
+    /// for their upload.
+    composing: crate::asset_work::Jobs<Option<Composite>>,
+    /// The assets each composite is made from: one downloaded again is made
+    /// again (`retry`), into the same slot (`stale`, shown meanwhile).
+    composite_inputs: HashMap<String, Vec<AssetRef>>,
+    stale: HashMap<String, u32>,
+    /// Composites with nothing to make from their inputs.
+    composite_failed: std::collections::HashSet<String>,
     pub messages: Vec<String>,
     /// Decodes running on worker threads, and finished ones not yet uploaded.
     decoding: std::collections::HashSet<String>,
@@ -1573,9 +1772,13 @@ impl TextureCache {
                     self.entries.insert(id.to_string(), None);
                     return None;
                 }
-                // Small images decode here; bigger ones on the decode
-                // workers (the part waits and is redone on arrival).
-                Fetch::Ready(bytes) if bytes.len() <= 16 * 1024 || sync_decode() => Some(texture::decode(&bytes).map(|i| (i, None, None))),
+                // Decoded (with the mip chain) on the decode workers, the
+                // part redone on arrival, as Roblox's TextureManager2 decodes
+                // every image on a `TaskScheduler::submitAsyncTask` task
+                // (`submitAsyncLoadImageInner` 0x1050f9038). Small images
+                // were decoded here, their mips made at upload: many
+                // characters arriving at once stalled the frame on them.
+                Fetch::Ready(bytes) if sync_decode() => Some(texture::decode(&bytes).map(|i| (i, None, None))),
                 Fetch::Ready(bytes) => {
                     let (tx, _) = self.decode_chan.get_or_insert_with(std::sync::mpsc::channel);
                     texture::decode_async(bytes, tx.clone(), id.to_string());
@@ -1654,24 +1857,19 @@ impl TextureCache {
         }
     }
 
-    /// A loaded texture's pixels: the kept ones, else decoded again from its
-    /// file (in this frame: rare, a composite made after its inputs went).
-    pub fn pixels(&mut self, id: &str, doc_dir: Option<&Path>, store: &mut AssetStore) -> Option<Arc<Rgba>> {
+    /// A loaded texture's pixels for a composite: the kept ones, else its
+    /// file's bytes (decoded on the asset worker making the composite).
+    pub fn pixel_source(&mut self, id: &str, doc_dir: Option<&Path>, store: &mut AssetStore) -> Option<PixelSource> {
         if id.starts_with("rbxtemp://rustudio/editable/") {
-            return crate::editable_source::image_pixels(id).map(|(_, img)| Arc::new(img));
+            return crate::editable_source::image_pixels(id).map(|(_, img)| PixelSource::Pixels(Arc::new(img)));
         }
         if let Some(px) = self.pixels.get(id) {
-            return Some(px.clone());
+            return Some(PixelSource::Pixels(px.clone()));
         }
-        let Fetch::Ready(bytes) = store.content(id, doc_dir) else { return None };
-        let px = Arc::new(texture::decode(&bytes).ok()?);
-        self.pixels.insert(id.to_string(), px.clone());
-        if !self.pinned.contains(id) {
-            self.loose_bytes += px.pixels.len();
-            self.loose.push_back(id.to_string());
-            self.release_pixels([]);
+        match store.content(id, doc_dir) {
+            Fetch::Ready(bytes) => Some(PixelSource::Bytes(bytes)),
+            _ => None,
         }
-        Some(px)
     }
 
     /// Collects finished background decodes; true when any arrived (the
@@ -1685,7 +1883,7 @@ impl TextureCache {
         self.decoded.retain(|_, (_, frame)| self.decode_frame - *frame <= 3);
         self.upload_ms = 0.0;
         self.upload_bytes = 0;
-        let mut any = std::mem::take(&mut self.deferred);
+        let mut any = std::mem::take(&mut self.deferred) | self.composing.poll();
         let Some((_, rx)) = &self.decode_chan else { return any };
         while let Ok((id, r)) = rx.try_recv() {
             self.decoding.remove(&id);
@@ -1736,46 +1934,107 @@ impl TextureCache {
         self.editable_composites.get(&base).filter(|(full, _)| full == key).map(|(_, i)| *i)
     }
 
-    /// A cached composite, building it the first time.
+    /// A composite made from `inputs` (asset ids) by `build` on the asset
+    /// workers, then uploaded within this frame's texture budget: Pending
+    /// until then (the part is redone when it arrives, `poll_decoded`).
+    /// EditableImage composites (and RUSTUDIO_SYNC_DECODE) are made here.
     pub fn composite(
         &mut self,
         key: &str,
-        build: impl FnOnce() -> Option<Rgba>,
-        upload: &mut TextureUpload,
-    ) -> Option<u32> {
+        inputs: &[&str],
+        build: impl FnOnce() -> Option<Composite> + Send + 'static,
+        upload: &mut CompositeUpload,
+    ) -> Composed {
         if let Some(i) = self.composites.get(key) {
-            return Some(*i);
+            return Composed::Ready(*i);
         }
         // Made from an EditableImage: one GPU slot per composite, whatever
         // the generation (the old one is replaced, not leaked).
         let stripped = crate::editable_source::strip_generations(key);
-        let mut reuse = None;
-        if let Some(base) = &stripped {
-            if let Some((full, i)) = self.editable_composites.get(base) {
-                if full == key {
-                    return Some(*i);
+        if stripped.is_some() || sync_decode() {
+            let mut reuse = self.stale.remove(key);
+            if let Some(base) = &stripped {
+                if let Some((full, i)) = self.editable_composites.get(base) {
+                    if full == key {
+                        return Composed::Ready(*i);
+                    }
+                    reuse = Some(*i);
                 }
-                reuse = Some(*i);
             }
+            let Some(c) = build() else { return Composed::Failed };
+            let i = self.upload_composite(c, reuse, upload);
+            match stripped {
+                Some(base) => {
+                    self.editable_composites.insert(base, (key.to_string(), i));
+                }
+                None => {
+                    self.composites.insert(key.to_string(), i);
+                }
+            }
+            return Composed::Ready(i);
         }
-        let img = build()?;
-        let i = upload(&img, reuse);
-        match stripped {
-            Some(base) => {
-                self.editable_composites.insert(base, (key.to_string(), i));
+        if self.composite_failed.contains(key) {
+            return Composed::Failed;
+        }
+        let stale = self.stale.get(key).copied();
+        match self.composing.take(key) {
+            Some(Some(c)) => {
+                if self.upload_ms > UPLOAD_BUDGET_MS || self.upload_bytes >= upload_budget_bytes() {
+                    self.composing.put_back(key.to_string(), Some(c));
+                    self.deferred = true;
+                    return Composed::Pending(stale);
+                }
+                let reuse = self.stale.remove(key);
+                let i = self.upload_composite(c, reuse, upload);
+                self.composites.insert(key.to_string(), i);
+                Composed::Ready(i)
+            }
+            Some(None) => {
+                self.composite_failed.insert(key.to_string());
+                Composed::Failed
             }
             None => {
-                self.composites.insert(key.to_string(), i);
+                if !self.composing.running(key) {
+                    self.composite_inputs.insert(key.to_string(), inputs.iter().filter_map(|id| asset_ref(id)).collect());
+                    self.composing.start(key, build);
+                }
+                Composed::Pending(stale)
             }
         }
-        Some(i)
     }
 
+    fn upload_composite(&mut self, mut c: Composite, reuse: Option<u32>, upload: &mut CompositeUpload) -> u32 {
+        let t0 = std::time::Instant::now();
+        self.upload_bytes += c.mips.as_ref().map_or(c.image.pixels.len() * 4 / 3, |m| m.len())
+            + c.packed.as_ref().map_or(0, |p| p.2.len())
+            + c.mask.as_ref().map_or(0, |m| m.pixels.len());
+        let mips = c.mips.take();
+        let i = crate::texture::with_mips(&c.image.pixels, mips, || upload(&c, reuse));
+        self.upload_ms += t0.elapsed().as_secs_f32() * 1000.0;
+        i
+    }
+
+    /// Forgets entries for assets that just finished downloading; the
+    /// composites made from one are made again (shown as they were until
+    /// then, and uploaded into the same slot).
     pub fn retry(&mut self, done: &[AssetRef]) {
         self.entries
             .retain(|id, _| asset_ref(id).is_none_or(|a| !done.contains(&a)));
-        if !done.is_empty() {
-            self.composites.clear();
+        if done.is_empty() {
+            return;
+        }
+        let redo: Vec<String> = self
+            .composite_inputs
+            .iter()
+            .filter(|(_, inputs)| inputs.iter().any(|a| done.contains(a)))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in redo {
+            if let Some(i) = self.composites.remove(&key) {
+                self.stale.insert(key.clone(), i);
+            }
+            self.composite_failed.remove(&key);
+            self.composing.forget(&key);
         }
     }
 }
@@ -2636,10 +2895,21 @@ mod tests {
         let mut store = AssetStore::default();
         let mut textures = TextureCache::default();
         let mut up = |_: &Rgba, _: Option<u32>| 7u32;
+        // Images decode on the workers: ask again until the result is in.
+        fn loaded(textures: &mut TextureCache, id: &str, dir: Option<&Path>, store: &mut AssetStore, up: &mut TextureUpload) -> bool {
+            for _ in 0..500 {
+                if textures.image(id, dir, store, up).is_some() {
+                    return true;
+                }
+                textures.poll_decoded();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            false
+        }
         // Edit: local files render (and land in the texture cache).
         for id in &locals {
             assert!(matches!(store.content(id, Some(&dir)), Fetch::Ready(b) if *b == bytes), "{id}");
-            assert!(textures.image(id, Some(&dir), &mut store, &mut up).is_some(), "{id}");
+            assert!(loaded(&mut textures, id, Some(&dir), &mut store, &mut up), "{id}");
         }
         // Play: neither a fresh load nor the cache gives them.
         store.scripts_running = true;
@@ -2652,7 +2922,7 @@ mod tests {
         let id = "rbxtemp://rustudio/test-play-content.png";
         register_generated(id, bytes.clone());
         let generated_ok = matches!(store.content(id, None), Fetch::Ready(b) if *b == bytes)
-            && textures.image(id, None, &mut store, &mut up).is_some();
+            && loaded(&mut textures, id, None, &mut store, &mut up);
         unregister_generated(id);
         assert!(generated_ok);
         for id in ["rbxassetid://12345", "rbxasset://textures/white.png", "http://www.roblox.com/asset/?id=5", "12345"] {
@@ -2875,4 +3145,44 @@ pub fn ray_triangles_normal(origin: Vec3, dir: Vec3, tris: &[[Vec3; 3]]) -> Opti
         }
     }
     best
+}
+
+/// `rbxthumb://type=…&id=…&w=…&h=…`: Roblox's thumbnail of a user (avatar,
+/// headshot, bust), an outfit or an asset, from the thumbnails API (the
+/// CoreScripts' player rows ask for AvatarHeadShot). Fetched once in the
+/// background; Pending until it arrives.
+fn thumbnail(id: &str) -> Fetch {
+    type Slot = Option<Result<Arc<Vec<u8>>, String>>;
+    static THUMBS: std::sync::LazyLock<Mutex<HashMap<String, Slot>>> = std::sync::LazyLock::new(Default::default);
+    let mut g = THUMBS.lock().unwrap_or_else(|e| e.into_inner());
+    match g.get(id) {
+        Some(Some(Ok(b))) => return Fetch::Ready(b.clone()),
+        Some(Some(Err(e))) => return Fetch::Unavailable(e.clone()),
+        Some(None) => return Fetch::Pending,
+        None => {}
+    }
+    let q = id.trim_start_matches("rbxthumb://").to_string();
+    let field = |k: &str| {
+        q.split('&').find_map(|kv| kv.split_once('=').filter(|(a, _)| a.eq_ignore_ascii_case(k)).map(|(_, v)| v.to_string()))
+    };
+    let Some(tid) = field("id").and_then(|v| v.parse::<u64>().ok()) else {
+        return Fetch::Unavailable(format!("{id}: no id"));
+    };
+    let kind = field("type").unwrap_or_default();
+    g.insert(id.to_string(), None);
+    let key = id.to_string();
+    std::thread::spawn(move || {
+        use rustudio_account::characters::{thumbnails, Thumb};
+        let got = match kind.as_str() {
+            "AvatarHeadShot" => rustudio_account::api::headshots(&[tid]).map_err(|e| e.to_string()),
+            "Avatar" | "AvatarBust" => thumbnails(Thumb::User, &[tid]).map_err(|e| e.to_string()),
+            "Outfit" => thumbnails(Thumb::Outfit, &[tid]).map_err(|e| e.to_string()),
+            _ => thumbnails(Thumb::Asset, &[tid]).map_err(|e| e.to_string()),
+        };
+        let r = got.and_then(|v| v.into_iter().next().map(|(_, b)| Arc::new(b)).ok_or_else(|| format!("{key}: thumbnail not ready")));
+        if let Ok(mut g) = THUMBS.lock() {
+            g.insert(key, Some(r));
+        }
+    });
+    Fetch::Pending
 }

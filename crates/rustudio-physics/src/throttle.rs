@@ -22,6 +22,10 @@ const TABLE: [i32; 9] = [100_000_000, 8, 4, 3, 2, -3, -4, -8, -16];
 const BUDGET: f32 = 0.8;
 /// Steps owed at which the level rises regardless of cost (Studio = 2).
 const LATE_STEPS: u32 = 2;
+/// The stepped fraction at or below which a frame runs only
+/// mech::THROTTLED_MAX_PHYSICS_STEPS world steps (Studio 0.746: the float 0.4 at
+/// 0x108f46868 compared in `World::updateStepsRequiredForCyclicExecutive`).
+const THROTTLED_STEPS_FRACTION: f32 = 0.4;
 
 /// Workspace.PhysicsEnvironmentalThrottle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -118,6 +122,19 @@ impl Throttle {
     /// workspace:GetPhysicsThrottling(): the stepped share in percent.
     pub fn percent(&self) -> f64 {
         (f64::from(self.fraction()) * 100.0).round()
+    }
+
+    /// World steps one frame may run (Studio 0.746 `World::updateStepsRequiredForCyclicExecutive`
+    /// 0x100309f1e: `DFInt::MaxMissedWorldStepsRemembered` (12, at least 12) while more than
+    /// 0.4 of the frames step the environment, else 4, one 60 Hz frame's worth). Studio's
+    /// rule reads the throttle factor; Always and Disabled have none here, so they keep 12.
+    pub fn max_world_steps(&self) -> usize {
+        let throttled = matches!(self.mode, Mode::Default | Mode::Skip(_)) && self.fraction() <= THROTTLED_STEPS_FRACTION;
+        if throttled {
+            rustudio_core::mech::THROTTLED_MAX_PHYSICS_STEPS
+        } else {
+            rustudio_core::mech::MAX_PHYSICS_STEPS
+        }
     }
 
     /// One world tick of the current frame took `ms` of wall time.
@@ -223,5 +240,16 @@ mod tests {
         // Owed steps raise it even when cheap.
         t.adapt(1000.0 / 60.0, 3);
         assert_eq!(t.level(), 1);
+    }
+
+    /// Studio's frame step cap: 12 world steps, 4 once the throttle steps the
+    /// environment on 40 % of frames or fewer (levels 5..8: 33 %, 25 %, 13 %, 6 %).
+    #[test]
+    fn heavy_throttle_caps_a_frame_at_four_steps() {
+        let caps: Vec<usize> = (0..9u8).map(|level| Throttle { level, ..Default::default() }.max_world_steps()).collect();
+        assert_eq!(caps, vec![12, 12, 12, 12, 12, 4, 4, 4, 4]);
+        assert_eq!(Throttle { mode: Mode::Skip(2), ..Default::default() }.max_world_steps(), 12);
+        assert_eq!(Throttle { mode: Mode::Skip(4), ..Default::default() }.max_world_steps(), 4);
+        assert_eq!(Throttle { mode: Mode::Always, ..Default::default() }.max_world_steps(), 12);
     }
 }

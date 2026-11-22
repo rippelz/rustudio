@@ -42,6 +42,7 @@ pub const METHODS: &[(&str, &str)] = &[
     ("SetFingerTip", "DigitsRigDescription"),
     ("SetJoint", "DigitsRigDescription"),
     ("GetAccessoryType", "AvatarEditorService"),
+    ("BustAvatarFetchCache", "AvatarEditorService"),
 ];
 pub const EVENTS: &[(&str, &str)] = &[
     ("PromptAllowInventoryReadAccessCompleted", "AvatarEditorService"),
@@ -135,6 +136,14 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
     if class == "AvatarEditorService" && name == "GetAccessoryType" {
         return Some(accessory_type(lua, args));
     }
+    // The menu's Respawn / Reset calls it before the character respawns, so
+    // the new one wears the avatar as it is now: the host fetches it again.
+    if class == "AvatarEditorService" && name == "BustAvatarFetchCache" {
+        return Some(world(lua).map(|mut w| {
+            w.avatar_fetch_busted = true;
+            MultiValue::new()
+        }));
+    }
     if matches!(class.as_str(), "HumanoidRigDescription" | "DigitsRigDescription") {
         if let Some(r) = rig::call(lua, &class, name, this, args) {
             return Some(r);
@@ -146,6 +155,13 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
 pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
     if let Some(v) = props::prop_get(lua, r, class, key)? {
         return Ok(Some(v));
+    }
+    // The emotes whose assets the client has: every emote of the
+    // description (rustudio doesn't load them ahead; estimate). Read by the
+    // CoreScripts' emotes menu (RobloxScriptSecurity).
+    if class == "HumanoidDescription" && key == "NumberEmotesLoaded" {
+        let n: usize = desc::emotes(lua, r)?.iter().map(|(_, ids)| ids.len()).sum();
+        return Ok(Some(Value::Integer(n as i64)));
     }
     if class == "FaceControls" {
         if let Some(v) = face::prop_get(lua, r, key)? {

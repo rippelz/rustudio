@@ -117,6 +117,9 @@ pub struct Tracks {
     /// (clip, rig) → its retargeter.
     retargeters: HashMap<(usize, Ref), Rc<super::anim_retarget::Retargeter>>,
     steps: u64,
+    /// The step `load_ms` is for, and the time spent loading clips in it.
+    load_step: u64,
+    load_ms: f64,
 }
 
 struct RigBindings {
@@ -202,13 +205,34 @@ fn convert(lua: &Lua, t: &Table) -> mlua::Result<Seq> {
 }
 
 /// The sequence for an id: (Some, _) loaded, (None, true) still
-/// downloading, (None, false) unavailable.
+/// downloading, (None, false) unavailable. Clips loaded this Animator step
+/// past `mech::ANIM_LOAD_BUDGET_MS` wait for the next one, still loading
+/// as far as the track can tell (Roblox loads clips asynchronously: a
+/// track's Length is 0 until its clip is in). A character arriving with
+/// a dozen clips loaded them all in one frame.
 fn load(lua: &Lua, id: &str) -> mlua::Result<(Option<Rc<Seq>>, bool)> {
-    if let Some(s) = tracks(lua).seqs.get(id) {
-        return Ok((Some(s.clone()), false));
+    let budgeted = !rbx_dom_weak::deterministic() && !rustudio_core::assets::sync_decode();
+    {
+        let t = tracks(lua);
+        if let Some(s) = t.seqs.get(id) {
+            return Ok((Some(s.clone()), false));
+        }
+        if budgeted && t.load_step == t.steps && t.load_ms >= rustudio_core::mech::ANIM_LOAD_BUDGET_MS {
+            return Ok((None, true));
+        }
     }
+    let _s = rustudio_core::bench::scope("anim_seq_load");
+    let started = std::time::Instant::now();
     let f: Function = lua.globals().get("__rs_anim_load")?;
     let (mut seq, mut still): (Value, bool) = f.call(id)?;
+    {
+        let mut t = tracks(lua);
+        if t.load_step != t.steps {
+            t.load_step = t.steps;
+            t.load_ms = 0.0;
+        }
+        t.load_ms += started.elapsed().as_secs_f64() * 1000.0;
+    }
     // RUSTUDIO_DETERMINISTIC=1 (test runs): wait for the asset (it arrives on a background
     // thread at wall-clock time), so a track starts on the same frame on every run.
     if rbx_dom_weak::deterministic() {

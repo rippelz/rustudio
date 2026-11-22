@@ -1,6 +1,6 @@
 //! Client replication messages, indexed by the negotiated server schema.
 use crate::handshake::{put_varint, put_varstr, zigzag};
-use crate::replicator::{PropValue, Schema};
+use crate::replicator::{PropValue, Schema, SessionKind};
 
 /// Encode one property change using the class's actual schema index.
 /// Unsupported value types are rejected before any bytes are sent.
@@ -74,16 +74,28 @@ fn encode_tagged(out: &mut Vec<u8>, schema: &Schema, value: &PropValue, compress
     let ty=match value {
         PropValue::Bool(_)=>0x09,PropValue::Int(_) | PropValue::Int64(_)=>0x2c,PropValue::Float(_)=>0x0c,PropValue::Float32(_)=>0x0b,
         PropValue::String(_)=>0x02,PropValue::BinaryString(_)=>0x08,PropValue::Array(_)=>0x1e,PropValue::Dictionary(_)=>0x1f,
-        PropValue::Ref(_)=>0x1c,PropValue::Enum(_)=>0x07,
+        PropValue::Ref(_)=>0x1c,PropValue::Enum(_) | PropValue::EnumItem { .. }=>0x07,
         PropValue::Color3(_)=>0x13,PropValue::Color3uint8(_)=>0x14,
         PropValue::Vector3(_)=>0x16,PropValue::Vector2(_)=>0x15,PropValue::CFrame {..}=>0x1a,
         PropValue::Typed { ty, .. } => *ty,
         _=>return Err("Unsupported event container value".into()),
     };
     out.push(ty);
-    // Container elements with tag 0x07 carry a u16 LE enum id before the varint.
+    // Container elements with tag 0x07 carry a u16 LE enum id before the
+    // varint. In a game client session it is the enum's index in the schema
+    // (see `PropValue::EnumItem`); Team Create, and a value that doesn't say
+    // which enum it is, keep 0xffff.
     if ty == 0x07 {
-        out.extend_from_slice(&0xffffu16.to_le_bytes());
+        let index = match value {
+            PropValue::EnumItem { enum_type, .. } if schema.kind == SessionKind::GameClient => schema
+                .enums
+                .iter()
+                .position(|e| e == enum_type)
+                .and_then(|i| u16::try_from(i).ok())
+                .ok_or_else(|| format!("Enum.{enum_type} is not replicated by this server"))?,
+            _ => 0xffff,
+        };
+        out.extend_from_slice(&index.to_le_bytes());
     }
     encode_value(out,schema,ty,value,compress_content)
 }
@@ -188,7 +200,7 @@ pub(crate) fn encode_value(
         }
         (0x09, PropValue::Bool(v)) => out.push(u8::from(*v)),
         (0x0a | 0x2c, PropValue::Int(v) | PropValue::Int64(v)) => put_varint(out, zigzag(*v)),
-        (0x07, PropValue::Enum(v)) => put_varint(out, u64::from(*v)),
+        (0x07, PropValue::Enum(v) | PropValue::EnumItem { value: v, .. }) => put_varint(out, u64::from(*v)),
         (0x0b, PropValue::Float(v)) => out.extend_from_slice(&(*v as f32).to_le_bytes()),
         (0x0c, PropValue::Float(v)) => out.extend_from_slice(&v.to_le_bytes()),
         (0x02, PropValue::BinaryString(v)) => put_varstr(out, v),
@@ -254,6 +266,22 @@ pub(crate) fn encode_value(
                 out.extend_from_slice(&f.to_le_bytes());
             }
         }
+        // CoordinateFrameCompressed (game client sessions; Team Create
+        // doesn't write it): the position, then an axis-aligned rotation as
+        // its basic rotation id, any other as 0 and the packed quaternion the
+        // reader's `rotation_compressed` takes.
+        (0x1b, PropValue::CFrame { pos, rot }) if schema.kind == SessionKind::GameClient => {
+            for f in pos {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+            match basic_rotation_id(rot) {
+                Some(id) => out.push(id),
+                None => {
+                    out.push(0);
+                    put_packed_rotation(out, rot);
+                }
+            }
+        }
         (0x1c | 0x45, PropValue::Ref(reference)) => match reference {
             Some(id) => {
                 put_reference(out, *id);
@@ -316,6 +344,29 @@ pub(crate) fn encode_value(
                 out.extend_from_slice(&f.to_le_bytes());
             }
         }
+        // OptionalCoordinateFrameCompressed (game client sessions): 0 when
+        // absent, else bit 7 and the rotation as for 0x1b, then the
+        // position. The reader keeps a present one as 0x32's `[pos, rot]`
+        // bytes.
+        (0x33, PropValue::Raw(bytes)) if schema.kind == SessionKind::GameClient && bytes.is_empty() => out.push(0),
+        (0x33, PropValue::Raw(bytes)) if schema.kind == SessionKind::GameClient && bytes.len() == 48 => {
+            let f = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+            let pos = [f(0), f(1), f(2)];
+            let rot = [f(3), f(4), f(5), f(6), f(7), f(8), f(9), f(10), f(11)];
+            return encode_value(out, schema, ty, &PropValue::CFrame { pos, rot }, compress_content);
+        }
+        (0x33, PropValue::CFrame { pos, rot }) if schema.kind == SessionKind::GameClient => {
+            match basic_rotation_id(rot) {
+                Some(id) => out.push(0x80 | id),
+                None => {
+                    out.push(0x80);
+                    put_packed_rotation(out, rot);
+                }
+            }
+            for f in pos {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+        }
         (0x3b | 0x3c, PropValue::NetAssetHandle(handle)) => {
             if schema.net_asset_handles {
                 match handle {
@@ -343,6 +394,49 @@ pub(crate) fn encode_value(
         _ => return Err(format!("Wire value type {ty:#x} is not supported yet")),
     }
     Ok(())
+}
+
+/// The basic rotation id of a row-major rotation that is axis-aligned
+/// (within float noise), as the reader's `rotation` reads it back.
+fn basic_rotation_id(rot: &[f32; 9]) -> Option<u8> {
+    let r = rot.map(|v| if (v - v.round()).abs() < 1e-4 { v.round() } else { v });
+    let v = |i: usize| rbx_types::Vector3::new(r[i], r[i + 1], r[i + 2]);
+    rbx_types::Matrix3::new(v(0), v(3), v(6)).to_basic_rotation_id()
+}
+
+/// The packed unit quaternion the reader's `rotation_compressed` takes:
+/// u16 `a`, u32 `b`; the largest component is dropped (made positive) and
+/// its index goes in `b >> 30`, the other three are 15-bit signed values of
+/// `x / √½ × 16383`.
+fn put_packed_rotation(out: &mut Vec<u8>, rot: &[f32; 9]) {
+    let [m00, m01, m02, m10, m11, m12, m20, m21, m22] = *rot;
+    // Row-major matrix → (x, y, z, w).
+    let trace = m00 + m11 + m22;
+    let mut q = if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        [(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25 * s]
+    } else if m00 > m11 && m00 > m22 {
+        let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+        [0.25 * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s]
+    } else if m11 > m22 {
+        let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+        [(m01 + m10) / s, 0.25 * s, (m12 + m21) / s, (m02 - m20) / s]
+    } else {
+        let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+        [(m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s]
+    };
+    let n = q.iter().map(|v| v * v).sum::<f32>().sqrt().max(f32::EPSILON);
+    q = q.map(|v| v / n);
+    let largest = (0..4).max_by(|&a, &b| q[a].abs().total_cmp(&q[b].abs())).unwrap_or(3);
+    if q[largest] < 0.0 {
+        q = q.map(|v| -v);
+    }
+    let field = |v: f32| ((v / std::f32::consts::FRAC_1_SQRT_2 * 16383.0).round().clamp(-16383.0, 16383.0) as i32 as u32) & 0x7fff;
+    let others = [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]][largest];
+    let a = field(q[others[0]]) as u16;
+    let b = ((largest as u32) << 30) | (field(q[others[1]]) << 15) | field(q[others[2]]);
+    out.extend_from_slice(&a.to_le_bytes());
+    out.extend_from_slice(&b.to_le_bytes());
 }
 
 /// NewObjectItem with schema-indexed properties and an empty early group.
@@ -426,16 +520,22 @@ pub fn create_partial_with(
     // live on a test place, 2026-11-20: Name alone is accepted, Name + any of them
     // resets).
     encoded.sort_by_key(|(pi,_,_)| *pi);
-    // Protected source is serialized in NewObject's early group.
-    for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| *ty==0x06) {
-        out.push(pi);encode_value(&mut out,schema,ty,value,true)?;
+    // NewObject writes its first property group, then its second. In a game
+    // client session the first holds the types Studio's `getPropertyGroup`
+    // puts there: references, ContentIds, protected and script sources, …
+    // [verified: Studio 0.746 `getPropertyGroup`]. Team Create's first group
+    // keeps only protected sources, as it always has.
+    let game_client = schema.kind == SessionKind::GameClient;
+    let first = |ty: u8| if game_client { matches!(ty, 0x03 | 0x06 | 0x1c | 0x21 | 0x22 | 0x2f | 0x45) } else { ty == 0x06 };
+    for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| first(*ty)) {
+        out.push(pi);encode_value(&mut out,schema,ty,value,!game_client)?;
     }
     out.push(0xff);
-    for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| *ty!=0x06) {
+    for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| !first(*ty)) {
         out.push(pi);encode_value(&mut out,schema,ty,value,false)?;
     }
     out.push(0xff);
-    for (_,_,value) in encoded.iter().filter(|(_,ty,_)| *ty==0x06).chain(encoded.iter().filter(|(_,ty,_)| *ty!=0x06)) {
+    for (_,_,value) in encoded.iter().filter(|(_,ty,_)| first(*ty)).chain(encoded.iter().filter(|(_,ty,_)| !first(*ty))) {
         append_shared(&mut out,value,sent);
     }
     put_reference(&mut out, parent);
@@ -1329,5 +1429,122 @@ mod tests {
                 "type {bad_ty:#x} should be rejected"
             );
         }
+    }
+
+    /// An enum inside a dictionary keeps the enum type its index names in a
+    /// game client session, and goes back with that index (`status 07 09 02
+    /// 02`). Team Create reads the bare value and writes `0xffff`, as before.
+    #[test]
+    fn container_enums_keep_their_type() {
+        let mut enums = vec![String::new(); 0x209];
+        enums.push("TextChatMessageStatus".into());
+        let game = Schema { enums: enums.clone(), kind: SessionKind::GameClient, ..Default::default() };
+        let mut d = vec![1u8];
+        put_varstr(&mut d, b"status");
+        d.extend_from_slice(&[0x07, 0x09, 0x02, 0x02]);
+        let (v, used) = game.decode_value_bytes(0x1f, &d, true).unwrap();
+        assert_eq!(used, d.len());
+        let want = PropValue::Dictionary(vec![(
+            "status".into(),
+            PropValue::EnumItem { enum_type: "TextChatMessageStatus".into(), value: 2 },
+        )]);
+        assert_eq!(v, want);
+        let mut out = Vec::new();
+        encode_value(&mut out, &game, 0x1f, &v, true).unwrap();
+        assert_eq!(out, d);
+        // Team Create: a bare Enum both ways.
+        let edit = Schema { enums, ..Default::default() };
+        let (v, used) = edit.decode_value_bytes(0x1f, &d, true).unwrap();
+        assert_eq!(used, d.len());
+        assert_eq!(v, PropValue::Dictionary(vec![("status".into(), PropValue::Enum(2))]));
+        let mut out = Vec::new();
+        encode_value(&mut out, &edit, 0x1f, &v, true).unwrap();
+        let mut old = vec![1u8];
+        put_varstr(&mut old, b"status");
+        old.extend_from_slice(&[0x07, 0xff, 0xff, 0x02]);
+        assert_eq!(out, old);
+    }
+
+    /// Compressed CFrames (0x1b, 0x33) write back what the reader reads in a
+    /// game client session: an axis-aligned rotation as its basic id, an
+    /// oblique one as the packed quaternion. Team Create doesn't write them,
+    /// as before.
+    #[test]
+    fn compressed_cframes_round_trip() {
+        let schema = Schema { kind: SessionKind::GameClient, ..Schema::default() };
+        // 0.5 rad about an oblique axis (no basic rotation id).
+        let n = 14f32.sqrt();
+        let (s, w) = (0.25f32.sin(), 0.25f32.cos());
+        let (x, y, z) = (s / n, 2.0 * s / n, 3.0 * s / n);
+        let oblique = [
+            1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w),
+            2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w),
+            2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y),
+        ];
+        let m = rbx_types::Matrix3::from_basic_rotation_id(6).unwrap();
+        let basic = [m.x.x, m.x.y, m.x.z, m.y.x, m.y.y, m.y.z, m.z.x, m.z.y, m.z.z];
+        let close = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-3);
+        for rot in [oblique, basic] {
+            let cf = PropValue::CFrame { pos: [1.0, -2.0, 3.0], rot };
+            let mut out = Vec::new();
+            encode_value(&mut out, &schema, 0x1b, &cf, false).unwrap();
+            let (back, used) = schema.decode_value_bytes(0x1b, &out, false).unwrap();
+            assert_eq!(used, out.len());
+            let PropValue::CFrame { pos, rot: got } = back else { panic!("{back:?}") };
+            assert!(pos == [1.0, -2.0, 3.0] && close(&got, &rot), "{got:?} vs {rot:?}");
+            let mut out = Vec::new();
+            encode_value(&mut out, &schema, 0x33, &cf, false).unwrap();
+            let (back, used) = schema.decode_value_bytes(0x33, &out, false).unwrap();
+            assert_eq!(used, out.len());
+            let PropValue::Typed { ty: 0x32, bytes } = back else { panic!("{back:?}") };
+            let f: Vec<f32> = bytes.chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+            assert!(f[..3] == [1.0, -2.0, 3.0] && close(&f[3..], &rot), "{f:?}");
+            // Team Create: unsupported, as before.
+            for ty in [0x1b, 0x33] {
+                assert!(encode_value(&mut Vec::new(), &Schema::default(), ty, &cf, false).is_err());
+            }
+        }
+        // A basic id goes as one byte.
+        let mut out = Vec::new();
+        encode_value(&mut out, &schema, 0x1b, &PropValue::CFrame { pos: [0.0; 3], rot: basic }, false).unwrap();
+        assert_eq!(out.len(), 13);
+        assert_eq!(out[12], 6);
+    }
+
+    /// In a game client session NewObject's first group holds a ContentId
+    /// (getPropertyGroup), the second the rest, each in schema order. Team
+    /// Create's first group stays empty here (protected sources only).
+    #[test]
+    fn content_ids_go_in_new_objects_first_group() {
+        let decal = |kind: SessionKind| Schema {
+            classes: vec![SchemaClass {
+                name: "Decal".into(),
+                props: vec![SchemaProp { name: "Texture".into(), ty: 0x21 }, SchemaProp { name: "Transparency".into(), ty: 0x0b }],
+                events: vec![],
+            }],
+            kind,
+            ..Default::default()
+        };
+        let props = vec![
+            ("Transparency".to_string(), PropValue::Float32(0.5)),
+            ("Texture".to_string(), PropValue::String("rbxassetid://1".into())),
+        ];
+        let out = create(&decal(SessionKind::GameClient), 7, "Decal", 1, &props).unwrap();
+        // 83 02, ref (01 + u32), u16 class 0, then [00 Texture] ff [01 f32] ff.
+        let mut want = vec![0x83, 2, 1, 7, 0, 0, 0, 0, 0, 0];
+        put_varstr(&mut want, b"rbxassetid://1");
+        want.push(0xff);
+        want.push(1);
+        want.extend_from_slice(&0.5f32.to_le_bytes());
+        want.push(0xff);
+        assert_eq!(&out[..want.len()], want.as_slice());
+        // Team Create: ff, then [00 Texture] [01 f32] ff.
+        let out = create(&decal(SessionKind::CloudEdit), 7, "Decal", 1, &props).unwrap();
+        let mut old = vec![0x83, 2, 1, 7, 0, 0, 0, 0, 0, 0xff, 0];
+        put_varstr(&mut old, b"rbxassetid://1");
+        old.push(1);
+        old.extend_from_slice(&0.5f32.to_le_bytes());
+        old.push(0xff);
+        assert_eq!(&out[..old.len()], old.as_slice());
     }
 }

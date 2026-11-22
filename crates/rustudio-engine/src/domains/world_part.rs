@@ -73,6 +73,9 @@ pub struct Graph {
     recs: HashMap<Ref, JointRec>,
     /// Attachment → the constraints naming it (moving one moves the constraint).
     att: HashMap<Ref, Vec<Ref>>,
+    /// Part → the joint its place in its assembly's member order came from
+    /// when last keyed (`MemberKeys`).
+    best: HashMap<Ref, Ref>,
 }
 
 fn rigid_joint(class: &str) -> bool {
@@ -149,18 +152,100 @@ fn remove_one(map: &mut HashMap<Ref, Vec<Ref>>, k: Ref, v: Ref) {
 }
 
 /// Where `r` comes in `descendants_of` (breadth first, children in order):
-/// its depth, then its path of child positions.
-fn bfs_key(d: &Document, r: Ref) -> (usize, Vec<u32>) {
+/// its depth, then its path of child positions. `at` remembers each
+/// visited parent's child positions: an assembly of a big model's parts
+/// asks about the same parents for every joint, and a scan of a parent
+/// with thousands of children per joint made re-sorting such an assembly
+/// quadratic (a welded map arriving in pieces).
+fn bfs_key(d: &Document, r: Ref, at: &mut ChildPositions) -> (usize, Vec<u32>) {
     let mut path = Vec::new();
     let mut cur = r;
     while let Some(i) = d.dom.get_by_ref(cur) {
         let parent = i.parent();
         let Some(p) = d.dom.get_by_ref(parent) else { break };
-        path.push(p.children().iter().position(|c| *c == cur).unwrap_or(0) as u32);
+        if at.parents.insert(parent) {
+            at.pos.extend(p.children().iter().enumerate().map(|(k, c)| (*c, k as u32)));
+        }
+        path.push(at.pos.get(&cur).copied().unwrap_or(0));
         cur = parent;
     }
     path.reverse();
     (path.len(), path)
+}
+
+/// Child positions of the parents `bfs_key` has seen (one document state).
+#[derive(Default)]
+struct ChildPositions {
+    parents: rustc_hash::FxHashSet<Ref>,
+    pos: rustc_hash::FxHashMap<Ref, u32>,
+}
+
+/// A part's place in a full build's member order: its first rigid joint's
+/// `bfs_key`, then 0 as that joint's Part0, 1 as its Part1.
+type MemberKey = ((usize, Vec<u32>), u8);
+
+/// `MemberKey`s, each joint's and part's key worked out once (one
+/// document state).
+#[derive(Default)]
+struct MemberKeys {
+    joints: HashMap<Ref, (usize, Vec<u32>)>,
+    /// Parts keyed by `cached`, and the joint each key came from.
+    parts: HashMap<Ref, Option<(MemberKey, Ref)>>,
+    at: ChildPositions,
+}
+
+impl MemberKeys {
+    /// `p`'s key from joint `j` (None: `j` makes no rigid edge with `p`).
+    fn joint_key(&mut self, g: &Graph, d: &Document, j: Ref, p: Ref) -> Option<MemberKey> {
+        let (a, b) = g.recs.get(&j).and_then(|r| r.edge)?;
+        let side = if a == p { 0 } else if b == p { 1 } else { return None };
+        let at = &mut self.at;
+        Some((self.joints.entry(j).or_insert_with(|| bfs_key(d, j, at)).clone(), side))
+    }
+
+    /// `p`'s key and the joint it comes from, from all of `p`'s joints.
+    fn of(&mut self, g: &Graph, d: &Document, p: Ref) -> Option<(MemberKey, Ref)> {
+        let mut best: Option<(MemberKey, Ref)> = None;
+        for &j in g.joints.get(&p).into_iter().flatten() {
+            let Some(k) = self.joint_key(g, d, j, p) else { continue };
+            if best.as_ref().is_none_or(|(bk, _)| k < *bk) {
+                best = Some((k, j));
+            }
+        }
+        best
+    }
+
+    /// `p`'s key after an edit that added joints and took none away (`dj`:
+    /// the joints the edit touched): the better of its last key's joint's
+    /// (when that one didn't change: the others kept their order behind it)
+    /// and its changed joints', else from all of its joints. A part with
+    /// many joints (a map's every part welded to one base) costs a key or
+    /// two, not one per weld. Also whether the joint it comes from changed
+    /// (its place in the order may have).
+    fn updated(&mut self, g: &Graph, d: &Document, p: Ref, dj: &HashSet<Ref>) -> (Option<(MemberKey, Ref)>, bool) {
+        let last = g.best.get(&p).copied().filter(|j| !dj.contains(j));
+        if let Some(k) = self.parts.get(&p) {
+            return (k.clone(), k.as_ref().map(|k| k.1) != last);
+        }
+        let (k, moved) = match last.and_then(|j| Some((self.joint_key(g, d, j, p)?, j))) {
+            Some(mut best) => {
+                for &j in g.joints.get(&p).into_iter().flatten().filter(|j| dj.contains(*j)) {
+                    if let Some(k) = self.joint_key(g, d, j, p).filter(|k| *k < best.0) {
+                        best = (k, j);
+                    }
+                }
+                let moved = Some(best.1) != last;
+                (Some(best), moved)
+            }
+            None => (self.of(g, d, p), true),
+        };
+        self.parts.insert(p, k.clone());
+        (k, moved)
+    }
+
+    fn cached(&mut self, g: &Graph, d: &Document, p: Ref, dj: &HashSet<Ref>) -> Option<(MemberKey, Ref)> {
+        self.updated(g, d, p, dj).0
+    }
 }
 
 fn build(d: &Document) -> Graph {
@@ -324,6 +409,7 @@ impl Graph {
     fn update(&mut self, d: &Document, marks: &[doc::Mark]) {
         let mut dj: HashSet<Ref> = HashSet::new();
         let mut dp: HashSet<Ref> = HashSet::new();
+        let touching = rustudio_core::bench::scope("jg_touch");
         for m in marks {
             match *m {
                 doc::Mark::Prop(r, name) => {
@@ -343,28 +429,57 @@ impl Graph {
                 }
             }
         }
+        drop(touching);
         if dj.is_empty() && dp.is_empty() {
             return;
         }
         let _b = rustudio_core::bench::scope("joint_graph_update");
+        rustudio_core::bench::add("count: jg_marks", marks.len() as f64, 1);
+        rustudio_core::bench::add("count: jg_joints", dj.len() as f64, 1);
+        rustudio_core::bench::add("count: jg_parts", dp.len() as f64, 1);
+        let recs = rustudio_core::bench::scope("jg_recs");
         let ws = d.workspace();
-        for j in dj {
-            if let Some((a, b)) = self.remove_rec(j).and_then(|old| old.edge) {
+        // Rigid edges that went away (assemblies may split: redone whole)
+        // and edges new to the graph (assemblies only merge: `merge_in`).
+        let mut removed = false;
+        let mut added: Vec<(Ref, Ref)> = Vec::new();
+        let same = |x: Option<(Ref, Ref)>, y: Option<(Ref, Ref)>| match (x, y) {
+            (Some((a, b)), Some((c, e))) => (a, b) == (c, e) || (a, b) == (e, c),
+            (None, None) => true,
+            _ => false,
+        };
+        for &j in &dj {
+            let old = self.remove_rec(j).and_then(|old| old.edge);
+            if let Some((a, b)) = old {
                 dp.insert(a);
                 dp.insert(b);
             }
-            let (Some(ws), Some(inst)) = (ws, d.dom.get_by_ref(j)) else { continue };
-            let kind = kind_of(inst.class.as_str());
-            if kind >= 2 && d.is_ancestor(ws, j) {
-                let rec = joint_rec(d, ws, j, kind, inst.class.as_str());
-                if let Some((a, b)) = rec.edge {
-                    dp.insert(a);
-                    dp.insert(b);
+            let mut new = None;
+            if let (Some(ws), Some(inst)) = (ws, d.dom.get_by_ref(j)) {
+                let kind = kind_of(inst.class.as_str());
+                if kind >= 2 && d.is_ancestor(ws, j) {
+                    let rec = joint_rec(d, ws, j, kind, inst.class.as_str());
+                    new = rec.edge;
+                    if let Some((a, b)) = rec.edge {
+                        dp.insert(a);
+                        dp.insert(b);
+                    }
+                    self.add_rec(j, rec);
                 }
-                self.add_rec(j, rec);
+            }
+            if !same(old, new) {
+                removed |= old.is_some();
+                added.extend(new);
             }
         }
-        self.regroup(d, dp);
+        drop(recs);
+        let _r = rustudio_core::bench::scope("jg_regroup");
+        if removed {
+            rustudio_core::bench::add("count: jg_removed", 1.0, 1);
+            self.regroup(d, dp);
+        } else {
+            self.merge_in(d, dp, &dj, &added);
+        }
     }
 
     /// Redoes the assemblies of `dp`'s parts (and any its joints now reach).
@@ -400,7 +515,10 @@ impl Graph {
                     }
                 }
             }
+            rustudio_core::bench::add("count: jg_regrouped", comp.len() as f64, 1);
+            let sorting = rustudio_core::bench::scope("jg_sort");
             self.sort_members(d, &mut comp);
+            drop(sorting);
             let gi = match self.free.pop() {
                 Some(gi) => gi,
                 None => {
@@ -434,24 +552,139 @@ impl Graph {
     /// Orders an assembly's parts as a full build lists them (the root pick
     /// keeps the first of equals): by the first rigid joint naming each, in
     /// `descendants_of` order, Part0 before Part1.
-    fn sort_members(&self, d: &Document, comp: &mut [Ref]) {
-        let mut keys: HashMap<Ref, (usize, Vec<u32>)> = HashMap::new();
-        let mut key_of = |p: Ref| {
-            let mut best: Option<((usize, Vec<u32>), u8)> = None;
-            for j in self.joints.get(&p).into_iter().flatten() {
-                let Some((a, b)) = self.recs.get(j).and_then(|r| r.edge) else { continue };
-                let side = if a == p { 0 } else if b == p { 1 } else { continue };
-                let k = keys.entry(*j).or_insert_with(|| bfs_key(d, *j)).clone();
-                if best.as_ref().is_none_or(|(bk, bs)| (&k, side) < (bk, *bs)) {
-                    best = Some((k, side));
+    fn sort_members(&mut self, d: &Document, comp: &mut [Ref]) {
+        let mut keys = MemberKeys::default();
+        let mut keyed: Vec<(Option<(MemberKey, Ref)>, Ref)> = comp.iter().map(|p| (keys.of(self, d, *p), *p)).collect();
+        keyed.sort_by(|a, b| a.0.as_ref().map(|k| &k.0).cmp(&b.0.as_ref().map(|k| &k.0)));
+        for (slot, (k, p)) in comp.iter_mut().zip(keyed) {
+            *slot = p;
+            if let Some((_, j)) = k {
+                self.best.insert(p, j);
+            }
+        }
+    }
+
+    /// Regroups after joints were only added (no rigid edge went away), the
+    /// case of a model streaming in or being built: assemblies can only
+    /// merge. The biggest one touched keeps its ordered members and the
+    /// rest (new parts, smaller assemblies, `dp`'s parts, whose order may
+    /// have changed) are keyed and slotted in, instead of re-sorting the
+    /// whole assembly for each piece (a part welded into a map of
+    /// thousands re-sorted all of them). The members' relative order
+    /// survives other edits: inserting or removing an instance shifts its
+    /// later siblings alike, and anything that moves a joint marks it, so
+    /// its parts are in `dp`.
+    fn merge_in(&mut self, d: &Document, dp: HashSet<Ref>, dj: &HashSet<Ref>, added: &[(Ref, Ref)]) {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum Unit {
+            Group(usize),
+            Part(Ref),
+        }
+        let unit = |g: &Graph, p: Ref| g.group.get(&p).map_or(Unit::Part(p), |gi| Unit::Group(*gi));
+        fn find(up: &mut HashMap<Unit, Unit>, u: Unit) -> Unit {
+            let mut r = *up.entry(u).or_insert(u);
+            while let Some(&n) = up.get(&r).filter(|n| **n != r) {
+                r = n;
+            }
+            up.insert(u, r);
+            r
+        }
+        let mut up: HashMap<Unit, Unit> = HashMap::new();
+        for &(a, b) in added {
+            let (ra, rb) = (find(&mut up, unit(self, a)), find(&mut up, unit(self, b)));
+            if ra != rb {
+                up.insert(ra, rb);
+            }
+        }
+        for &p in &dp {
+            if self.rigid.contains_key(&p) {
+                find(&mut up, unit(self, p));
+            }
+        }
+        let mut comps: HashMap<Unit, Vec<Unit>> = HashMap::new();
+        for u in up.keys().copied().collect::<Vec<_>>() {
+            let root = find(&mut up, u);
+            comps.entry(root).or_default().push(u);
+        }
+        let mut keys = MemberKeys::default();
+        for units in comps.into_values() {
+            let big = units
+                .iter()
+                .filter_map(|u| match u {
+                    Unit::Group(gi) => Some(*gi),
+                    Unit::Part(_) => None,
+                })
+                .max_by_key(|gi| self.groups[*gi].len());
+            let mut base = big.map(|gi| std::mem::take(&mut self.groups[gi])).unwrap_or_default();
+            let mut inserts: Vec<Ref> = Vec::new();
+            for u in &units {
+                match *u {
+                    Unit::Group(gi) if Some(gi) != big => {
+                        inserts.append(&mut self.groups[gi]);
+                        self.roots[gi] = (Ref::none(), false);
+                        self.free.push(gi);
+                    }
+                    Unit::Group(_) => {}
+                    Unit::Part(p) => inserts.push(p),
                 }
             }
-            best
-        };
-        let mut keyed: Vec<(Option<((usize, Vec<u32>), u8)>, Ref)> = comp.iter().map(|p| (key_of(*p), *p)).collect();
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        for (slot, (_, p)) in comp.iter_mut().zip(keyed) {
-            *slot = p;
+            // `dp`'s parts in it: out, when their place may have changed.
+            let mut keyed: Vec<(Option<(MemberKey, Ref)>, Ref)> = Vec::new();
+            if big.is_some() {
+                let mut out: HashSet<Ref> = HashSet::new();
+                for &p in &dp {
+                    if big.is_some_and(|gi| self.group.get(&p) == Some(&gi)) {
+                        let (k, moved) = keys.updated(self, d, p, dj);
+                        if moved {
+                            out.insert(p);
+                            keyed.push((k, p));
+                        }
+                    }
+                }
+                if !out.is_empty() {
+                    base.retain(|p| !out.contains(p));
+                }
+            }
+            for p in inserts {
+                keyed.push((keys.cached(self, d, p, dj), p));
+            }
+            rustudio_core::bench::add("count: jg_regrouped", keyed.len() as f64, 1);
+            let members = if keyed.len() * 8 > base.len() {
+                // (much of it new: one sort)
+                base.extend(keyed.into_iter().map(|(_, p)| p));
+                self.sort_members(d, &mut base);
+                base
+            } else {
+                keyed.sort_by(|a, b| a.0.as_ref().map(|k| &k.0).cmp(&b.0.as_ref().map(|k| &k.0)));
+                for (k, p) in keyed {
+                    let key = k.as_ref().map(|k| &k.0);
+                    let at = base.partition_point(|m| keys.cached(self, d, *m, dj).as_ref().map(|k| &k.0) <= key);
+                    base.insert(at, p);
+                    if let Some((_, j)) = k {
+                        self.best.insert(p, j);
+                    }
+                }
+                base
+            };
+            let gi = big.unwrap_or_else(|| match self.free.pop() {
+                Some(gi) => gi,
+                None => {
+                    self.groups.push(Vec::new());
+                    self.roots.push((Ref::none(), false));
+                    self.groups.len() - 1
+                }
+            });
+            for p in &members {
+                self.group.insert(*p, gi);
+            }
+            self.roots[gi] = pick_root(d, &members);
+            self.groups[gi] = members;
+        }
+        // (parts keyed on the way, the base's hub included: next time one key)
+        for (p, k) in keys.parts {
+            if let Some((_, j)) = k {
+                self.best.insert(p, j);
+            }
         }
     }
 
@@ -628,8 +861,20 @@ enum JointPoseEdit {
 /// Pose the affected side of an assembly, keeping the root fixed. A newly
 /// active joint supplies its stored rest offset. An offset edit replaces just
 /// that factor in the current pose, preserving the motor's last stepped pose.
-fn joint_pose_moves(d: &Document, g: &Graph, edits: &HashMap<Ref, JointPoseEdit>) -> Vec<(Ref, Xform)> {
-    use rustudio_core::body::joint_frames;
+///
+/// `arrived`: the parts of a replicated subtree entering the Workspace
+/// (`EnterPose::Replicated`). The sender posed them already; what may still
+/// move is the new parts against the client's own (its character a hand
+/// holds an accessory to). The walk then starts at the assembly's parts
+/// that were there before (`arrival_seeds`) and goes through the arrived
+/// ones only: a welded map streaming in walked the whole map for every
+/// piece (test `chained_welded_map_poses_only_the_arriving_pieces`).
+fn joint_pose_moves(
+    d: &Document,
+    g: &Graph,
+    edits: &HashMap<Ref, JointPoseEdit>,
+    arrived: Option<&HashSet<Ref>>,
+) -> Vec<(Ref, Xform)> {
     let mut posed = HashSet::new();
     let mut writes = Vec::new();
     for joint in edits.keys() {
@@ -637,58 +882,127 @@ fn joint_pose_moves(d: &Document, g: &Graph, edits: &HashMap<Ref, JointPoseEdit>
         if posed.contains(&a) || posed.contains(&b) || anchored(d, a) && anchored(d, b) {
             continue;
         }
+        if let Some(seeds) = arrived.and_then(|t| arrival_seeds(d, g, edits, t, a)) {
+            pose_walk(d, g, edits, seeds, arrived, &mut posed, &mut writes);
+            continue;
+        }
         let members = g.assembly(a);
         let mut roots: Vec<_> = members.iter().copied().filter(|p| anchored(d, *p)).collect();
         if roots.is_empty() {
             roots.push(g.root(d, a));
         } else if roots.len() > 1 {
-            roots.sort_by_cached_key(|p| std::cmp::Reverse(bfs_key(d, *p)));
+            let mut at = ChildPositions::default();
+            roots.sort_by_cached_key(|p| std::cmp::Reverse(bfs_key(d, *p, &mut at)));
         }
-        let mut queue = VecDeque::new();
-        for root in roots {
-            posed.insert(root);
-            if let Some(frame) = xf(d, root, "CFrame") {
-                queue.push_back((root, frame, frame));
-            }
-        }
-        while let Some((part, before, after)) = queue.pop_front() {
-            let Some(joints) = g.joints.get(&part) else { continue };
-            for j in joints {
-                let Some((p0, p1)) = g.recs.get(j).and_then(|rec| rec.edge) else { continue };
-                let forward = part == p0;
-                let child = if forward { p1 } else { p0 };
-                if !posed.insert(child) {
-                    continue;
-                }
-                let Some(child_before) = xf(d, child, "CFrame") else { continue };
-                let mut child_after = child_before;
-                if let Some((edit, (_, _, c0, c1))) = edits.get(j).zip(joint_frames(d, *j)) {
-                    let (a, b) = if forward { (before, child_before) } else { (child_before, before) };
-                    let relative = |a: Xform, b: Xform| Xform {
-                        pos: a.rot.transpose() * (b.pos - a.pos),
-                        rot: a.rot.transpose() * b.rot,
-                    };
-                    let offset = match edit {
-                        JointPoseEdit::Activate => cf_mul(&c0, &cf_inv(&c1)),
-                        JointPoseEdit::C0(old) => cf_mul(&cf_mul(&c0, &cf_inv(old)), &relative(a, b)),
-                        JointPoseEdit::C1(old) => cf_mul(&relative(a, b), &cf_mul(old, &cf_inv(&c1))),
-                    };
-                    child_after = cf_mul(&after, &if forward { offset } else { cf_inv(&offset) });
-                } else if before != after {
-                    child_after = Xform {
-                        pos: after.apply(before.rot.transpose() * (child_before.pos - before.pos)),
-                        rot: after.rot * before.rot.transpose() * child_before.rot,
-                    };
-                }
-                if child_before != child_after {
-                    child_after = child_after.orthonormalized();
-                    writes.push((child, child_after));
-                }
-                queue.push_back((child, child_before, child_after));
-            }
-        }
+        pose_walk(d, g, edits, roots, None, &mut posed, &mut writes);
     }
     writes
+}
+
+/// Where the walk of an arrival into `a`'s assembly starts, in the order a
+/// walk from its roots would take them: the parts of the assembly that were
+/// there before and hold an edited joint, its anchored new parts, and its
+/// root when it is an old part. None (walk from the roots) when the root
+/// is a new unanchored part (the new parts carry the old ones then) or
+/// nothing old is in the assembly.
+fn arrival_seeds(d: &Document, g: &Graph, edits: &HashMap<Ref, JointPoseEdit>, arrived: &HashSet<Ref>, a: Ref) -> Option<Vec<Ref>> {
+    let gi = *g.group.get(&a)?;
+    let (root, grounded) = g.roots[gi];
+    if !grounded && arrived.contains(&root) {
+        return None;
+    }
+    let mine = |x: &Ref| g.group.get(x) == Some(&gi);
+    let mut seeds: HashSet<Ref> = edits
+        .keys()
+        .filter_map(|j| g.recs.get(j).and_then(|rec| rec.edge))
+        .flat_map(|(p0, p1)| [p0, p1])
+        .filter(|x| mine(x) && !arrived.contains(x))
+        .collect();
+    seeds.extend(arrived.iter().copied().filter(|x| mine(x) && anchored(d, *x)));
+    if !grounded {
+        seeds.insert(root);
+    }
+    if seeds.iter().all(|x| arrived.contains(x)) {
+        return None;
+    }
+    let mut seeds: Vec<Ref> = seeds.into_iter().collect();
+    let mut at = ChildPositions::default();
+    seeds.sort_by_cached_key(|p| std::cmp::Reverse(bfs_key(d, *p, &mut at)));
+    Some(seeds)
+}
+
+/// Breadth-first from `starts` (held where they are) along the rigid
+/// joints, posing each part from the one it was reached by; with `only`,
+/// into those parts alone (the rest keep their poses).
+fn pose_walk(
+    d: &Document,
+    g: &Graph,
+    edits: &HashMap<Ref, JointPoseEdit>,
+    starts: Vec<Ref>,
+    only: Option<&HashSet<Ref>>,
+    posed: &mut HashSet<Ref>,
+    writes: &mut Vec<(Ref, Xform)>,
+) {
+    use rustudio_core::body::joint_frames;
+    let mut queue = VecDeque::new();
+    for root in starts {
+        posed.insert(root);
+        if let Some(frame) = xf(d, root, "CFrame") {
+            queue.push_back((root, frame, frame));
+        }
+    }
+    let mut walked = 0u64;
+    while let Some((part, before, after)) = queue.pop_front() {
+        let Some(joints) = g.joints.get(&part) else { continue };
+        for j in joints {
+            let Some((p0, p1)) = g.recs.get(j).and_then(|rec| rec.edge) else { continue };
+            let forward = part == p0;
+            let child = if forward { p1 } else { p0 };
+            if only.is_some_and(|t| !t.contains(&child)) {
+                continue;
+            }
+            // A leaf (no other rigid joint) carried unchanged by an
+            // unedited joint is neither written nor walked on from: a
+            // weld into a map of thousands welded to one base walked
+            // every one of them per piece.
+            if before == after
+                && !edits.contains_key(j)
+                && g.rigid.get(&child).is_some_and(|n| n.len() == 1)
+            {
+                continue;
+            }
+            if !posed.insert(child) {
+                continue;
+            }
+            let Some(child_before) = xf(d, child, "CFrame") else { continue };
+            let mut child_after = child_before;
+            if let Some((edit, (_, _, c0, c1))) = edits.get(j).zip(joint_frames(d, *j)) {
+                let (a, b) = if forward { (before, child_before) } else { (child_before, before) };
+                let relative = |a: Xform, b: Xform| Xform {
+                    pos: a.rot.transpose() * (b.pos - a.pos),
+                    rot: a.rot.transpose() * b.rot,
+                };
+                let offset = match edit {
+                    JointPoseEdit::Activate => cf_mul(&c0, &cf_inv(&c1)),
+                    JointPoseEdit::C0(old) => cf_mul(&cf_mul(&c0, &cf_inv(old)), &relative(a, b)),
+                    JointPoseEdit::C1(old) => cf_mul(&relative(a, b), &cf_mul(old, &cf_inv(&c1))),
+                };
+                child_after = cf_mul(&after, &if forward { offset } else { cf_inv(&offset) });
+            } else if before != after {
+                child_after = Xform {
+                    pos: after.apply(before.rot.transpose() * (child_before.pos - before.pos)),
+                    rot: after.rot * before.rot.transpose() * child_before.rot,
+                };
+            }
+            if child_before != child_after {
+                child_after = child_after.orthonormalized();
+                writes.push((child, child_after));
+            }
+            queue.push_back((child, child_before, child_after));
+            walked += 1;
+        }
+    }
+    rustudio_core::bench::add("count: jp_walked", walked as f64, 1);
 }
 
 pub(crate) fn joint_property_moves(
@@ -716,11 +1030,21 @@ pub(crate) fn joint_property_moves(
             };
             HashMap::from([(r, edit)])
         };
-        joint_pose_moves(d, g, &edits)
+        joint_pose_moves(d, g, &edits, None)
     })
 }
 
-pub(crate) fn entering_joint_moves(d: &Document, tree: &[Ref]) -> Vec<(Ref, Xform)> {
+/// How a subtree entering the Workspace is posed by its joints.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EnterPose {
+    /// A script's or the engine's parenting: the assembly is posed from its roots.
+    Full,
+    /// Replication brought it (already posed by the sender): only the new
+    /// parts are posed, against the parts that were there (`joint_pose_moves`).
+    Replicated,
+}
+
+pub(crate) fn entering_joint_moves(d: &Document, tree: &[Ref], how: EnterPose) -> Vec<(Ref, Xform)> {
     if !tree.iter().any(|r| d.class_of(*r).is_some_and(|class| {
         doc::is_a(&class, "BasePart") || poses_immediately(class.as_str())
     })) {
@@ -740,7 +1064,8 @@ pub(crate) fn entering_joint_moves(d: &Document, tree: &[Ref]) -> Vec<(Ref, Xfor
             .filter(|j| d.class_of(*j).is_some_and(|c| poses_immediately(c.as_str())))
             .map(|j| (j, JointPoseEdit::Activate))
             .collect();
-        joint_pose_moves(d, g, &edits)
+        let arrived: Option<HashSet<Ref>> = (how == EnterPose::Replicated).then(|| tree.iter().copied().collect());
+        joint_pose_moves(d, g, &edits, arrived.as_ref())
     })
 }
 
@@ -1641,4 +1966,78 @@ fn unjoin_outsiders(lua: &Lua, args: &MultiValue) -> mlua::Result<MultiValue> {
 
 fn destroy(lua: &Lua, r: Ref) -> mlua::Result<()> {
     destroy_inst(lua, r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{RunMode, Runtime, World};
+
+    /// The journal-driven graph (merges in place when joints are only
+    /// added, regroups otherwise) equals a full build after every edit of
+    /// a seeded mix: parts welded on as they arrive, models built outside
+    /// and parented in, welds made, disabled and re-enabled, parts moved
+    /// out and back, destroyed, anchored and unanchored.
+    #[test]
+    fn incremental_graph_matches_full_build() {
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(Document::new_place(), RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            local s = 12345
+            local function rnd(n) s = (s * 1103515245 + 12345) % 2147483648 return s % n + 1 end
+            local parts, welds = {}, {}
+            local holders = {workspace}
+            for i = 1, 3 do local m = Instance.new('Model') m.Name = 'M' .. i m.Parent = workspace table.insert(holders, m) end
+            local function pick(t) return t[rnd(#t)] end
+            local function weld(a, b)
+                local w = Instance.new(if rnd(2) == 1 then 'Weld' else 'WeldConstraint')
+                if rnd(2) == 1 then w.Part0 = a w.Part1 = b else w.Part0 = b w.Part1 = a end
+                w.Parent = if rnd(2) == 1 then a else b
+                table.insert(welds, w)
+            end
+            local function part()
+                local p = Instance.new('Part')
+                p.Anchored = rnd(8) == 1
+                p.Size = Vector3.new(rnd(4), 1, 1)
+                table.insert(parts, p)
+                return p
+            end
+            _G.step = function()
+                local k = rnd(10)
+                _G.last = k
+                if k <= 4 or #parts < 4 then
+                    local p = part()
+                    if #parts > 1 and rnd(4) ~= 1 then weld(pick(parts), p) end
+                    p.Parent = pick(holders)
+                elseif k == 5 then
+                    local a, b = pick(parts), pick(parts)
+                    if a ~= b then weld(a, b) end
+                elseif k == 6 then
+                    local w = pick(welds) w.Enabled = not w.Enabled
+                elseif k == 7 then
+                    local p = pick(parts)
+                    p.Parent = if p.Parent == game.ReplicatedStorage then pick(holders) else game.ReplicatedStorage
+                elseif k == 8 then
+                    pick(parts):Destroy()
+                elseif k == 9 then
+                    local m = Instance.new('Model')
+                    local first = part() first.Parent = m
+                    for _ = 1, rnd(6) do local p = part() weld(if rnd(2) == 1 then first else pick(parts), p) p.Parent = m end
+                    m.Parent = pick(holders)
+                else
+                    local p = pick(parts) p.Anchored = not p.Anchored
+                end
+            end
+        "#).exec().unwrap();
+        let step: mlua::Function = rt.lua.globals().get("step").unwrap();
+        for i in 0..600 {
+            let _ = step.call::<()>(());
+            let w = rt.world_mut().unwrap();
+            let d = w.d();
+            let diff = with_graph(d, |g| g.diff(&build(d)));
+            let last: i64 = rt.lua.globals().get("last").unwrap_or(0);
+            assert!(diff.is_empty(), "step {i} (kind {last}): {}", diff.join("\n"));
+        }
+    }
 }

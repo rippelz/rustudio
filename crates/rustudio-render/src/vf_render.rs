@@ -531,7 +531,7 @@ impl Renderer {
             pass.set_bind_group(0, &t.blit_bg, &[]);
             pass.draw(0..3, 0..1);
         }
-        crate::gpu_timing::submit(device, queue, "gpu: viewport frames", [encoder.finish()]);
+        crate::gpu_timing::submit(device, queue, "gpu: viewport frames", [encoder]);
         crate::world_gui::native_changed(t.id);
     }
 }

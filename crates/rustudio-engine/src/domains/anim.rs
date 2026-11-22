@@ -32,6 +32,13 @@ use rbx_dom_weak::types::{Ref, Variant};
 
 use crate::runtime::*;
 
+thread_local! {
+    /// Animation assets decoding on the asset workers (`__rs_anim_asset`),
+    /// by asset id; None: the bytes didn't decode.
+    static DECODES: std::cell::RefCell<rustudio_core::asset_work::Jobs<Option<rbx_dom_weak::WeakDom>>> =
+        std::cell::RefCell::new(Default::default());
+}
+
 #[path = "anim_ik.rs"]
 mod anim_ik;
 #[path = "anim_types.rs"]
@@ -434,15 +441,47 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     })?;
     // An animation asset already downloaded (__rs_asset_ready said true),
     // decoded into a Model: the Animator loads clips itself, on either side,
-    // not through InsertService (server-only, and it yields).
+    // not through InsertService (server-only, and it yields). The decode
+    // runs on the asset workers, as Roblox's clips load asynchronously
+    // (an AnimationTrack's Length is 0 until its clip is in): returns
+    // (nil, true) until it is done. A character's dozen clips decoded in
+    // its arrival frame took hundreds of ms of one step.
     lua.globals().set(
         "__rs_anim_asset",
         lua.create_function(|lua, id: f64| {
-            let rustudio_core::assets::Fetch::Ready(bytes) = rustudio_core::assets::public_prefetch(id as u64) else {
-                return Ok(Value::Nil);
+            let _s = rustudio_core::bench::scope("anim_asset_decode");
+            let id = id as u64;
+            let key = id.to_string();
+            let decoded = if rustudio_core::assets::sync_decode() || rbx_dom_weak::deterministic() {
+                None
+            } else {
+                let taken = DECODES.with(|j| {
+                    let mut j = j.borrow_mut();
+                    j.poll();
+                    j.take(&key)
+                });
+                match taken {
+                    Some(doc) => Some(doc),
+                    None => {
+                        if !DECODES.with(|j| j.borrow().running(&key)) {
+                            let rustudio_core::assets::Fetch::Ready(bytes) = rustudio_core::assets::public_prefetch(id) else {
+                                return Ok((Value::Nil, false));
+                            };
+                            DECODES.with(|j| j.borrow_mut().start(&key, move || rustudio_core::doc::Document::decode(&bytes).ok()));
+                        }
+                        return Ok((Value::Nil, true));
+                    }
+                }
             };
-            let Ok(mut tmp) = rustudio_core::doc::Document::decode(&bytes) else {
-                return Ok(Value::Nil);
+            let doc = match decoded {
+                Some(doc) => doc,
+                None => match rustudio_core::assets::public_prefetch(id) {
+                    rustudio_core::assets::Fetch::Ready(bytes) => rustudio_core::doc::Document::decode(&bytes).ok(),
+                    _ => None,
+                },
+            };
+            let Some(mut tmp) = doc else {
+                return Ok((Value::Nil, false));
             };
             let r = super::super::ext::create_any(lua, "Model")?;
             {
@@ -451,7 +490,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                     tmp.transfer(child, &mut w.dm().dom, r);
                 }
             }
-            inst_value(lua, r)
+            Ok((inst_value(lua, r)?, false))
         })?,
     )?;
     // StarterPlayer.AvatarJointUpgrade (rig.rs) and the upgraded joint

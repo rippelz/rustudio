@@ -4204,6 +4204,7 @@ dependencies = [
  "image",
  "libc",
  "log",
+ "lz4_flex",
  "objc2-foundation 0.3.2",
  "rbx_binary",
  "rbx_dom_weak",
@@ -4217,6 +4218,7 @@ dependencies = [
  "serde_json",
  "ureq",
  "windows-sys 0.61.2",
+ "zstd",
 ]
 
 [[package]]

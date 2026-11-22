@@ -427,6 +427,11 @@ fn drain(server: &Document, client: &Runtime, map: &mut RepMap, budgeted: bool) 
             PendingKind::Op(_) => "rep_prop",
             PendingKind::Attach { .. } => "rep_attach",
         });
+        let traced = rustudio_core::load_trace::on().then(|| (Instant::now(), match &p.kind {
+            PendingKind::Op(RepOp::Parent(r) | RepOp::Destroy(r)) => *r,
+            PendingKind::Attach { s, .. } => *s,
+            _ => Ref::none(),
+        }));
         match p.kind {
             PendingKind::Op(op) => {
                 match &op {
@@ -446,6 +451,16 @@ fn drain(server: &Document, client: &Runtime, map: &mut RepMap, budgeted: bool) 
             PendingKind::Attach { s, next } => {
                 attach(server, client, map, s, next, p.seq, &over, &mut created);
             }
+        }
+        // RUSTUDIO_LOAD_TRACE: which instance a slow structural op was.
+        if let Some((t0, r)) = traced.filter(|(t0, _)| t0.elapsed().as_secs_f64() > 0.02) {
+            let (class, name) = server.dom.get_by_ref(r).map(|i| (i.class.to_string(), i.name.clone())).unwrap_or_default();
+            rustudio_core::load_trace::mark(&format!(
+                "slow rep op {:.1} ms: {class} {name:?} under {:?}, {} below",
+                t0.elapsed().as_secs_f64() * 1000.0,
+                server.dom.get_by_ref(r).and_then(|i| server.dom.get_by_ref(i.parent())).map(|p| p.name.clone()),
+                server.dom.descendants_of(r).count().saturating_sub(1),
+            ));
         }
         flush_refs(client, map);
     }
@@ -470,6 +485,7 @@ fn arrive(
     let big = !whole && server.dom.descendants_of(r).nth(PIECE).is_some();
     let mut new_refs = Vec::new();
     let copy = {
+        let _s = rustudio_core::bench::scope("rp_copy");
         let Some(mut w) = client.world_mut() else {
             return false;
         };
@@ -495,7 +511,7 @@ fn arrive(
         copy
     };
     if let Some(c) = copy {
-        client.apply_parent(c, cp);
+        client.apply_parent_replicated(c, cp);
     }
     created.extend(new_refs);
     if big {
@@ -669,7 +685,7 @@ fn apply_op(
             match (visible, map.s2c.get(&r).copied(), cp) {
                 (true, Some(c), Some(cp)) => {
                     crate::runtime::domains::services::perf::net(true, false, 10);
-                    client.apply_parent(c, cp)
+                    client.apply_parent_replicated(c, cp)
                 }
                 (true, None, Some(cp)) => {
                     // New to the client: copy it (unparented), then parent it
@@ -840,6 +856,109 @@ mod tests {
             return 'ok ' .. #_G.seen").eval().unwrap();
         assert_eq!(order, "ok 2461");
         let _ = sn;
+    }
+
+    /// A big welded model (every part welded to an anchored base, all
+    /// siblings under one Model) streams over a budgeted client in pieces:
+    /// each piece regroups the one growing assembly, which must stay
+    /// linear in its size (it was quadratic while the member sort scanned
+    /// the Model's children per joint), and ends
+    /// as one assembly rooted at the base.
+    #[test]
+    fn welded_map_streams_in_without_quadratic_regroups() {
+        let (s, c, mut map) = pair();
+        s.lua.load("local m = Instance.new('Model') m.Name = 'Map'\n\
+            local base = Instance.new('Part') base.Name = 'Base' base.Anchored = true base.Parent = m\n\
+            for i = 1, 3000 do local p = Instance.new('Part') p.Name = 'P' .. i p.Position = Vector3.new(i, 0, 0)\n\
+              local w = Instance.new(if i % 2 == 0 then 'Weld' else 'WeldConstraint')\n\
+              if i % 2 == 0 then w.C0 = CFrame.new(i, 0, 0) end\n\
+              w.Part0 = base w.Part1 = p w.Parent = p p.Parent = m end\n\
+            m.Parent = workspace").exec().unwrap();
+        let mut o = ops(&s);
+        let mut slowest = 0.0f64;
+        let mut frames = 0;
+        rustudio_core::bench::take_sections();
+        loop {
+            let t0 = Instant::now();
+            {
+                let w = s.world_mut().unwrap();
+                map.begin_frame(1.0 / 60.0);
+                map.frame_budget = Some(Duration::from_millis(2));
+                apply_budgeted(w.d(), &c, &mut map, std::mem::take(&mut o));
+            }
+            c.dispatch();
+            slowest = slowest.max(t0.elapsed().as_secs_f64() * 1000.0);
+            frames += 1;
+            if map.backlog() == 0 || frames > 100_000 {
+                break;
+            }
+        }
+        let sections = rustudio_core::bench::take_sections();
+        let jg: f64 = sections.iter().filter(|e| e.0 == "joint_graph_update").map(|e| e.1).sum();
+        eprintln!("welded map: {frames} frames, slowest {slowest:.1} ms, joint_graph_update {jg:.1} ms in all");
+        let mut top = sections.clone();
+        top.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (n, ms, calls) in top.iter().take(14) {
+            eprintln!("  {n} {ms:.1} ms {calls}x");
+        }
+        let joined: String = c.lua.load("local m = workspace.Map local n = 0\n\
+            for _, p in m:GetChildren() do if p.AssemblyRootPart == m.Base then n += 1 end end\n\
+            return n .. ' ' .. #m:GetChildren()").eval().unwrap();
+        assert_eq!(joined, "3001 3001");
+        assert!(slowest < 40.0, "a frame of the welded map took {slowest:.1} ms");
+    }
+
+    /// A map whose parts are welded to each other (a chain from an anchored
+    /// base: no part is a leaf) streams in piece by piece, and each piece
+    /// is posed against the parts already there, not by walking the map
+    /// from its roots (which walked every part already there for each
+    /// piece).
+    #[test]
+    fn chained_welded_map_poses_only_the_arriving_pieces() {
+        let (s, c, mut map) = pair();
+        s.lua.load("local m = Instance.new('Model') m.Name = 'Map'\n\
+            local base = Instance.new('Part') base.Name = 'Base' base.Anchored = true base.Parent = m\n\
+            local prev = base\n\
+            for i = 1, 3000 do local p = Instance.new('Part') p.Name = 'P' .. i p.Position = Vector3.new(i, 0, 0)\n\
+              local w = Instance.new('Weld') w.Part0 = prev w.Part1 = p w.C0 = prev.CFrame:Inverse() * p.CFrame w.Parent = p\n\
+              p.Parent = m prev = p end\n\
+            m.Parent = workspace").exec().unwrap();
+        let mut o = ops(&s);
+        let mut frames = 0;
+        rustudio_core::bench::take_sections();
+        loop {
+            {
+                let w = s.world_mut().unwrap();
+                map.begin_frame(1.0 / 60.0);
+                map.frame_budget = Some(Duration::from_millis(2));
+                apply_budgeted(w.d(), &c, &mut map, std::mem::take(&mut o));
+            }
+            c.dispatch();
+            frames += 1;
+            if map.backlog() == 0 || frames > 100_000 {
+                break;
+            }
+        }
+        let walked: f64 = rustudio_core::bench::take_sections().iter().filter(|e| e.0 == "count: jp_walked").map(|e| e.1).sum();
+        assert!(walked <= 2.0 * 3001.0, "{walked} parts walked to pose a 3001-part map");
+        let last: String = c.lua.load("return tostring(workspace.Map.P3000.Position) .. ' ' .. workspace.Map.P3000.AssemblyRootPart.Name").eval().unwrap();
+        assert_eq!(last, "3000, 0, 0 Base");
+    }
+
+    /// A replicated part welded to a part the client moved itself (its
+    /// own character's hand) is posed against the client's copy of it.
+    #[test]
+    fn arriving_weld_poses_against_the_clients_part() {
+        let (s, c, mut map) = pair();
+        s.lua.load("local h = Instance.new('Part') h.Name = 'Hand' h.Size = Vector3.new(4, 4, 4) h.Position = Vector3.new(0, 10, 0) h.Parent = workspace").exec().unwrap();
+        sync(&s, &c, &mut map, false);
+        c.lua.load("workspace.Hand.CFrame = CFrame.new(5, 10, 0)").exec().unwrap();
+        s.lua.load("local a = Instance.new('Part') a.Name = 'Hat' a.Position = Vector3.new(0, 12, 0)\n\
+            local w = Instance.new('Weld') w.Part0 = workspace.Hand w.Part1 = a w.C0 = CFrame.new(0, 2, 0) w.Parent = a\n\
+            a.Parent = workspace").exec().unwrap();
+        sync(&s, &c, &mut map, false);
+        let at: String = c.lua.load("return tostring(workspace.Hat.Position) .. ' ' .. tostring(workspace.Hand.Position)").eval().unwrap();
+        assert_eq!(at, "5, 12, 0 5, 10, 0");
     }
 
     #[test]

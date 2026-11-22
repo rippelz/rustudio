@@ -1404,7 +1404,7 @@ impl WorldGuiPass {
             }))
         };
         let enc = draw_mips(device, &self.mip_pipeline, &self.mip_bgl, &self.mip_sampler, tex, &mipped, dirty);
-        crate::gpu_timing::submit(device, queue, "gpu: world gui mips", [enc.finish()]);
+        crate::gpu_timing::submit(device, queue, "gpu: world gui mips", [enc]);
         if let Some((_, view)) = reuse {
             return view;
         }
@@ -1714,19 +1714,20 @@ impl WorldGuiPass {
             });
             self.record(&mut pass, &self.pipeline, &up);
         }
-        crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: world gui", [enc.finish()]);
+        crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: world gui", [enc]);
     }
 
     /// Draws world GUIs and effects into the scene's HDR image `hdr`
-    /// (linear light, before postprocessing), blended in the
+    /// (linear light, before postprocessing), recorded into `enc` (the
+    /// frame's post encoder), blended in the
     /// square root of linear light as Studio blends them: the image is
     /// copied into that space, the effects drawn over it far to near, and
-    /// squared back. False when there were none (the view needn't be
-    /// finished again).
+    /// squared back.
     #[allow(clippy::too_many_arguments)]
     pub fn effects(
         &mut self,
         rs: &egui_wgpu::RenderState,
+        enc: &mut wgpu::CommandEncoder,
         hdr: &wgpu::TextureView,
         size: [u32; 2],
         depth: &wgpu::TextureView,
@@ -1735,12 +1736,12 @@ impl WorldGuiPass {
         tone_curve: Option<[f32; 5]>,
         fog: [f32; 4],
         fog_rgb: [f32; 3],
-    ) -> bool {
+    ) {
         let up = {
             let _b = rustudio_core::bench::scope("fx_upload");
             self.upload(rs, depth, batches, fx, tone_curve, fog, fog_rgb)
         };
-        let Some(up) = up else { return false };
+        let Some(up) = up else { return };
         let _b = rustudio_core::bench::scope("fx_encode");
         let device = &rs.device;
         if self.fx_tex.as_ref().is_none_or(|(s, _)| *s != size) {
@@ -1758,7 +1759,7 @@ impl WorldGuiPass {
                 .create_view(&Default::default());
             self.fx_tex = Some((size, view));
         }
-        let Some((_, buf)) = self.fx_tex.as_ref() else { return false };
+        let Some((_, buf)) = self.fx_tex.as_ref() else { return };
         let source = |v: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("world gui effects buffer"),
@@ -1767,8 +1768,7 @@ impl WorldGuiPass {
             })
         };
         let (from_hdr, from_buf) = (source(hdr), source(buf));
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui effects") });
-        let mut step = |label: &str, view: &wgpu::TextureView, f: &mut dyn FnMut(&mut wgpu::RenderPass<'_>)| {
+        let step = |enc: &mut wgpu::CommandEncoder, label: &str, view: &wgpu::TextureView, f: &mut dyn FnMut(&mut wgpu::RenderPass<'_>)| {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1784,20 +1784,18 @@ impl WorldGuiPass {
             });
             f(&mut pass);
         };
-        step("effects in", buf, &mut |p| {
+        step(enc, "effects in", buf, &mut |p| {
             p.set_pipeline(&self.fx_in);
             p.set_bind_group(0, &from_hdr, &[]);
             p.draw(0..3, 0..1);
         });
-        step("effects", buf, &mut |p| self.record(p, &self.fx_pipeline, &up));
-        step("effects out", hdr, &mut |p| {
+        step(enc, "effects", buf, &mut |p| self.record(p, &self.fx_pipeline, &up));
+        step(enc, "effects out", hdr, &mut |p| {
             p.set_pipeline(&self.fx_out);
             p.set_bind_group(0, &from_buf, &[]);
             p.draw(0..3, 0..1);
         });
-        drop(step);
-        crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: world gui effects", [enc.finish()]);
-        true
+        crate::gpu_timing::mark(enc, "gpu: world gui effects");
     }
 }
 

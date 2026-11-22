@@ -35,6 +35,12 @@ mod walk;
 mod fx;
 #[path = "gui_adorn.rs"]
 mod adorn;
+#[path = "gui_ligatures.rs"]
+mod ligatures;
+#[path = "gui_message.rs"]
+mod message;
+#[path = "gui_color_glyphs.rs"]
+mod color_glyphs;
 
 /// Where a GuiObject ended up (the values scripts read as AbsolutePosition /
 /// AbsoluteSize / AbsoluteRotation), plus its text's size (TextBounds).
@@ -388,6 +394,8 @@ pub struct Gui {
     cache_why: HashMap<Ref, String>,
     /// ViewportFrames the current walk drew.
     walk_vfs: Vec<Ref>,
+    /// Legacy Messages / Hints in view (gui_message.rs).
+    messages: message::LegacyMessages,
 }
 
 /// Everything a draw needs from the editor.
@@ -987,7 +995,7 @@ fn point_in_quad(q: &[Pos2; 4], p: Pos2) -> bool {
 
 /// Enum.Font → (family file, weight, italic), as Font.fromEnum maps them
 /// (Gotham is Montserrat in current Studio's content folder).
-fn legacy_font(name: &str) -> (String, u32, bool) {
+pub(crate) fn legacy_font(name: &str) -> (String, u32, bool) {
     let f = |fam: &str, w: u32, i: bool| (format!("rbxasset://fonts/families/{fam}.json"), w, i);
     match name {
         "Legacy" => f("LegacyArial", 400, false),
@@ -1182,10 +1190,17 @@ pub(crate) fn fallback_fonts() -> &'static [&'static [u8]] {
         scripts.sort();
         files.extend(scripts);
         files.extend(rustudio_core::platform::fallback_font_files().iter().map(std::path::PathBuf::from));
-        files
-            .iter()
-            .filter_map(|p| std::fs::read(p).ok())
-            .map(|b| &*Box::leak(b.into_boxed_slice()))
+        // RobloxEmoji's colour glyphs first (the verified badge), rebuilt
+        // with its layers mapped (gui_color_glyphs.rs).
+        color_glyphs::face()
+            .map(|f| f.bytes.as_slice())
+            .into_iter()
+            .chain(
+                files
+                    .iter()
+                    .filter_map(|p| std::fs::read(p).ok())
+                    .map(|b| &*Box::leak(b.into_boxed_slice())),
+            )
             .collect()
     })
 }
@@ -1291,6 +1306,8 @@ impl Gui {
             }
         };
         let name = format!("rbx:{path}");
+        ligatures::note_face(&name, &bytes);
+        color_glyphs::note_face(&name, &bytes);
         let family = FontFamily::Name(name.clone().into());
         ctx.add_font(egui::epaint::text::FontInsert::new(
             &name,
@@ -1739,9 +1756,19 @@ fn parse_color(s: &str) -> Option<[f32; 3]> {
     (v.len() == 3).then(|| [v[0] / 255.0, v[1] / 255.0, v[2] / 255.0])
 }
 
+/// A rich text tag's attribute value: `name="v"`, `name='v'` or `name=v`,
+/// spaces allowed around the `=` (`<font color = "rgb(0, 0, 0)">` colours
+/// in Roblox).
 fn attr(tag: &str, name: &str) -> Option<String> {
-    let i = tag.find(&format!("{name}="))?;
-    let rest = &tag[i + name.len() + 1..];
+    let mut from = 0;
+    let rest = loop {
+        let i = from + tag[from..].find(name)?;
+        let after = tag[i + name.len()..].trim_start();
+        if let Some(v) = after.strip_prefix('=') {
+            break v.trim_start();
+        }
+        from = i + name.len();
+    };
     let q = rest.chars().next()?;
     if q == '"' || q == '\'' {
         let end = rest[1..].find(q)?;
@@ -1889,6 +1916,24 @@ mod tests {
         assert_eq!(runs[3].size, Some(20.0));
     }
 
+    /// `<font color = "rgb(…)">` (spaces around `=`) colours, as in Roblox;
+    /// ExpChat's invisible prefix copy keeps its transparency (its outline
+    /// fades with it).
+    #[test]
+    fn rich_text_colour_attributes() {
+        let runs = rich_runs("<font color = \"rgb(0, 255, 0)\">Player1:</font> hi");
+        assert_eq!(runs[0].color, Some([0.0, 1.0, 0.0]));
+        assert_eq!(runs[1].color, None);
+        let runs = rich_runs("<font color='#02b857'>Player1:</font>");
+        assert_eq!(runs[0].color, Some([2.0 / 255.0, 184.0 / 255.0, 87.0 / 255.0]));
+        let runs = rich_runs(
+            "<font transparency='1.0' size='18'><stroke transparency='1.0'>Player2:</stroke></font> hello",
+        );
+        assert_eq!(runs[0].text, "Player2:");
+        assert_eq!(runs[0].transparency, Some(1.0));
+        assert_eq!(runs[1].transparency, None);
+    }
+
     #[test]
     fn clip_keeps_inside() {
         let m = quad_mesh(
@@ -2007,6 +2052,44 @@ pub(super) fn note_text_face(ctx: &egui::Context, font: &FaceKey, family: &FontF
     }
 }
 
+/// A face for TextService's measuring: a legacy Enum.Font name, or a Font
+/// (family, weight, italic).
+pub fn face_of_legacy(name: &str) -> FaceKey {
+    legacy_font(name)
+}
+
+pub fn face_of_font(f: &rbx_dom_weak::types::Font) -> FaceKey {
+    (f.family.clone(), weight_of(f.weight), matches!(f.style, rbx_dom_weak::types::FontStyle::Italic))
+}
+
+/// The size `text` takes in `font` at `text_size`, wrapped at `width` when
+/// it is finite and positive (TextService:GetTextSize / GetTextBoundsAsync):
+/// measured as the walk lays text out, with the face it last used for this
+/// font, else the default face. None before the GUI has drawn any text.
+pub fn measure_plain(text: &str, font: &FaceKey, text_size: f32, width: f32) -> Option<[f32; 2]> {
+    let ctx = TEXT_CTX.get()?;
+    let (family, em) = {
+        let m = TEXT_FACES.lock().unwrap_or_else(|e| e.into_inner());
+        let m = m.as_ref()?;
+        match m.get(font) {
+            Some(f) => f.clone(),
+            None => m.iter().find(|(_, (f, _))| *f == FontFamily::Proportional).map(|(_, f)| f.clone())?,
+        }
+    };
+    if text.is_empty() {
+        return Some([0.0, text_size]);
+    }
+    let ts = text_size * legacy_text_scale(font);
+    let mut f = egui::TextFormat::simple(egui::FontId::new(ts * em, family), Color32::WHITE);
+    f.line_height = Some(ts);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(text, 0.0, f);
+    job.wrap.max_width = if width.is_finite() && width > 0.0 { width } else { f32::INFINITY };
+    job.round_output_to_gui = false;
+    let g = ctx.fonts_mut(|fo| fo.layout_job(job));
+    Some([g.size().x.ceil(), g.size().y.max(ts).ceil()])
+}
+
 /// TextBounds of a text object that wasn't drawn with its current text or
 /// box (`size`, its AbsoluteSize): Studio measures on the read, so a script
 /// reading it right after the object appeared (the title templates'
@@ -2036,6 +2119,7 @@ pub fn text_bounds_now(d: &Document, r: Ref, size: [f32; 2], ui_scale: f32) -> O
     let scaled = boolp(d, r, "TextScaled", false);
     let line_height = num(d, r, "LineHeight", 1.0);
     let tsc = child_of_class(d, r, "UITextSizeConstraint");
+    let text = ligatures::apply(&family, text);
     let layout = |ts: f32, wrap: bool| {
         let mut f = egui::TextFormat::simple(egui::FontId::new(ts * em, family.clone()), Color32::WHITE);
         f.line_height = Some(ts * line_height);
@@ -2099,6 +2183,7 @@ impl walk::AutoText for FaceText {
         }
         let font = font_of(d, r);
         let Some((ctx, family, em)) = text_face(&font) else { return egui::Vec2::ZERO };
+        let text = ligatures::apply(&family, text);
         let size = num(d, r, "TextSize", 14.0) * scale * legacy_text_scale(&font);
         let mut f = egui::TextFormat::simple(egui::FontId::new(size * em, family), Color32::WHITE);
         f.line_height = Some(size * num(d, r, "LineHeight", 1.0));

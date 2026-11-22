@@ -45,8 +45,9 @@ mod npc;
 /// The player's character (refs are server-side).
 pub struct Character {
     pub model: Ref,
-    /// Accessories the rig's attachments were last worked out for (unused:
-    /// the Npcs journal reader redoes them, play_npc.rs `npc_journal`).
+    /// How many instances the character model held when the rig's attached
+    /// parts were last worked out (play_humanoid.rs `ensure_hum_body`; MAX:
+    /// not yet).
     pub accessories_seen: usize,
     /// Humanoid.FloorMaterial as last written (Enum.Material value).
     pub floor_material: u32,
@@ -1351,6 +1352,7 @@ impl Game {
             return;
         };
         let mut local = Vec::new();
+        let mut core = None;
         if let Some(cdoc) = self.play.as_mut().and_then(|s| s.other_doc.as_mut()) {
             let root = cdoc.dom.root_ref();
             if let Some(players) = cdoc.find_child(root, "Players") {
@@ -1429,8 +1431,24 @@ impl Game {
                     local.push(i.referent());
                 }
             }
+            // Roblox's own CoreScripts, opt-in (core_scripts.rs): CorePackages
+            // and CoreGui.RobloxGui from Studio's data model patch.
+            if rustudio_core::rustudio_settings::core_scripts() {
+                core = Some(load_core_scripts(cdoc));
+            }
         }
         self.sync_view_size();
+        match core {
+            Some(Ok((installed, note))) => {
+                self.info(note);
+                let started = self.with_side(Side::Client, |rt, _, _| rt.start_core_scripts(installed));
+                if let Some(Err(e)) = started {
+                    self.error(format!("CoreScripts: {e}"));
+                }
+            }
+            Some(Err(e)) => self.error(e),
+            None => {}
+        }
         self.with_side(Side::Client, |rt, _, _| {
             for r in local {
                 rt.start_collected(r);
@@ -2972,11 +2990,26 @@ impl Game {
         let Some(mode) = self.play.as_ref().map(|p| p.mode) else {
             return true;
         };
+        // A script's AvatarEditorService:BustAvatarFetchCache (the menu's
+        // Respawn): the account fetches the avatar again. A script's
+        // DataModel:Shutdown (the CoreScripts menu's Leave) ends the session.
+        let mut busted = false;
+        let mut shutdown = false;
+        if let Some(s) = self.play.as_mut() {
+            for w in [s.server.as_mut().and_then(|server| server.world.as_mut()), s.client.as_mut().and_then(|c| c.world.as_mut())].into_iter().flatten() {
+                busted |= std::mem::take(&mut w.avatar_fetch_busted);
+                shutdown |= std::mem::take(&mut w.shutdown_requested);
+            }
+        }
+        if busted {
+            self.account.refetch_avatar();
+        }
         // An avatar that arrived after Play started (it wasn't waited for:
-        // CharacterAutoLoads off) is the next LoadCharacter's.
+        // CharacterAutoLoads off, or fetched again) is the next LoadCharacter's.
+        let new = self.account.take_new_avatar();
         if let (Some(look), Some(s)) = (self.account.avatar(), self.play.as_mut()) {
             for w in [s.server.as_mut().and_then(|server| server.world.as_mut()), s.client.as_mut().and_then(|c| c.world.as_mut())].into_iter().flatten() {
-                if w.avatar.is_none() {
+                if new || w.avatar.is_none() {
                     w.avatar = Some(look.clone());
                 }
             }
@@ -2991,7 +3024,7 @@ impl Game {
         let dt = elapsed;
         // The in-game menu's Leave stops the session; Reset Character kills
         // the character on the server (Humanoid.Health = 0, as Roblox does).
-        if self.play.as_ref().is_some_and(|s| s.game.leave_request) {
+        if shutdown || self.play.as_ref().is_some_and(|s| s.game.leave_request) {
             self.stop_play(host);
             return true;
         }
@@ -4035,6 +4068,27 @@ fn script_enabled(d: &Document, r: Ref) -> bool {
 fn kept_on_spawn(d: &Document, r: Ref) -> bool {
     d.class_of(r).is_some_and(|c| doc::is_a(&c, "LayerCollector"))
         && matches!(d.prop(r, "ResetOnSpawn"), Some(Variant::Bool(false)))
+}
+
+/// Puts Studio's data model patch in the client's DataModel
+/// (core_scripts::install). Returns what to start and a line for Output.
+fn load_core_scripts(cdoc: &mut Document) -> Result<(rustudio_core::core_scripts::Installed, String), String> {
+    let path = rustudio_core::core_scripts::patch_path().ok_or_else(|| {
+        format!("CoreScripts: no {} in the Studio install", rustudio_core::core_scripts::PATCH)
+    })?;
+    // Roblox's published client flags pick the CoreScripts' UI (client_flags.rs).
+    let flags = rustudio_core::client_flags::load();
+    let t0 = std::time::Instant::now();
+    let patch = rustudio_core::core_scripts::read(&path).map_err(|e| format!("CoreScripts: {e}"))?;
+    let installed = rustudio_core::core_scripts::install(cdoc, patch).map_err(|e| format!("CoreScripts: {e}"))?;
+    let note = format!(
+        "CoreScripts: {} modules and {} CoreScripts from {} ({} ms); {flags}",
+        installed.modules.len(),
+        installed.scripts.len(),
+        path.display(),
+        t0.elapsed().as_millis()
+    );
+    Ok((installed, note))
 }
 
 fn client_scripts(cd: &Document, under: &[Option<Ref>]) -> Vec<Ref> {

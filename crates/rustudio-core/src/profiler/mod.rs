@@ -179,6 +179,7 @@ impl Cat {
             ("collision", Cat::Physics),
             ("gameplay_publish_wait", Cat::Wait),
             ("physics_pose_wait", Cat::Wait),
+            ("render_thread_wait", Cat::Wait),
             // scripts
             ("rt_", Cat::Script),
             ("dis_", Cat::Script),

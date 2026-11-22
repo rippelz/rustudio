@@ -124,9 +124,17 @@ pub enum Reader {
     RenderSnapshot = 21,
     /// Animator bindings to joints and bones in a rig.
     AnimatorBindings = 22,
+    /// Legacy Message / Hint instances the view shows (crates/rustudio-engine/src/gui_message.rs).
+    LegacyMessages = 23,
+    /// The styled GUI trees and style sheets style rule matching read
+    /// (crates/rustudio-engine/src/domains/gui_input.rs `style_changes`).
+    Styles = 24,
+    /// The Workspace's Dialogs (crates/rustudio-engine/src/domains/gui_input.rs
+    /// `workspace_dialogs`, GuiService:GetClosestDialogToPosition).
+    Dialogs = 25,
 }
 
-const JOURNAL_READERS: usize = Reader::AnimatorBindings as usize + 1;
+const JOURNAL_READERS: usize = Reader::Dialogs as usize + 1;
 
 /// What a reader gets back: everything changed (rebuild), or the new marks.
 pub enum Marks {
@@ -748,14 +756,28 @@ impl Document {
     /// The marks `reader` hasn't seen yet (All on its first call, or when it
     /// fell too far behind). Marks every reader has seen are dropped.
     pub fn marks_for(&mut self, reader: Reader) -> Marks {
+        let out = match self.reader_pos(reader).and_then(|pos| self.marks_since(pos)) {
+            Some(m) => Marks::Some(m.to_vec()),
+            None => Marks::All,
+        };
+        self.mark_read(reader);
+        out
+    }
+
+    /// Where `reader` is in the journal: None before its first read or
+    /// after it fell behind (it rebuilds then). With `marks_since` a reader
+    /// goes through its new marks in place, without `marks_for`'s copy,
+    /// then `mark_read` moves it on.
+    pub fn reader_pos(&self, reader: Reader) -> Option<u64> {
+        self.journal.read[reader as usize]
+    }
+
+    /// Moves `reader` to the journal's end (it has seen every mark), and
+    /// drops the marks every reader has seen.
+    pub fn mark_read(&mut self, reader: Reader) {
         let j = &mut self.journal;
         let end = j.base + j.marks.len() as u64;
-        let slot = reader as usize;
-        let out = match j.read[slot] {
-            Some(pos) if pos >= j.base => Marks::Some(j.marks[(pos - j.base) as usize..].to_vec()),
-            _ => Marks::All,
-        };
-        j.read[slot] = Some(end);
+        j.read[reader as usize] = Some(end);
         // A reader that stopped reading doesn't hold the journal back: it
         // rebuilds from scratch if it comes back.
         for r in j.read.iter_mut() {
@@ -775,7 +797,6 @@ impl Document {
             j.marks.drain(..n);
             j.base += n as u64;
         }
-        out
     }
 
     /// The journal's end: what the next mark's sequence number will be.

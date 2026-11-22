@@ -632,9 +632,31 @@ thread_local! {
 }
 
 /// The mip chain add_texture would make for `img` (None when it makes none).
-fn mip_chain_for(img: &Rgba) -> Option<Vec<u8>> {
+pub fn mip_chain_for(img: &Rgba) -> Option<Vec<u8>> {
     let (w, h) = (img.width.max(1), img.height.max(1));
     (img.pixels.len() == (w * h * 4) as usize).then(|| mip_chain(w, h, &img.pixels))
+}
+
+/// An RGBA8 data image (normal / roughness / metalness: no sRGB) followed
+/// by its mip levels, 2×2 texels averaged as stored.
+pub fn data_mip_chain(mut w: u32, mut h: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    let mut prev = rgba.to_vec();
+    while w > 1 || h > 1 {
+        let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+        let mut next = vec![0; (nw * nh * 4) as usize];
+        for y in 0..nh { for x in 0..nw { for c in 0..4 {
+            let mut sum = 0u16;
+            for (dx, dy) in [(0,0), (1,0), (0,1), (1,1)] {
+                sum += prev[(((y*2+dy).min(h-1)*w + (x*2+dx).min(w-1))*4) as usize + c] as u16;
+            }
+            next[((y*nw+x)*4) as usize+c] = ((sum+2)/4) as u8;
+        }}}
+        out.extend_from_slice(&next);
+        prev = next;
+        w = nw; h = nh;
+    }
+    out
 }
 
 /// Runs `upload` (which adds `pixels` as a texture) with `mips` already made
