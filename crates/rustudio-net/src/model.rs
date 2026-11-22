@@ -129,6 +129,32 @@ impl LiveModel {
                     self.apply_props(r, &[(name, value)]);
                 }
             }
+            RepOp::ChangeAttribute { id, name, value } => {
+                let Some(inst) = self.refs.get(id).and_then(|r| self.dom.get_by_ref_mut(r)) else { return };
+                // One attribute as a binary place's table of one: count,
+                // name, then the serialized value.
+                let mut table = 1u32.to_le_bytes().to_vec();
+                table.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                table.extend_from_slice(name.as_bytes());
+                table.extend_from_slice(&value);
+                let mut attributes = match inst.properties.get(&"Attributes".into()) {
+                    Some(Variant::Attributes(a)) => a.clone(),
+                    _ => rbx_types::Attributes::new(),
+                };
+                match rbx_types::Attributes::from_reader(table.as_slice()) {
+                    Ok(one) => {
+                        for (k, v) in one {
+                            attributes.insert(k, v);
+                        }
+                    }
+                    // A value rbx_types can't read (nil, which removes the
+                    // attribute, among them): the attribute is gone.
+                    Err(_) => {
+                        attributes.remove(name.as_str());
+                    }
+                }
+                inst.properties.insert("Attributes".into(), Variant::Attributes(attributes));
+            }
             RepOp::DeleteInstance { id } => {
                 if let Some(r) = self.refs.get(id) {
                     if r != self.dom.root_ref() && self.dom.get_by_ref(r).is_some() {
@@ -663,7 +689,7 @@ fn to_variant(v: &PropValue, name: &str) -> Option<Variant> {
         PropValue::SharedString(bytes) | PropValue::CachedSharedString { bytes, .. } => {
             Variant::SharedString(rbx_types::SharedString::new(bytes.clone()))
         }
-        PropValue::Enum(e) => Variant::Enum(rbx_types::Enum::from_u32(*e)),
+        PropValue::Enum(e) | PropValue::EnumItem { value: e, .. } => Variant::Enum(rbx_types::Enum::from_u32(*e)),
         PropValue::Vector2([x, y]) => Variant::Vector2(rbx_types::Vector2::new(*x, *y)),
         PropValue::Vector3([x, y, z]) => Variant::Vector3(rbx_types::Vector3::new(*x, *y, *z)),
         PropValue::Color3([r, g, b]) => Variant::Color3(rbx_types::Color3::new(*r, *g, *b)),
@@ -678,7 +704,7 @@ fn to_variant(v: &PropValue, name: &str) -> Option<Variant> {
                 rbx_types::Vector3::new(rot[6], rot[7], rot[8]),
             ),
         )),
-        PropValue::Ref(_) | PropValue::NetAssetHandle(_) | PropValue::Raw(_) | PropValue::Typed { .. } | PropValue::SharedHash(_) | PropValue::Array(_) | PropValue::Dictionary(_) => return None,
+        PropValue::Ref(_) | PropValue::NetAssetHandle(_) | PropValue::Raw(_) | PropValue::Typed { .. } | PropValue::SharedHash(_) | PropValue::Array(_) | PropValue::Dictionary(_) | PropValue::Nil => return None,
     };
     Some(match (name, variant) {
         ("WorldPivotData", Variant::CFrame(cf)) => Variant::OptionalCFrame(Some(cf)),
@@ -689,6 +715,35 @@ fn to_variant(v: &PropValue, name: &str) -> Option<Variant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server's ChangeAttribute item (0x15) sets one attribute; the rest
+    /// of the packet still decodes (the unknown item used to stop the
+    /// session).
+    #[test]
+    fn change_attribute_item_sets_one_attribute() {
+        let mut m = LiveModel::new();
+        m.apply(RepOp::NewInstance { id: 1, class: "DataModel".into(), parent: None, props: vec![] });
+        m.apply(RepOp::NewInstance { id: 7, class: "Folder".into(), parent: Some(1), props: vec![] });
+        // ref 7 (scope 1), name "Ammo", value: double 5 (type 6); then
+        // ref 7 again with a bool (type 3) true.
+        let mut body = vec![0x15, 0x01, 7, 0, 0, 0, 4];
+        body.extend_from_slice(b"Ammo");
+        body.push(9);
+        body.push(6);
+        body.extend_from_slice(&5.0f64.to_le_bytes());
+        body.extend_from_slice(&[0x15, 0x01, 7, 0, 0, 0, 2, b'O', b'n', 2, 3, 1, 0]);
+        let mut dec = crate::replicator::Decoder::new();
+        let ops = dec.decode_frame(0x83, &body);
+        assert!(dec.errors.is_empty(), "{:?}", dec.errors);
+        assert_eq!(ops.len(), 2);
+        for op in ops {
+            m.apply(op);
+        }
+        let inst = m.dom().get_by_ref(m.reference(7).unwrap()).unwrap();
+        let Some(Variant::Attributes(a)) = inst.properties.get(&"Attributes".into()) else { panic!("no attributes") };
+        assert_eq!(a.get("Ammo"), Some(&Variant::Float64(5.0)));
+        assert_eq!(a.get("On"), Some(&Variant::Bool(true)));
+    }
 
     /// A collaborator's new instance naming a parent this client already
     /// deleted is parked, not inserted (inserting under the stale referent

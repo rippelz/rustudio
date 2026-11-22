@@ -98,6 +98,14 @@ pub enum RepOp {
         name: String,
         value: PropValue,
     },
+    /// One attribute set on an instance (item 0x15): its name and the value
+    /// as `VariantSerializer` writes it (a type byte, then the value, as in
+    /// a binary place's attribute table).
+    ChangeAttribute {
+        id: u64,
+        name: String,
+        value: Vec<u8>,
+    },
     /// An instance was removed.
     DeleteInstance { id: u64 },
     /// An instance moved under a new parent (item 0x13: post-join batch
@@ -139,6 +147,16 @@ pub enum PropValue {
     /// A reference to another instance by server referent.
     Ref(Option<u64>),
     Enum(u32),
+    /// An enum value inside a tuple, array or dictionary, where it carries
+    /// its enum type: `07 | u16 LE index into the schema's enums | varint
+    /// value` [verified: a TextChatMessage dictionary, `status 07 09 02 02`
+    /// (Enum.TextChatMessageStatus); the schema gives a property's enum the
+    /// same u16].
+    EnumItem { enum_type: String, value: u32 },
+    /// `nil` inside a tuple, array or dictionary: element type 0 with no
+    /// payload [verified: a chat RemoteEvent tuple ending `… 1e 00 | 00`,
+    /// an empty array then nil].
+    Nil,
     Vector2([f32; 2]),
     Vector3([f32; 3]),
     Color3([f32; 3]),
@@ -390,16 +408,26 @@ impl Schema {
         Ok(s)
     }
 
-    /// Decode one property value of schema type `ty`.
+    /// Decode one property value of schema type `ty`, as a new object's
+    /// properties carry it.
     fn value(&self, ty: u8, c: &mut Cur) -> R<PropValue> {
-        self.value_at_depth(ty, c, 0)
+        self.value_at_depth(ty, c, 0, false)
     }
 
-    fn value_at_depth(&self, ty: u8, c: &mut Cur, depth: usize) -> R<PropValue> {
+    /// Decode a value as property changes and event arguments carry it:
+    /// Studio's `ChangePropertyItem::read` and `EventInvocationItem::read`
+    /// pass `schemaReadValue` true, which reads content ids prefixed
+    /// [verified: Studio 0.746 disassembly].
+    fn value_prefixed(&self, ty: u8, c: &mut Cur) -> R<PropValue> {
+        self.value_at_depth(ty, c, 0, true)
+    }
+
+    fn value_at_depth(&self, ty: u8, c: &mut Cur, depth: usize, prefixed: bool) -> R<PropValue> {
         if depth > 32 {
             return bad("nested value depth");
         }
         Ok(match ty {
+            0x21 if prefixed => PropValue::String(self.prefixed_content_id(c)?),
             0x02 | 0x21 => {
                 let n=c.varint()? as usize;
                 let bytes=c.take(n)?.to_vec();
@@ -429,6 +457,27 @@ impl Schema {
                 let rot = rotation(c.u8()?, c)?;
                 PropValue::CFrame { pos, rot }
             }
+            // CoordinateFrameCompressed: position, then a rotation id, or 0
+            // and a packed quaternion [verified: Studio 0.746
+            // CustomSerializers::deserializeCoordinateFrameCompressed].
+            0x1b => {
+                let pos = c.f32s()?;
+                let rot = compressed_rotation(c.u8()?, c)?;
+                PropValue::CFrame { pos, rot }
+            }
+            // OptionalCoordinateFrameCompressed: a byte whose bit 7 says
+            // present, low bits the rotation id as for 0x1b, then position
+            // [verified: deserializeOptionalCoordinateFrameCompressed].
+            0x33 => {
+                let b = c.u8()?;
+                if b & 0x80 == 0 {
+                    PropValue::Raw(Vec::new())
+                } else {
+                    let rot = compressed_rotation(b & 0x7f, c)?;
+                    let pos = c.f32s()?;
+                    PropValue::CFrame { pos, rot }
+                }
+            }
             0x1c => PropValue::Ref(c.reference()?),
             // Captured event containers: count, then type-tagged values;
             // dictionaries additionally prefix each value with a key string.
@@ -440,7 +489,16 @@ impl Schema {
                 for _ in 0..count {
                     let key = if ty == 0x1f { Some(c.varstr()?) } else {None};
                     let element_ty = c.u8()?;
-                    let value=self.value_at_depth(element_ty,c,depth+1)?;
+                    let value = match element_ty {
+                        0x00 => PropValue::Nil,
+                        0x07 => {
+                            let index = c.u16()?;
+                            let value = c.varint()? as u32;
+                            let enum_type = self.enums.get(usize::from(index)).cloned().ok_or_else(|| DecodeError::Bad(format!("enum index {index}")))?;
+                            PropValue::EnumItem { enum_type, value }
+                        }
+                        _ => self.value_at_depth(element_ty, c, depth + 1, prefixed)?,
+                    };
                     if let Some(key)=key {dictionary.push((key,value));} else {array.push(value);}
                 }
                 if ty==0x1f {PropValue::Dictionary(dictionary)} else {PropValue::Array(array)}
@@ -511,8 +569,13 @@ impl Schema {
             }
             0x37 => PropValue::Raw(c.take(8)?.to_vec()),
             0x3c => PropValue::NetAssetHandle(self.net_asset_handle(c)?),
+            // `Content`: kind 0 none, 1 a URI read like a ContentId
+            // (`Replicator::readContentId(stream, prefixed)`, so prefixed in
+            // property changes and event arguments), 2 an object
+            // [verified: Studio 0.746 `schemaReadValue`].
             0x3d => match c.u8()? {
                 0 => PropValue::String(String::new()),
+                1 if prefixed => PropValue::String(self.prefixed_content_id(c)?),
                 1 => PropValue::String(c.varstr()?),
                 // Object (Content.fromObject: an EditableImage /
                 // EditableMesh): an instance reference, as type 0x1c. Those
@@ -528,6 +591,19 @@ impl Schema {
             },
             t => return bad(format!("value type {t:#x}")),
         })
+    }
+
+    /// `Replicator::readPrefixedContentId`: a byte whose high seven bits
+    /// index the schema's content prefixes; bit 0 set, a zigzag varint id
+    /// follows (`<prefix><id>`), else a string appended to the prefix
+    /// [verified: Studio 0.746 disassembly].
+    fn prefixed_content_id(&self, c: &mut Cur) -> R<String> {
+        let b = c.u8()?;
+        let prefix = self
+            .content_prefixes
+            .get(usize::from(b >> 1))
+            .ok_or_else(|| DecodeError::Bad(format!("content prefix {}", b >> 1)))?;
+        Ok(if b & 1 != 0 { format!("{prefix}{}", c.zigzag()?) } else { format!("{prefix}{}", c.varstr()?) })
     }
 }
 
@@ -578,6 +654,43 @@ fn rotation(id: u8, c: &mut Cur) -> R<[f32; 9]> {
         ]),
         Err(_) => bad(format!("rotation id {id:#x}")),
     }
+}
+
+/// The compressed CFrame rotation: a basic rotation id as [`rotation`], or
+/// for id 0 `Compressor::readRotation`'s packed unit quaternion — u16 `a`,
+/// u32 `b`: the dropped (largest) component's index is `b >> 30`, the other
+/// three are 15-bit signed fields (`a`, `b >> 15`, `b`) scaled by
+/// `√½ / 16383`, stored at `kRotationAxisTable[index]` = the remaining
+/// indices in that order [verified: Studio 0.746 disassembly]. Components
+/// are (x, y, z, w).
+fn compressed_rotation(id: u8, c: &mut Cur) -> R<[f32; 9]> {
+    if id != 0 {
+        return rotation(id, c);
+    }
+    let a = u32::from(c.u16()?);
+    let b = c.u32()?;
+    let field = |v: u32| (((v << 17) as i32) >> 17) as f32 / 16383.0 * std::f32::consts::FRAC_1_SQRT_2;
+    let (from_a, high, low) = (field(a), field(b >> 15), field(b));
+    let largest = (b >> 30) as usize;
+    let others = [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]][largest];
+    let mut q = [0f32; 4];
+    q[others[0]] = from_a;
+    q[others[1]] = high;
+    q[others[2]] = low;
+    q[largest] = (1.0 - (from_a * from_a + high * high + low * low)).max(0.0).sqrt();
+    let n = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let [x, y, z, w] = q.map(|v| v / n);
+    Ok([
+        1.0 - 2.0 * (y * y + z * z),
+        2.0 * (x * y - z * w),
+        2.0 * (x * z + y * w),
+        2.0 * (x * y + z * w),
+        1.0 - 2.0 * (x * x + z * z),
+        2.0 * (y * z - x * w),
+        2.0 * (x * z - y * w),
+        2.0 * (y * z + x * w),
+        1.0 - 2.0 * (x * x + y * y),
+    ])
 }
 
 // A local resource limit, not a claimed protocol maximum.
@@ -740,16 +853,17 @@ fn terrain_packet(body: &[u8]) -> R<RepOp> {
     Ok(RepOp::Terrain { id, chunks })
 }
 
-/// SET_GLOBALS assigns the client's GUID namespace after seven flags.
-/// Native client parser:...
-/// The second flag enables an optional terrain block, not supported here.
+/// SET_GLOBALS (`0x81`) assigns the client's instance namespace (its peer
+/// id): seven flag bytes, then a varint. The flags are StreamingEnabled,
+/// network filtering, three third-party permissions, on-demand ads (sent
+/// to clients with that capability) and CharacterAutoLoads [verified:
+/// Studio 0.746 `ClientReplicator::processPacketV2`'s `0x81` branch:
+/// `readBool` × 7, then `deserializeUnsignedVarint` → `World::setLocalPeerId`].
+/// No flag adds a block: a server with filtering on sends the second flag
+/// set and the namespace right after the seventh.
 pub fn assigned_peer_scope(body: &[u8]) -> Result<u32, String> {
     let mut c = Cur::new(body);
-    c.u8().map_err(|e| format!("{e:?}"))?;
-    if c.u8().map_err(|e| format!("{e:?}"))? != 0 {
-        return Err("terrain globals block".into());
-    }
-    c.take(5).map_err(|e| format!("{e:?}"))?;
+    c.take(7).map_err(|e| format!("{e:?}"))?;
     let scope = c.varint().map_err(|e| format!("{e:?}"))?;
     if scope <= 1 || scope > u32::MAX as u64 {
         return Err("invalid client namespace".into());
@@ -765,11 +879,7 @@ pub fn assigned_peer_scope(body: &[u8]) -> Result<u32, String> {
 pub fn top_services(schema: &Schema, body: &[u8]) -> Result<Vec<(u64, String)>, String> {
     let mut c = Cur::new(body);
     let e = |e: DecodeError| format!("{e:?}");
-    c.u8().map_err(e)?;
-    if c.u8().map_err(e)? != 0 {
-        return Err("terrain globals block".into());
-    }
-    c.take(5).map_err(e)?;
+    c.take(7).map_err(e)?;
     c.varint().map_err(e)?;
     c.take(4).map_err(e)?;
     let count = c.varint().map_err(e)?;
@@ -1029,6 +1139,15 @@ impl Decoder {
                     ops.push(RepOp::DeleteInstance { id });
                 }
             }
+            // SharedDestroyInstanceItem: u32 count, then that many ids
+            // [verified: Studio 0.746 SharedDestroyInstanceItem::read].
+            0x1b => {
+                for _ in 0..c.u32()? {
+                    if let Some(id) = c.reference()? {
+                        ops.push(RepOp::DeleteInstance { id });
+                    }
+                }
+            }
             // new instance: ref, class, ff, props, ff, parent
             0x02 => {
                 let id = c.reference()?;
@@ -1076,7 +1195,7 @@ impl Decoder {
                     .ok_or(DecodeError::Bad(format!("global prop {gi}")))?;
                 let cls = &s.classes[usize::from(ci)];
                 let p = &cls.props[usize::from(pi)];
-                let value = s.value(p.ty, c)?;
+                let value = s.value_prefixed(p.ty, c)?;
                 let name = p.name.clone();
                 let collaborator = cls.name == "Collaborator";
                 if let PropValue::SharedHash(expected) = &value {
@@ -1085,6 +1204,18 @@ impl Decoder {
                 if let Some(id) = id {
                     if collaborator {ops.push(RepOp::Presence { user_id: id });}
                     ops.push(RepOp::ChangeProperty {id,name,value});
+                }
+            }
+            // ChangeAttributeItem: ref, the attribute's name, then its value
+            // serialized as a string [verified: Studio 0.746
+            // `ChangeAttributeItem::read` → `deserializeString` twice].
+            0x15 => {
+                let id = c.reference()?;
+                let name = c.varstr()?;
+                let n = c.varint()? as usize;
+                let value = c.take(n)?.to_vec();
+                if let Some(id) = id {
+                    ops.push(RepOp::ChangeAttribute { id, name, value });
                 }
             }
             // event: ref, u16 global event, args
@@ -1100,7 +1231,7 @@ impl Decoder {
                 let e = &cls.events[usize::from(ei)];
                 let mut args = Vec::new();
                 for &t in &e.arg_types {
-                    args.push(s.value(t, c)?);
+                    args.push(s.value_prefixed(t, c)?);
                 }
                 ops.push(RepOp::Event {
                     id: id.unwrap_or(0),
@@ -1333,7 +1464,9 @@ mod tests {
             assigned_peer_scope(&[1, 0, 0, 0, 0, 0, 1, 0xac, 2, 0, 0, 0]).unwrap(),
             300
         );
-        assert!(assigned_peer_scope(&[1, 1, 0, 0, 0, 0, 1, 5]).is_err());
+        // Filtering on (the second flag), as a server with it on sends: the
+        // namespace still follows the seventh flag.
+        assert_eq!(assigned_peer_scope(&[0, 1, 1, 0, 1, 0, 1, 5, 0xb3, 1]).unwrap(), 5);
         assert!(assigned_peer_scope(&[1, 0, 0, 0, 0, 0, 1, 1]).is_err());
     }
 
@@ -1641,6 +1774,73 @@ mod tests {
         let mut c = Cur::new(&d);
         assert!(s.value(0x3d, &mut c).is_ok());
         assert_eq!(c.o, 2);
+    }
+
+    #[test]
+    fn compressed_cframe_quaternion_and_shared_destroy() {
+        let s = Schema::default();
+        // Position (1, 2, 3), id 0, then a = 0, b = largest w, y = √½: a
+        // quarter turn about Y.
+        let mut d = Vec::new();
+        for v in [1f32, 2.0, 3.0] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d.push(0);
+        d.extend_from_slice(&0u16.to_le_bytes());
+        d.extend_from_slice(&((3u32 << 30) | (16383 << 15)).to_le_bytes());
+        let mut c = Cur::new(&d);
+        let Ok(PropValue::CFrame { pos, rot }) = s.value(0x1b, &mut c) else { panic!() };
+        assert_eq!((pos, c.o), ([1.0, 2.0, 3.0], d.len()));
+        let want = [0.0, 0.0, 1.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0];
+        assert!(rot.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-3), "{rot:?}");
+        let mut dec = decoder();
+        let ops = dec.decode_frame(0x83, &[0x1b, 2, 0, 0, 0, 1, 7, 0, 0, 0, 1, 9, 0, 0, 0, 0]);
+        assert!(dec.errors.is_empty(), "{:?}", dec.errors);
+        assert!(matches!(ops.as_slice(), [RepOp::DeleteInstance { id: 7 }, RepOp::DeleteInstance { id: 9 }]));
+    }
+
+    #[test]
+    fn compressed_cframe_round_trips_through_the_writer() {
+        let schema = Schema {
+            classes: vec![SchemaClass { name: "Tool".into(), props: vec![SchemaProp { name: "Grip".into(), ty: 0x1b }], events: vec![] }],
+            global_props: vec![(0, 0)],
+            ..Default::default()
+        };
+        // A turn of 0.5 rad about an oblique axis (no basic rotation id).
+        let n = 14f32.sqrt();
+        let (s, w) = (0.25f32.sin(), 0.25f32.cos());
+        let (x, y, z) = (s / n, 2.0 * s / n, 3.0 * s / n);
+        let rot = [
+            1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w),
+            2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w),
+            2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y),
+        ];
+        let frame = crate::writer::property(&schema, 7, "Tool", "Grip", &PropValue::CFrame { pos: [1.0, 2.0, 3.0], rot }).unwrap();
+        let mut dec = Decoder::new();
+        dec.schema = Some(schema);
+        let ops = dec.decode_frame(frame[0], &frame[1..]);
+        assert!(dec.errors.is_empty(), "{:?}", dec.errors);
+        let [RepOp::ChangeProperty { value: PropValue::CFrame { pos, rot: got }, .. }] = ops.as_slice() else { panic!("{ops:?}") };
+        assert_eq!(*pos, [1.0, 2.0, 3.0]);
+        assert!(got.iter().zip(rot).all(|(a, b)| (a - b).abs() < 1e-3), "{got:?} vs {rot:?}");
+    }
+
+    /// Property changes and event arguments carry content ids prefixed; a
+    /// new object's carry them as plain strings.
+    #[test]
+    fn content_uri_in_a_property_change_is_a_prefixed_content_id() {
+        let mut s = Schema::default();
+        s.content_prefixes = vec!["rbxassetid://".into(), "http://www.roblox.com/asset/?id=".into()];
+        // A Decal.TextureContent change seen live: kind 1, then prefix 1
+        // with a zigzag id (an 18-digit asset id needs 7 bytes).
+        let d = [0x01, 0x03, 0xba, 0x97, 0xf1, 0x85, 0xa7, 0xe0, 0x33, 0x02];
+        let mut c = Cur::new(&d);
+        let v = s.value_prefixed(0x3d, &mut c).unwrap();
+        assert!(matches!(&v, PropValue::String(u) if u == "http://www.roblox.com/asset/?id=113804694136285"), "{v:?}");
+        assert_eq!(c.o, 9);
+        let d = [0x01, 0x03, b'a', b'b', b'c'];
+        let mut c = Cur::new(&d);
+        assert!(matches!(s.value(0x3d, &mut c), Ok(PropValue::String(u)) if u == "abc"));
     }
 
     #[test]

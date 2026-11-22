@@ -31,7 +31,7 @@ pub fn property(
     out.extend_from_slice(&global.to_le_bytes());
     out.push(0); // Client-origin version byte (verified against Studio c2s).
     let value = prepare_value(ty, value)?;
-    encode_value(&mut out, ty, &value)?;
+    encode_value(&mut out, ty, &value, Some(schema))?;
     append_shared(&mut out, &value);
     out.push(0); // End of item list.
     Ok(out)
@@ -46,19 +46,36 @@ pub fn event(schema: &Schema, id: u64, class: &str, name: &str, args: &[PropValu
     if args.len()!=descriptor.arg_types.len() {return Err(format!("{class}.{name} argument count"));}
     let mut out=vec![0x83,7];put_reference(&mut out,id);
     out.extend_from_slice(&u16::try_from(global).map_err(|_| "event index range")?.to_le_bytes());
-    for (value,ty) in args.iter().zip(&descriptor.arg_types) {encode_value(&mut out,*ty,value)?;}
+    for (value,ty) in args.iter().zip(&descriptor.arg_types) {encode_value(&mut out,*ty,value,Some(schema))?;}
     out.push(0);Ok(out)
 }
 
-fn encode_tagged(out: &mut Vec<u8>, value: &PropValue) -> Result<(), String> {
+fn encode_tagged(out: &mut Vec<u8>, value: &PropValue, prefixes: Prefixes) -> Result<(), String> {
+    // An enum in a container names its enum type: `07 | u16 enum index |
+    // varint value` (replicator's PropValue::EnumItem). A bare enum has no
+    // container form.
+    if let PropValue::EnumItem { enum_type, value } = value {
+        let index = prefixes
+            .and_then(|schema| schema.enums.iter().position(|e| e == enum_type))
+            .and_then(|i| u16::try_from(i).ok())
+            .ok_or_else(|| format!("Enum.{enum_type} is not replicated by this server"))?;
+        out.push(0x07);
+        out.extend_from_slice(&index.to_le_bytes());
+        put_varint(out, u64::from(*value));
+        return Ok(());
+    }
+    if let PropValue::Nil = value {
+        out.push(0x00);
+        return Ok(());
+    }
     let ty=match value {
         PropValue::Bool(_)=>0x09,PropValue::Int(_) | PropValue::Int64(_)=>0x2c,PropValue::Float(_)=>0x0c,PropValue::Float32(_)=>0x0b,
-        PropValue::String(_)=>0x02,PropValue::Array(_)=>0x1e,PropValue::Dictionary(_)=>0x1f,
-        PropValue::Ref(_)=>0x1c,PropValue::Enum(_)=>0x07,
+        PropValue::String(_) | PropValue::BinaryString(_)=>0x02,PropValue::Array(_)=>0x1e,PropValue::Dictionary(_)=>0x1f,
+        PropValue::Ref(_)=>0x1c,
         PropValue::Vector3(_)=>0x16,PropValue::Vector2(_)=>0x15,PropValue::CFrame {..}=>0x1a,
         _=>return Err("Unsupported event container value".into()),
     };
-    out.push(ty);encode_value(out,ty,value)
+    out.push(ty);encode_value(out,ty,value,prefixes)
 }
 
 pub fn wire_name(name: &str) -> &str {
@@ -97,29 +114,61 @@ fn append_shared(out: &mut Vec<u8>, value: &PropValue) {
     }
 }
 
-fn encode_value(out: &mut Vec<u8>, ty: u8, value: &PropValue) -> Result<(), String> {
+/// The schema where content ids are written prefixed (property changes and
+/// event arguments: `Replicator::readContentId(stream, true)`) and enums
+/// in containers name their type; None where content ids are plain
+/// strings (new objects).
+type Prefixes<'a> = Option<&'a Schema>;
+
+/// A content id in the form `Replicator::readPrefixedContentId` reads: a
+/// byte `index << 1 | 1` and a zigzag id when the URI is a prefix and a
+/// number, else `index << 1` and the rest as a string (the longest matching
+/// prefix either way).
+fn put_prefixed_content_id(out: &mut Vec<u8>, uri: &str, prefixes: &[String]) -> Result<(), String> {
+    let matching = || prefixes.iter().enumerate().filter(|(_, p)| uri.starts_with(p.as_str()));
+    let numeric = matching()
+        .filter_map(|(i, p)| uri[p.len()..].parse::<i64>().ok().filter(|n| n.to_string() == uri[p.len()..]).map(|n| (i, p.len(), n)))
+        .max_by_key(|&(_, len, _)| len);
+    let index = |i: usize| u8::try_from(i).ok().filter(|i| *i < 128).ok_or("content prefix index range");
+    if let Some((i, _, n)) = numeric {
+        out.push(index(i)? << 1 | 1);
+        put_varint(out, zigzag(n));
+    } else {
+        let (i, p) = matching().max_by_key(|(_, p)| p.len()).ok_or_else(|| format!("{uri} has no content prefix in this server's schema"))?;
+        out.push(index(i)? << 1);
+        put_varstr(out, uri[p.len()..].as_bytes());
+    }
+    Ok(())
+}
+
+fn encode_value(out: &mut Vec<u8>, ty: u8, value: &PropValue, prefixes: Prefixes) -> Result<(), String> {
     if let PropValue::Typed { bytes, .. } = value {
-        return encode_value(out, ty, &PropValue::Raw(bytes.clone()));
+        return encode_value(out, ty, &PropValue::Raw(bytes.clone()), prefixes);
     }
     if let PropValue::Float32(v) = value {
-        return encode_value(out, ty, &PropValue::Float(f64::from(*v)));
+        return encode_value(out, ty, &PropValue::Float(f64::from(*v)), prefixes);
     }
     match (ty, value) {
         (0x1d | 0x1e, PropValue::Array(values)) => {
             put_varint(out,values.len() as u64);
-            for value in values {encode_tagged(out,value)?;}
+            for value in values {encode_tagged(out,value,prefixes)?;}
         }
         (0x1f, PropValue::Dictionary(values)) => {
             put_varint(out,values.len() as u64);
-            for (key,value) in values {put_varstr(out,key.as_bytes());encode_tagged(out,value)?;}
+            for (key,value) in values {put_varstr(out,key.as_bytes());encode_tagged(out,value,prefixes)?;}
         }
         (0x09, PropValue::Bool(v)) => out.push(u8::from(*v)),
         (0x0a | 0x2c, PropValue::Int(v) | PropValue::Int64(v)) => put_varint(out, zigzag(*v)),
-        (0x07, PropValue::Enum(v)) => put_varint(out, u64::from(*v)),
+        (0x07, PropValue::Enum(v) | PropValue::EnumItem { value: v, .. }) => put_varint(out, u64::from(*v)),
         (0x0b, PropValue::Float(v)) => out.extend_from_slice(&(*v as f32).to_le_bytes()),
         (0x0c, PropValue::Float(v)) => out.extend_from_slice(&v.to_le_bytes()),
+        (0x21, PropValue::String(v)) if prefixes.is_some() => put_prefixed_content_id(out, v, prefixes.map(|s| s.content_prefixes.as_slice()).unwrap_or_default())?,
         (0x02 | 0x21, PropValue::BinaryString(v)) => put_varstr(out,v),
         (0x02 | 0x21, PropValue::String(v)) => put_varstr(out, v.as_bytes()),
+        // A name in the schema's dictionary goes as its index (0x80 | i),
+        // as Roblox clients write a weld's "RightGrip"; else its length and
+        // text.
+        (0x31, PropValue::Raw(index)) if index.len() == 1 && index[0] & 0x80 != 0 => out.push(index[0]),
         (0x31, PropValue::String(v)) if v.len() < 128 => {
             out.push(v.len() as u8);
             out.extend_from_slice(v.as_bytes());
@@ -140,7 +189,10 @@ fn encode_value(out: &mut Vec<u8>, ty: u8, value: &PropValue) -> Result<(), Stri
                 out.push(0);
             } else {
                 out.push(1);
-                put_varstr(out, uri.as_bytes());
+                match prefixes {
+                    Some(schema) => put_prefixed_content_id(out, uri, &schema.content_prefixes)?,
+                    None => put_varstr(out, uri.as_bytes()),
+                }
             }
         }
         (0x13, PropValue::Color3(v)) | (0x16, PropValue::Vector3(v)) => {
@@ -159,6 +211,30 @@ fn encode_value(out: &mut Vec<u8>, ty: u8, value: &PropValue) -> Result<(), Stri
             }
             out.push(0); // Full matrix, avoiding compressed-rotation assumptions.
             for f in rot {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        // CoordinateFrameCompressed: the position, then an axis-aligned
+        // rotation as its basic rotation id, any other as 0 and the packed
+        // quaternion `replicator::compressed_rotation` reads (a Roblox
+        // client's weld C0 / C1 use ids 6 and 27 [verified: capture]).
+        (0x1b, PropValue::CFrame { pos, rot }) => {
+            for f in pos {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+            match basic_rotation_id(rot) {
+                Some(id) => out.push(id),
+                None => {
+                    out.push(0);
+                    put_packed_rotation(out, rot);
+                }
+            }
+        }
+        (0x33, PropValue::Raw(bytes)) if bytes.is_empty() => out.push(0),
+        (0x33, PropValue::CFrame { pos, rot }) => {
+            out.push(0x80);
+            put_packed_rotation(out, rot);
+            for f in pos {
                 out.extend_from_slice(&f.to_le_bytes());
             }
         }
@@ -220,7 +296,50 @@ fn encode_value(out: &mut Vec<u8>, ty: u8, value: &PropValue) -> Result<(), Stri
     Ok(())
 }
 
-/// NewObjectItem with schema-indexed properties and an empty early group.
+/// The basic rotation id of a row-major rotation that is axis-aligned
+/// (within float noise), as `replicator::rotation` reads it back.
+fn basic_rotation_id(rot: &[f32; 9]) -> Option<u8> {
+    let r = rot.map(|v| if (v - v.round()).abs() < 1e-4 { v.round() } else { v });
+    let v = |i: usize| rbx_types::Vector3::new(r[i], r[i + 1], r[i + 2]);
+    rbx_types::Matrix3::new(v(0), v(3), v(6)).to_basic_rotation_id()
+}
+
+/// The packed unit quaternion of `Compressor::readRotation` (the inverse of
+/// `replicator::compressed_rotation`): u16 `a`, u32 `b`; the largest
+/// component is dropped (made positive) and its index goes in `b >> 30`,
+/// the other three are 15-bit signed values of `x / √½ × 16383`.
+fn put_packed_rotation(out: &mut Vec<u8>, rot: &[f32; 9]) {
+    let [m00, m01, m02, m10, m11, m12, m20, m21, m22] = *rot;
+    // Row-major matrix → (x, y, z, w).
+    let trace = m00 + m11 + m22;
+    let mut q = if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        [(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25 * s]
+    } else if m00 > m11 && m00 > m22 {
+        let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+        [0.25 * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s]
+    } else if m11 > m22 {
+        let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+        [(m01 + m10) / s, 0.25 * s, (m12 + m21) / s, (m02 - m20) / s]
+    } else {
+        let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+        [(m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s]
+    };
+    let n = q.iter().map(|v| v * v).sum::<f32>().sqrt().max(f32::EPSILON);
+    q = q.map(|v| v / n);
+    let largest = (0..4).max_by(|&a, &b| q[a].abs().total_cmp(&q[b].abs())).unwrap_or(3);
+    if q[largest] < 0.0 {
+        q = q.map(|v| -v);
+    }
+    let field = |v: f32| ((v / std::f32::consts::FRAC_1_SQRT_2 * 16383.0).round().clamp(-16383.0, 16383.0) as i32 as u32) & 0x7fff;
+    let others = [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]][largest];
+    let a = field(q[others[0]]) as u16;
+    let b = ((largest as u32) << 30) | (field(q[others[1]]) << 15) | field(q[others[2]]);
+    out.extend_from_slice(&a.to_le_bytes());
+    out.extend_from_slice(&b.to_le_bytes());
+}
+
+/// NewObjectItem with schema-indexed properties in its two groups.
 /// Every property must be sent; see [`create_partial`] to drop the ones this
 /// server cannot take.
 pub fn create(
@@ -270,9 +389,17 @@ pub fn create_partial(
             continue;
         };
         if pi>=255 {skipped.push((name.clone(),"Property index exceeds protocol range".into()));continue;}
+        // A name in the schema's dictionary goes as its index.
+        let value = match (prop.ty, value) {
+            (0x31, PropValue::String(s)) => match schema.names.iter().position(|n| n == s).filter(|i| *i < 0x80) {
+                Some(i) => PropValue::Raw(vec![0x80 | i as u8]),
+                None => value.clone(),
+            },
+            _ => value.clone(),
+        };
         // Encode once here so a value without a wire form drops only itself.
-        let value=match prepare_value(prop.ty,value) {Ok(v)=>v,Err(e)=>{skipped.push((name.clone(),e));continue;}};
-        if let Err(e)=encode_value(&mut Vec::new(),prop.ty,&value) {skipped.push((name.clone(),format!("{class}.{name}: {e}")));continue;}
+        let value=match prepare_value(prop.ty,&value) {Ok(v)=>v,Err(e)=>{skipped.push((name.clone(),e));continue;}};
+        if let Err(e)=encode_value(&mut Vec::new(),prop.ty,&value,None) {skipped.push((name.clone(),format!("{class}.{name}: {e}")));continue;}
         encoded.push((pi as u8,prop.ty,value));
     }
     // Each group goes in ascending schema index, as the server's own
@@ -284,16 +411,22 @@ pub fn create_partial(
     // live on a test place, 2026-11-20: Name alone is accepted, Name + any of them
     // resets).
     encoded.sort_by_key(|(pi,_,_)| *pi);
-    // Protected source is serialized in NewObject's early group.
-    for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| *ty==0x06) {
-        out.push(pi);encode_value(&mut out,ty,value)?;
+    // NewObject writes its first property group, then its second; the first
+    // holds the types `getPropertyGroup` puts there: references, content
+    // ids, protected and script sources, … [verified: Studio 0.746
+    // `getPropertyGroup`; a Roblox client's weld has Part0 / Part1 there].
+    // A property in the other group gets the session closed (0x104)
+    // [verified: live, a weld sent with its references in the second group].
+    let first = |ty: u8| matches!(ty, 0x03 | 0x06 | 0x1c | 0x21 | 0x22 | 0x2f | 0x45);
+    for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| first(*ty)) {
+        out.push(pi);encode_value(&mut out,ty,value,None)?;
     }
     out.push(0xff);
-    for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| *ty!=0x06) {
-        out.push(pi);encode_value(&mut out,ty,value)?;
+    for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| !first(*ty)) {
+        out.push(pi);encode_value(&mut out,ty,value,None)?;
     }
     out.push(0xff);
-    for (_,_,value) in encoded.iter().filter(|(_,ty,_)| *ty==0x06).chain(encoded.iter().filter(|(_,ty,_)| *ty!=0x06)) {
+    for (_,_,value) in encoded.iter().filter(|(_,ty,_)| first(*ty)).chain(encoded.iter().filter(|(_,ty,_)| !first(*ty))) {
         append_shared(&mut out,value);
     }
     put_reference(&mut out, parent);
@@ -364,6 +497,8 @@ mod tests {
             let schema = Schema {
                 classes: vec![SchemaClass { name: class.into(), props: vec![SchemaProp { name: name.into(), ty }], events: vec![] }],
                 global_props: vec![(0, 0)],
+                // Property changes write content ids against these.
+                content_prefixes: vec!["rbxassetid://".into()],
                 ..Default::default()
             };
             let wire = crate::model::typed_value(&value)
@@ -382,6 +517,42 @@ mod tests {
             let got = inst.properties.iter().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.clone());
             assert_eq!(got.as_ref(), Some(&value), "{class}.{name}");
         }
+    }
+
+    /// A Roblox client's NewObject for a tool grip weld, byte for byte:
+    /// references in the first group, each group in schema order,
+    /// axis-aligned rotations as basic ids, the name as its dictionary index.
+    #[test]
+    fn grip_weld_new_object_matches_a_roblox_client() {
+        let ty = [0x09, 0x1b, 0x1b, 0x09, 0x1c, 0x1c, 0x09, 0x02, 0x37, 0x09, 0x31];
+        let names = ["EnableSkinning", "C0", "C1", "Enabled", "Part0", "Part1", "Archivable", "AttributesReplicate", "Capabilities", "DefinesCapabilities", "Name"];
+        let mut dictionary = vec![String::new(); 0x52];
+        dictionary.push("RightGrip".into());
+        let schema = Schema {
+            classes: vec![SchemaClass {
+                name: "Weld".into(),
+                props: names.iter().zip(ty).map(|(n, ty)| SchemaProp { name: (*n).into(), ty }).collect(),
+                events: vec![],
+            }],
+            names: dictionary,
+            ..Default::default()
+        };
+        let basic = |id: u8| {
+            let m = rbx_types::Matrix3::from_basic_rotation_id(id).unwrap();
+            [m.x.x, m.x.y, m.x.z, m.y.x, m.y.y, m.y.z, m.z.x, m.z.y, m.z.z]
+        };
+        let props = vec![
+            ("Name".to_string(), PropValue::String("RightGrip".into())),
+            ("Part0".to_string(), PropValue::Ref(Some(0x51f7))),
+            ("Part1".to_string(), PropValue::Ref(Some(0x524a))),
+            ("C0".to_string(), PropValue::CFrame { pos: [0.0, -1.0, 0.0], rot: basic(6) }),
+            ("C1".to_string(), PropValue::CFrame { pos: [0.7, 0.0, -0.5], rot: basic(0x1b) }),
+        ];
+        let out = create(&schema, (5u64 << 32) | 0xb973, "Weld", 0x51f7, &props).unwrap();
+        // The client's bytes, its class index here 0.
+        let client = "02 05 73 b9 00 00 00 00 04 01 f7 51 00 00 05 01 4a 52 00 00 ff 01 00 00 00 00 00 00 80 bf 00 00 00 00 06 02 33 33 33 3f 00 00 00 00 00 00 00 bf 1b 0a d2 ff 01 f7 51 00 00";
+        let client: Vec<u8> = client.split(' ').map(|b| u8::from_str_radix(b, 16).unwrap()).collect();
+        assert_eq!(&out[1..out.len() - 1], client.as_slice());
     }
 
     /// A Part's Color goes as Color3uint8 bytes; a GUI's Size keeps its name.
@@ -515,6 +686,40 @@ mod tests {
         dec.schema = Some(schema);
         let ops = dec.decode_frame(frame[0], &frame[1..]);
         assert!(dec.errors.is_empty(), "{:?}", dec.errors);
+    }
+
+    /// An enum inside an event's dictionary carries its enum type's index,
+    /// as a TextChatMessage's `status` does (`07 09 02 02`); read as a bare
+    /// enum, the rest of the dictionary desynced ("value type 0x74"). A nil
+    /// element is the bare type byte 0 ("value type 0x0").
+    #[test]
+    fn enums_and_nils_in_containers() {
+        use crate::replicator::SchemaEvent;
+        let mut enums = vec![String::new(); 0x209];
+        enums.push("TextChatMessageStatus".into());
+        let schema = Schema {
+            enums,
+            classes: vec![SchemaClass {
+                name: "TextChatService".into(),
+                props: vec![],
+                events: vec![SchemaEvent { name: "ServerToClientMessageReplicateSignalV2".into(), arg_types: vec![0x1f] }],
+            }],
+            global_events: vec![(0, 0)],
+            ..Default::default()
+        };
+        let message = PropValue::Dictionary(vec![
+            ("status".into(), PropValue::EnumItem { enum_type: "TextChatMessageStatus".into(), value: 2 }),
+            ("text".into(), PropValue::String("Hello world".into())),
+            ("extra".into(), PropValue::Nil),
+        ]);
+        let frame = event(&schema, 0x2409, "TextChatService", "ServerToClientMessageReplicateSignalV2", &[message.clone()]).unwrap();
+        let status = [0x06, b's', b't', b'a', b't', b'u', b's', 0x07, 0x09, 0x02, 0x02];
+        assert!(frame.windows(status.len()).any(|w| w == status), "{frame:02x?}");
+        let mut dec = Decoder::new();
+        dec.schema = Some(schema);
+        let ops = dec.decode_frame(frame[0], &frame[1..]);
+        assert!(dec.errors.is_empty(), "{:?}", dec.errors);
+        assert!(matches!(&ops[0], RepOp::Event { args, .. } if args == &vec![message]));
     }
 
     #[test]

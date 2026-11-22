@@ -1237,6 +1237,7 @@ impl Editor {
                         let touched = match &op {
                             Op::NewInstance { id, .. } | Op::Reparent { id, .. } => Some((*id, None)),
                             Op::ChangeProperty { id, name, .. } => Some((*id, Some(name.clone()))),
+                            Op::ChangeAttribute { id, .. } => Some((*id, Some("Attributes".to_string()))),
                             Op::DeleteInstance { .. } => { live_rebuild = true; None }
                             Op::JoinDataBegin => { live_rebuild = true; None }
                             // A listed service may be made here, with children parked for it.
