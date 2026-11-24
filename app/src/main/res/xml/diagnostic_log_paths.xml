@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <external-path name="shared_logs" path="RuStudio/Logs/" />
+    <files-path name="private_logs" path="RuStudio/Logs/" />
+</paths>

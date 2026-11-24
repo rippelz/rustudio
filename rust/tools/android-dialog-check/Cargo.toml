@@ -1,0 +1,9 @@
+[workspace]
+
+[package]
+name = "android-dialog-check"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+egui = { path = "../../vendor/egui" }

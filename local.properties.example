@@ -1,0 +1,6 @@
+# Android Studio normally configures this automatically.
+# sdk.dir=/path/to/Android/Sdk
+
+# Optional overrides. Use forward slashes on Windows.
+# cargo.dir=/path/to/.cargo/bin
+# cargo.targetDir=/path/to/cargo-target

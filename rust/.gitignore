@@ -1,0 +1,16 @@
+target/
+shots/
+__pycache__/
+
+# Generated probes and editor lock files
+tools/parity_probe/*/runs/
+*.rbxlx.lock
+tools/fidelity/truss/build.log
+tools/fidelity/truss/tests.log
+
+# Wine prefixes and Studio data folders checks leave behind: their links lead
+# out of the tree (dosdevices/z: is /), and cargo walks every file git doesn't
+# ignore the first time a profile builds ("failed to determine package
+# fingerprint ... Permission denied").
+checks/**/dosdevices/
+checks/**/waxley-data/

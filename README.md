@@ -1,148 +1,51 @@
-<p align="center">
-  <img src="assets/icons/rustudio-256.png" width="128" alt="rustudio icon">
-</p>
+# RuStudioAPK
 
-<h1 align="center">rustudio</h1>
+A native Android port of Rustudio, a native editor for Roblox places, written in Rust.
 
-<p align="center">
-  <a href="https://discord.gg/pdVZpADpWr"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Join the rustudio Discord"></a>
-</p>
+RuStudioAPK brings the [Rustudio](https://github.com/rippelz/rustudio) editing experience to Android, allowing users to work with Roblox place files directly on ARM64 devices running Android 8.0 or later.
 
-**A native Linux/Windows/macOS Roblox Studio, written in Rust.** Open, edit and save
-Roblox places, press Play and run them with real Luau, physics, characters
-and GUIs, without Wine.
+[GitHub repository](https://github.com/saidrbx/RuStudioAPK) · [Releases](https://github.com/saidrbx/RuStudioAPK/releases) · [Android builds](https://github.com/saidrbx/RuStudioAPK/actions/workflows/android.yml)
 
-![Editing a place in rustudio](docs/images/editor.png)
+> If you have any suggestions for UI improvements or other Studio-related features, feel free to share them so I can work on improving the project.
 
-![Playing a test place in rustudio](docs/images/play-mode.png)
+## Screenshots
+This interface was designed to maximize screen space on mobile devices, keeping the layout compact and efficient.
+| Editor | Play Mode |
+|:---:|:---:|
+| ![RuStudioAPK Editor](docs/pictures/Image_1.jpeg) | ![RuStudioAPK Interface](docs/pictures/Image_2.jpeg) |
 
-![The rustudio home screen](docs/images/home.png)
+## Build
 
-> This project is still early, so please please help!! Contributions are super welcome. Come hang out, ask for help or report bugs on the [Discord](https://discord.gg/pdVZpADpWr).
-
-## Features
-
-- **Editor:** Explorer, Properties, Output, script tabs, move/scale/rotate
-  tools, terrain brushes, pop-out panels, undo/redo, and Studio's menus and
-  shortcuts.
-- **Files:** `.rbxl` / `.rbxlx` places, `.rbxm` / `.rbxmx` models, and
-  Rojo/Argon-style project folders (File > Save as Project Folder…).
-- **File Sync:** attach a Rojo or Argon project to any open place, live Team
-  Create sessions included.
-- **Play / Run:** separate server and client, remotes, physics that follows
-  Studio's solver, R15/R6 characters, sounds, tweens, 2D and 3D GUIs, and
-  teleports between places of the same experience.
-- **Luau:** the real Luau VM with most of the engine API real games use
-  ([what's missing](docs/ENGINE-GAPS.md)).
-- **Rendering:** wgpu, with lighting, shadows, sky, atmosphere, materials,
-  meshes and terrain tuned against Studio, plus FBX import.
-- **Plugins and Toolbox:** Studio plugins run in the editor (local or from
-  the Creator Store), and the Toolbox searches the Creator Store and your
-  inventory.
-- **Roblox account:** open, save and publish your places, load assets and
-  avatars, use DataStores, and join Team Create.
-- **MCP server:** AI agents can read and edit an open place, run Luau, press
-  Play and send input (`rustudio mcp`).
-- **Profiler:** a MicroProfiler window (Ctrl+F6) and command-line captures
-  ([docs/PROFILING.md](docs/PROFILING.md)).
-
-## Install
-
-Download the latest build from the
-[releases page](https://github.com/rippelz/rustudio/releases):
-
-- **Linux (x86_64):** extract the archive and run `./install.sh`. It installs
-  into `~/.local` and adds rustudio to your app launcher. Run it again from a
-  newer archive to upgrade; `./install.sh --uninstall` removes it.
-- **Windows (x64):** extract the ZIP and double-click `install.cmd` (no admin
-  rights needed), or run `rustudio.exe` directly as a portable copy.
-  `uninstall.cmd` in the install folder removes it.
-- **macOS 11+ (Apple Silicon and Intel):** unzip, move `rustudio.app` to
-  Applications, and the first time right-click it > **Open** (it isn't
-  notarized).
-
-Uninstalling keeps your projects, settings, sign-in and downloaded content.
-Downloaded copies check for updates on start (verified against the release's
-`SHA256SUMS`); set `RUSTUDIO_NO_UPDATE_CHECK=1` to turn that off.
-
-### Build from source
-
-You need Rust 1.95 or newer and a GPU with Vulkan or OpenGL (Metal on macOS).
+Install JDK 17, Android SDK Platform 35, Build Tools 35.0.0, NDK 29.0.14206865, and Rust with rustup. Set `ANDROID_HOME` to your SDK directory or open the project in Android Studio.
 
 ```sh
-git clone https://github.com/rippelz/rustudio
-cd rustudio
-cargo build --release
-./target/release/rustudio --demo           # sample scene
-./target/release/rustudio my_place.rbxl    # open a place
+rustup target add aarch64-linux-android
+cargo install cargo-ndk --version 4.1.2 --locked
 ```
 
-On Linux, `./install.sh` builds and installs it for your user
-(`--no-build` installs an existing `target/release/rustudio`; `--help` for
-more). On macOS, `tools/macos/bundle.sh` builds the `.app`. The standalone
-player isn't in the downloads; build it with `cargo build -p rustudio-player`.
+| Host | Command from the repository root |
+| --- | --- |
+| Linux | `./gradlew assembleDebug` |
+| Windows | `.\gradlew.bat assembleDebug` |
 
-### Studio content
+The APK is written to `app/build/outputs/apk/debug/app-debug.apk`. See the [build guide](docs/android/BUILD.md) for setup details, GitHub Actions, and signing.
 
-On first launch rustudio downloads Roblox Studio's built-in content (default
-characters, player scripts, fonts, textures, sounds; about 60 MB) from
-Roblox's CDN. Run `rustudio --install-studio-content` to fetch or update it
-ahead of time. If you already have Studio installed (e.g. through
-[Vinegar](https://vinegarhq.org), or `RobloxStudio.app` on a Mac), rustudio
-can use that instead:
+## Reporting Issues
+When reporting a problem, please include:
+- RuStudioAPK version.
+- Android version.
+- Device model.
+- Steps to reproduce the issue.
+- Screenshots or additional details, if applicable.
 
-```sh
-export RUSTUDIO_STUDIO_DIR=~/.var/app/org.vinegarhq.Vinegar/data/vinegar/versions/version-XXXX
-```
+You can export diagnostic information directly from the editor:
 
-## Platforms
+**Menu → Help → Share Diagnostic Logs**
 
-| Platform | Status |
-|---|---|
-| Linux x86_64 (Wayland or X11) | Supported |
-| Linux ARM64 | Should build; untested |
-| macOS 11+ (Apple Silicon and Intel) | Builds and runs (tested on Apple Silicon) |
-| Windows x86_64 (MSVC) | Builds and runs (tested on Windows 11) |
+Review the exported logs before sharing them to ensure they do not contain sensitive information.
 
-CI builds and tests on Linux, Windows and macOS (ARM and Intel).
+For additional instructions, see the [Usage Guide](docs/android/USAGE.md).
 
-- **Windows:** data and caches live in `%LOCALAPPDATA%\rustudio`, settings
-  in `%APPDATA%\rustudio`. Video playback is off, and native crashes don't
-  write a crash report (panics do).
-- **macOS:** data and settings live in `~/Library/Application Support/rustudio`,
-  caches in `~/Library/Caches/rustudio`. Shortcuts follow Studio for Mac.
-  Video playback needs `brew install libvpx opus`.
+## Credits and license
 
-## Signing in
-
-Everything above works signed out. To open your own places or private
-assets, use the account button at the top right and choose **Sign in with
-your browser**, or paste your `.ROBLOSECURITY` cookie. rustudio keeps the
-session in your system keyring (the Keychain on macOS). See
-[docs/AUTH.md](docs/AUTH.md).
-
-## Docs
-
-- [DEVELOPING.md](docs/DEVELOPING.md): workspace layout, command-line options and tests
-- [MECHANICS.md](docs/MECHANICS.md): every tuning number and where it comes from
-- [ENGINE-GAPS.md](docs/ENGINE-GAPS.md): engine API that's still missing
-- [TEAMCREATE.md](docs/TEAMCREATE.md): Team Create
-- [PROFILING.md](docs/PROFILING.md): profiler captures and the CLI that reads them
-- [MATERIALS.md](docs/MATERIALS.md): where material textures come from
-- [STUDIO-PANELS.md](docs/STUDIO-PANELS.md): panels and pop-out windows
-- [UI-PARITY.md](docs/UI-PARITY.md): how the UI was matched to Studio
-
-## Not affiliated with Roblox
-
-rustudio is an independent project. It is not made, endorsed or supported
-by Roblox Corporation. "Roblox" and "Roblox Studio" are trademarks of Roblox
-Corporation.
-
-This repository doesn't redistribute Roblox Studio or its content. Studio's
-built-in content is downloaded from Roblox's own CDN onto your machine on
-first launch.
-
-## License
-
-MIT OR Apache-2.0, at your option. Vendored crates in `vendor/` keep their
-own licences.
+The Android sources are based on Rustudio 0.5.1. See [upstream credits](rust/CREDITS.md), the [Android changelog](docs/android/CHANGELOG.md), and the [MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE) licenses.

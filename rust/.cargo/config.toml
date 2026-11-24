@@ -1,0 +1,9 @@
+# Android (arm64): the APK supports devices using 16 KiB memory pages.
+# Luau's native code generator calls __clear_cache on ARM64. Let Clang link
+# its compiler-rt builtins and reject any unresolved references at link time.
+[target.aarch64-linux-android]
+rustflags = [
+    "-C", "default-linker-libraries=yes",
+    "-C", "link-arg=-Wl,--no-undefined",
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+]

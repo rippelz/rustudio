@@ -1,0 +1,68 @@
+name: Android APK
+
+on:
+  push:
+    branches: [android, main]
+  pull_request:
+    branches: [android, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK packages
+        shell: pwsh
+        run: |
+          $tool = if ($IsWindows) { 'sdkmanager.bat' } else { 'sdkmanager' }
+          $manager = Get-Command $tool -ErrorAction SilentlyContinue
+          $sdkmanager = if ($manager) { $manager.Source } else {
+            Join-Path $env:ANDROID_HOME "cmdline-tools/latest/bin/$tool"
+          }
+          if (!(Test-Path -LiteralPath $sdkmanager -PathType Leaf)) {
+            throw "Android SDK manager not found at $sdkmanager"
+          }
+          (1..30 | ForEach-Object { 'y' }) | & $sdkmanager --licenses
+          if ($LASTEXITCODE -ne 0) { throw 'SDK license acceptance failed' }
+          & $sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;29.0.14206865'
+          if ($LASTEXITCODE -ne 0) { throw 'SDK package installation failed' }
+
+      - name: Install Rust tools
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-linux-android
+          rustup default stable
+          cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Build on Linux
+        if: runner.os == 'Linux'
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Build on Windows
+        if: runner.os == 'Windows'
+        run: .\gradlew.bat assembleDebug --no-daemon
+
+      - name: Upload ARM64 debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: RuStudioAPK-arm64-${{ runner.os }}
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          compression-level: 0

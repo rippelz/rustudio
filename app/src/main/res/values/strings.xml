@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">RuStudio</string>
+    <string name="storage_hint">RuStudio needs \"All files access\" to open and save places in your storage (folder RuStudio).</string>
+    <string name="diagnostic_logs">Share RuStudio logs</string>
+    <string name="diagnostic_logs_empty">No saved diagnostic logs found.</string>
+    <string name="diagnostic_logs_error">Could not share diagnostic logs.</string>
+</resources>

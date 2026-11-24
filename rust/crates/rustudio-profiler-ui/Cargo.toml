@@ -1,0 +1,22 @@
+[package]
+name = "rustudio-profiler-ui"
+description = "The profiler window for rustudio (editor and player): frame strip, timeline, tree, counters, GPU and Scripts tabs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustudio-core = { path = "../rustudio-core" }
+rustudio-engine = { path = "../rustudio-engine" }
+egui = "0.36"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+log = "0.4"
+pollster = "0.4"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.15"
+
+[dev-dependencies]
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
