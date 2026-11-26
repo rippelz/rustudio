@@ -5714,3 +5714,50 @@ mod respawn_gui_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod autoplay_sound_tests {
+    use crate::game::Game;
+    use rbx_dom_weak::types::{ContentId, Variant};
+    use rbx_dom_weak::InstanceBuilder;
+    use rustudio_engine::runtime::{RunMode, Side};
+
+    /// A Sound saved with Playing = true starts when Play begins, on both
+    /// sides. Start_autoplay_sounds used to run with the client's DataModel
+    /// in front (start_play switches to it first), treat its client refs as
+    /// the server's, and set neither side's IsPlaying.
+    #[test]
+    fn saved_playing_sound_autoplays_on_both_sides() {
+        let mut game = Game::new(None);
+        let ws = game.doc.workspace().unwrap();
+        let speaker = game
+            .doc
+            .dom
+            .insert(ws, InstanceBuilder::new("Part").with_name("Speaker"));
+        game.doc.dom.insert(
+            speaker,
+            InstanceBuilder::new("Sound")
+                .with_name("Theme")
+                .with_property("Playing", Variant::Bool(true))
+                .with_property("SoundId", ContentId::from("rbxasset://sounds/autoplay-probe.wav")),
+        );
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        let ctx = egui::Context::default();
+        for _ in 0..10 {
+            game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+        }
+        for side in [Side::Server, Side::Client] {
+            assert_eq!(
+                game.run_luau(
+                    side,
+                    r#"local s = workspace.Speaker.Theme
+                    assert(s.Playing == true, "Sound.Playing is not true")
+                    assert(s.IsPlaying == true, "Sound.IsPlaying is not true")"#,
+                ),
+                None,
+                "{side:?}"
+            );
+        }
+    }
+}
