@@ -7,6 +7,7 @@
 //! move the editor's settings (as in Studio, where they don't change
 //! StudioService.GridSize either). Collaborator answers what Team Create
 //! replicated. LiveSyncService: nothing is ever file-synced in rustudio.
+//! StudioDeviceSimulatorService: no device is ever emulated in rustudio.
 //! Studio.LocalAssetsFolder can't be read (QDir), as in Studio.
 
 use std::sync::RwLock;
@@ -252,6 +253,15 @@ pub fn call(
         })(),
         // The signed-in user's id (0 signed out), as plugin:GetStudioUserId.
         "GetUserId" if class == "StudioService" => ret1(Value::Number(crate::runtime::domains::plugin_api::user_id() as f64)),
+        // The emulated device's id. Studio's macOS x86_64 binary (symbols):
+        // getDeviceAsync (0x1079dcc74) runs StudioDeviceEmulator::
+        // yieldCurrentDeviceId (0x10182124a), which yields the current
+        // device's id QString (emulator+400) as UTF-8; initializeEmulationMode
+        // (0x10181b2a0) treats id == DefaultEmulationDeviceId as "not
+        // emulating", and that static is QString::fromAscii("default", 7)
+        // (__GLOBAL__sub_I_StudioDeviceEmulator.cpp, 0x10182a2f7). rustudio
+        // never emulates a device, so "default".
+        "GetDeviceAsync" if class == "StudioDeviceSimulatorService" => lstr(lua, "default").and_then(ret1),
         // The widget's close callback (called when the widget closes; no
         // plugin widget ever closes in rustudio's play session).
         "BindToClose" if rustudio_core::doc::is_a(class, "PluginGui") => (|| {
@@ -265,4 +275,35 @@ pub fn call(
         _ => return None,
     };
     Some(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::{security, RunMode, Runtime, World};
+    use rbx_dom_weak::InstanceBuilder;
+    use rustudio_core::doc::Document;
+    use rustudio_core::log::Level;
+
+    /// A plugin's StudioDeviceSimulatorService:GetDeviceAsync() with no
+    /// device emulated answers Studio's DefaultEmulationDeviceId.
+    #[test]
+    fn device_simulator_get_device_is_default() {
+        let mut d = Document::new_place();
+        let parent = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        let s = d.dom.insert(
+            parent,
+            InstanceBuilder::new("Script").with_name("T").with_property(
+                "Source",
+                r#"print("DEVICE", game:GetService("StudioDeviceSimulatorService"):GetDeviceAsync())"#.to_string(),
+            ),
+        );
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.run_script_as(s, security::PLUGIN_IDENT);
+        let out = rt.leave().output;
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        let got = out.iter().find_map(|(_, m)| m.strip_prefix("DEVICE ").map(|r| r.split("  —  ").next().unwrap_or(r).trim().to_string()));
+        assert_eq!(got.as_deref(), Some("default"), "{out:?}");
+    }
 }

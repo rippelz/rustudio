@@ -2268,7 +2268,18 @@ fn parent_write(lua: &Lua, r: Ref, key: &str, atom: i32, p: Ref) -> Option<mlua:
     if same {
         return Some(Ok(true));
     }
-    Some(set_parent(lua, r, p).map(|_| false))
+    Some(script_set_parent(lua, r, p).map(|_| false))
+}
+
+/// A script's `inst.Parent = p`. A client script moving a Tool into or out
+/// of a character equips or unequips it (ext::script_tool_move).
+fn script_set_parent(lua: &Lua, r: Ref, p: Ref) -> mlua::Result<()> {
+    let equip = ext::script_tool_move(lua, r, p)?;
+    set_parent(lua, r, p)?;
+    if let Some(request) = equip {
+        world(lua)?.requests.equip.push(request);
+    }
+    Ok(())
 }
 
 /// Numeric Light.Brightness assignments use the usual property store and
@@ -3963,7 +3974,7 @@ fn newindex_routed(
                     ))
                 })?,
             };
-            return set_parent(lua, r, p);
+            return script_set_parent(lua, r, p);
         }
         "ClassName" => {
             return Err(rt_err(
@@ -10529,7 +10540,7 @@ mod weld_offset_tests {
             ],
             accessories: Vec::new(),
             body_parts: Vec::new(),
-            head: None,
+            head: Vec::new(),
             animations: Vec::new(),
             emotes: Vec::new(),
             skipped: Vec::new(),

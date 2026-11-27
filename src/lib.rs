@@ -1217,7 +1217,8 @@ pub fn run() -> eframe::Result<()> {
         let px = [size[0].round() as u32, size[1].round() as u32];
         let code = offscreen::run(
             wgpu_options,
-            offscreen::Options { size: px, render: !no_render, paced: !bench_mode },
+            // (RUSTUDIO_HEADLESS_HZ paces a bench too: frame work at a display's rate)
+            offscreen::Options { size: px, render: !no_render, paced: !bench_mode || std::env::var_os("RUSTUDIO_HEADLESS_HZ").is_some() },
             move |ctx, rs| app::RustudioApp::new_in(ctx, rs, None, open, harness, demo),
             app::RustudioApp::frame,
         );

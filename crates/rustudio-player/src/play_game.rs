@@ -2733,6 +2733,59 @@ mod tool_tests {
         assert_eq!(tool_handle(&d, tool), Some(handle));
         assert_eq!(tool_handle(&d, Ref::new()), None);
     }
+
+    /// Roblox's Backpack CoreScript (what RUSTUDIO_CORE_SCRIPTS=1 runs)
+    /// equips a hotbar slot with `tool.Parent = Character` from the client.
+    /// In local Play that is the character's equip: Equipped fires on both
+    /// sides and the server's tool is in the character. (The tool only moved
+    /// on the client, and its Equipped / Activated never fired.)
+    #[test]
+    fn a_client_moving_a_tool_into_its_character_equips_it() {
+        use crate::game::Game;
+        use rustudio_engine::runtime::{RunMode, Side};
+        let mut game = Game::new(None);
+        let pack = game.doc.find_child(game.doc.dom.root_ref(), "StarterPack").unwrap();
+        let tool = game.doc.dom.insert(pack, InstanceBuilder::new("Tool").with_name("Gear"));
+        game.doc.dom.insert(tool, InstanceBuilder::new("Part").with_name("Handle"));
+        game.start_play(RunMode::Play, &mut (), false, None);
+        let ctx = egui::Context::default();
+        let tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        tick(&mut game, 120);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                assert(plr.Character, "no character")
+                local t = plr.Backpack:FindFirstChild("Gear")
+                assert(t, "no Gear in the server's Backpack")
+                t.Equipped:Connect(function() _G.equipped = true end)
+            "#),
+            None
+        );
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local plr = game:GetService("Players").LocalPlayer
+                local t = plr.Backpack:FindFirstChild("Gear")
+                assert(t, "no Gear in the client's Backpack")
+                t.Equipped:Connect(function() _G.equipped = true end)
+                t.Parent = plr.Character
+            "#),
+            None
+        );
+        tick(&mut game, 30);
+        assert_eq!(game.run_luau(Side::Client, "assert(_G.equipped, 'no Equipped on the client')"), None);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                assert(_G.equipped, "no Equipped on the server")
+                assert(plr.Character:FindFirstChild("Gear"), "the server's tool isn't in the character")
+            "#),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

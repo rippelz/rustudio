@@ -373,6 +373,7 @@ pub const THROTTLED_MAX_PHYSICS_STEPS: usize = 4;
 pub const PHYSICS_CARRY_MAX_STEPS: f32 = 3.99999;
 pub const PHYSICS_LENGTH_UNIT: f32 = 5.0; // rapier length scale in studs (sleep thresholds, contact tolerances) (estimated)
 pub const MAX_FRAME_DT: f32 = 1.0 / 15.0; // Play's game step per frame at most (Studio 0.746: PreAnimation dt and DistributedGameTime stop at 0.0667 s however long the frame; waits keep wall time)
+pub const PLAY_STEP_WAIT_MS: f32 = 1000.0 / 15.0; // each display frame waits at most this long for the gameplay step in flight before it shows the last frame again: a Roblox frame draws the state its own DataModel step left (Studio 0.746 `SurfaceController::RenderJob::stepDataModelJob` 0x1013f2bc4 fires renderStep under the DataModel's write lock and hands that state to the render thread); the bound is one MAX_FRAME_DT (estimated: a step this slow is a hitch either way)
 pub const SCRIPT_FRAME_BUDGET_MS: f64 = 6.0; // per side: waiting scripts past this resume next frame (estimated)
 pub const BENCH_TURN_DEG_PER_S: f32 = 36.0; // edit-mode benchmark camera turn rate
 pub const BODY_MOVER_P_SCALE: f32 = 1.0; // legacy BodyMover P/D read as force (torque) per stud (radian) and per stud/s (rad/s) (estimated)

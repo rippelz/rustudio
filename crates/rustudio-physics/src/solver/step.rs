@@ -6,7 +6,7 @@ use rapier3d::prelude as rp;
 use rbx_dom_weak::types::Ref;
 use rustc_hash::FxHashMap;
 
-use super::body::{flag, BodySet, NONE};
+use super::body::{flag, BodySet, SolveSpan, NONE};
 use super::contact::{self, ContactStore};
 use super::dual::{self, BodyRec, ConnSrc, DualBatch, LevelCfg, MassRec};
 use super::island::Islands;
@@ -445,6 +445,37 @@ impl StudioSolver {
         (sp.written_pos == pos && sp.written_rot == rot).then(|| super::body::m3::to_glam(&sp.r))
     }
 
+    /// Where a body between two solves of its level is drawn: Roblox's
+    /// `World::interpolateAfterPhysics` (0x10030a31c, after a frame's last world
+    /// step) gives every adaptive assembly `Body::interpolatePvOnBody` →
+    /// `SolverRigidBody::interpolateWithTimestepId` (0x1073633b6): a level-L
+    /// body solved over L ticks shows the PV k/L of the way from where that
+    /// solve began to where it ended, k = the world ticks since it began
+    /// (timestepId mod L), linearly (`applyLinearInterpolation`;
+    /// DFFlagSimAdaptiveUseLinearInterpolation2 = true in Roblox's published
+    /// PCDesktopClient settings), and the solve's end
+    /// once k reaches L. Draw-only: the world steps on from the solve's end.
+    /// None: show the body as it is (level 1, a solve's end, or a body moved
+    /// since its solve — a teleport or a CFrame write is not blended).
+    pub fn shown_pose(&self, b: rp::RigidBodyHandle, pos: Vec3, rot: glam::Quat) -> Option<(Vec3, glam::Quat)> {
+        let (i, g) = b.into_raw_parts();
+        let p = self.bodies.persist.get(i as usize)?;
+        if !p.live || p.generation != g {
+            return None;
+        }
+        let span = p.span?;
+        let k = self.ticks.checked_sub(span.tick)?;
+        if k == 0 || k >= u64::from(span.level) {
+            return None;
+        }
+        let moved = (pos - span.to_pos).abs().max_element() > 1e-5 || rot.dot(span.to_rot).abs() < 1.0 - 1e-6;
+        if moved {
+            return None;
+        }
+        let u = k as f32 / f32::from(span.level);
+        Some((span.from_pos.lerp(span.to_pos, u), span.from_rot.slerp(span.to_rot, u).normalize()))
+    }
+
     /// Touching pairs narrow.rs made alone (Stats.ContactsCount adds them to rapier's).
     pub fn external_touching(&self) -> usize {
         self.contacts.external_touching()
@@ -690,6 +721,18 @@ impl StudioSolver {
             rows += w.rows;
             for o in w.out.drain(..) {
                 let s = o.slot as usize;
+                let mut persist = o.persist;
+                // A level-2+ solve on a world tick (not an environment catch-up
+                // tick, which runs behind the world): where it began, for
+                // `shown_pose`. Any other solve ends the last one's span.
+                persist.span = (o.dirty && o.level > 1 && self.env_phase.is_none()).then(|| SolveSpan {
+                    from_pos: self.bodies.pos[s],
+                    from_rot: self.bodies.rot[s],
+                    to_pos: o.pos,
+                    to_rot: o.rot,
+                    level: o.level,
+                    tick: self.ticks.saturating_sub(1),
+                });
                 if o.dirty {
                     self.bodies.linvel[s] = o.v;
                     self.bodies.angvel[s] = o.w;
@@ -700,7 +743,7 @@ impl StudioSolver {
                     self.bodies.flags[s] |= flag::DIRTY | flag::STUDIO_POSE;
                 }
                 let idx = self.bodies.handle[s].into_raw_parts().0 as usize;
-                self.bodies.persist[idx] = o.persist;
+                self.bodies.persist[idx] = persist;
             }
             for (c, kept) in w.kept.drain(..) {
                 self.contacts.conn_mut(c as usize).kept = kept;
@@ -832,6 +875,8 @@ struct BodyOut {
     /// Studio's R after the solve (STEP §4.2 [L2]).
     mat: Mat3,
     pos: Vec3,
+    /// The island level it was solved at (ticks the solve spans).
+    level: u8,
     persist: super::body::Persist,
 }
 
@@ -1002,7 +1047,7 @@ fn solve_island(w: &mut Worker, sh: &Shared, i: usize, h: f32, gravity: Vec3, ph
             let dw = (rec.wf + Vec3::new(u[2], u[6], u[10])) - rec.w0;
             p.sleep.asleep_solve(dv, dw, phase, sh.cfg.max_level);
             let b = sh.bodies;
-            w.out.push(BodyOut { slot: s as u32, dirty: false, v: b.linvel[s], w: b.angvel[s], com: b.com[s], rot: b.rot[s], mat: b.mat[s], pos: b.pos[s], persist: p });
+            w.out.push(BodyOut { slot: s as u32, dirty: false, v: b.linvel[s], w: b.angvel[s], com: b.com[s], rot: b.rot[s], mat: b.mat[s], pos: b.pos[s], level, persist: p });
             continue;
         }
         let mut o = integrate(sh.bodies, s, &rec, &u, &cfg, sh.cfg, &mut p);
@@ -1270,6 +1315,7 @@ fn integrate(bodies: &BodySet, s: usize, rec: &BodyRec, u: &[f32; 12], cfg: &Lev
         rot: rot_q,
         mat: rm,
         pos,
+        level: cfg.level,
         persist: *p,
     };
     // Studio: b = max(b − b, 0).

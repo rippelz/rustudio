@@ -117,6 +117,39 @@ mod tests {
         game.stop_play(&mut ());
     }
 
+    /// A gameplay step longer than a display frame (a server script busy for
+    /// 8 ms each Heartbeat, past a 144 Hz refresh) is waited for: every
+    /// display shows a new state, none the last one again.
+    #[test]
+    fn display_waits_for_a_step_longer_than_its_frame() {
+        let mut game = Game::new(None);
+        let sss = game.doc.find_child(game.doc.dom.root_ref(), "ServerScriptService").unwrap();
+        game.doc.dom.insert(
+            sss,
+            rbx_dom_weak::InstanceBuilder::new("Script").with_name("Slow").with_property(
+                "Source",
+                r#"game:GetService("RunService").Heartbeat:Connect(function()
+                    local t = os.clock()
+                    while os.clock() - t < 0.008 do end
+                end)"#
+                    .to_string(),
+            ),
+        );
+        game.start_play_threaded(RunMode::Run, &mut (), false, None);
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            game.play_tick(&ctx, 1.0 / 144.0, &mut (), true, false);
+        }
+        let mut shown = game.play.as_ref().unwrap().time;
+        for frame in 0..12 {
+            game.play_tick(&ctx, 1.0 / 144.0, &mut (), true, false);
+            let now = game.play.as_ref().unwrap().time;
+            assert!(now > shown, "display {frame} showed the last state again ({now} after {shown})");
+            shown = now;
+        }
+        game.stop_play(&mut ());
+    }
+
     #[test]
     fn datamodel_shutdown_returns_to_the_edit_document() {
         use rustudio_engine::runtime::security;
@@ -894,8 +927,20 @@ impl Game {
         let textbox_edit = self.play.as_ref().is_some_and(|play| {
             play.game.gui_events.iter().any(|event| matches!(event, GuiEvent::TextBoxUpdate { .. }))
         });
-        // A fixed-step replay also joins every preceding step.
-        match threaded.receive(self, host, textbox_edit || self.fixed_dt.is_some()) {
+        // A fixed-step replay also joins every preceding step. Otherwise the
+        // display waits for the step in flight, as a Roblox frame draws what
+        // its DataModel step left: Studio 0.746's
+        // `SurfaceController::RenderJob::stepDataModelJob` (0x1013f2bc4) is
+        // itself a DataModel job that, holding the DataModel's write lock,
+        // fires renderStep and hands what it reads to the render thread
+        // (that no Roblox frame presents a state twice is an inference from
+        // that). Polling showed the last state again whenever a step ran past
+        // a refresh (a 144 Hz display's 6.9 ms), and the deferred step then
+        // simulated two frames at once, which made the next step slower
+        // still. A step past the budget shows the last frame.
+        let budget = std::time::Duration::from_secs_f32(rustudio_core::mech::PLAY_STEP_WAIT_MS / 1000.0);
+        let join = if textbox_edit || self.fixed_dt.is_some() { Join::Block } else { Join::Upto(budget) };
+        match threaded.receive(self, host, join) {
             Receive::Available => {}
             Receive::Pending => {
                 threaded.deferred_dt = (threaded.deferred_dt + dt).min(rustudio_core::mech::MAX_FRAME_DT);
@@ -929,7 +974,7 @@ impl Game {
                 // InputBegan was delivered while the last viewport drew.
                 // Give the following RenderStepped's pose and camera the
                 // next presentation slot instead of queueing it one deeper.
-                if !wait_for_publication || matches!(threaded.receive(self, host, true), Receive::Available) {
+                if !wait_for_publication || matches!(threaded.receive(self, host, Join::Block), Receive::Available) {
                     self.play_thread = Some(threaded);
                 }
             }
@@ -974,6 +1019,13 @@ impl Game {
     }
 }
 
+/// How long `ThreadedPlay::receive` waits for the step in flight.
+#[derive(Clone, Copy)]
+enum Join {
+    Block,
+    Upto(std::time::Duration),
+}
+
 enum Receive {
     Available,
     Pending,
@@ -990,18 +1042,21 @@ impl ThreadedPlay {
         }
     }
 
-    fn receive(&mut self, main: &mut Game, host: &mut dyn GameHost, wait: bool) -> Receive {
+    fn receive(&mut self, main: &mut Game, host: &mut dyn GameHost, wait: Join) -> Receive {
         if let Some(pending) = self.pending.as_ref() {
-            let result = if wait {
-                let _join = rustudio_core::bench::scope("gameplay_publish_wait");
-                pending.recv().ok()
-            } else {
-                match pending.try_recv() {
+            let _join = rustudio_core::bench::scope("gameplay_publish_wait");
+            let result = match wait {
+                Join::Block => pending.recv().ok(),
+                Join::Upto(budget) => match pending.recv_timeout(budget) {
                     Ok(frame) => Some(frame),
-                    Err(mpsc::TryRecvError::Empty) => return Receive::Pending,
-                    Err(mpsc::TryRecvError::Disconnected) => None,
-                }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        rustudio_core::bench::add("gameplay_wait_timeouts", 0.0, 1);
+                        return Receive::Pending;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => None,
+                },
             };
+            drop(_join);
             self.pending = None;
             let Some((frame, source)) = result else {
                 main.error("Play worker stopped before publishing its frame");
@@ -1020,7 +1075,7 @@ impl Game {
     pub(super) fn show_worker_side(&mut self, side: Side, host: &mut dyn GameHost) {
         let Some(mut threaded) = self.play_thread.take() else { return };
         threaded.queue_edits(EditorEdits::take(self));
-        if !matches!(threaded.receive(self, host, true), Receive::Available) {
+        if !matches!(threaded.receive(self, host, Join::Block), Receive::Available) {
             return;
         }
         let edits = threaded.queued_edits.take().expect("edits scanned before side change");
@@ -1036,7 +1091,7 @@ impl Game {
             return;
         };
         threaded.pending = Some(reply);
-        if matches!(threaded.receive(self, host, true), Receive::Available) {
+        if matches!(threaded.receive(self, host, Join::Block), Receive::Available) {
             self.play_thread = Some(threaded);
         }
     }

@@ -883,7 +883,19 @@ impl Game {
                 *x = *h;
             }
         }
+        let rig_key = rig::joints_key(&self.doc, model);
         let Some(s) = self.play.as_mut() else { return };
+        // A joint that holds its parts now and didn't when the rig was read,
+        // or one whose parts or frames changed (a script rescaling the body,
+        // replacing a joint, or an AnimationConstraint's attachment arriving
+        // after the character was taken): the rig is read again, or the limb
+        // past it keeps whatever offset it had and never animates. (A dead
+        // character's joints are broken and its parts fall loose:
+        // `kill_character`.)
+        if let Some(ch) = s.character.as_mut().filter(|c| !c.dead && c.rig_key != rig_key) {
+            ch.rig_key = rig_key;
+            ch.rig = Rig::read(&self.doc, model);
+        }
         // Claim late descendants before the physics sync. Otherwise the
         // character body can collide with a duplicate in the loose world.
         let late: Vec<Ref> = parts.iter().map(|(r, _)| *r).filter(|r| !s.physics.skip.contains(r)).collect();
@@ -971,7 +983,8 @@ impl Game {
         if let Some(c) = s.physics.humanoid_ctl(model) {
             ch.dynamic.hum = c.hum.clone();
         }
-        let Some((mut root_xf, v, _w)) = s.physics.humanoid_root(model) else { return };
+        // (As drawn: between two level-2 solves, part-way along the last one.)
+        let Some((mut root_xf, v, _w)) = s.physics.humanoid_root_shown(model) else { return };
         // A script moved the root while the world stepped (a server Script or
         // LocalScript resumed between stepHumanoid and the publish, the
         // harness's --luau): its CFrame wins and the body goes there instead of
@@ -1408,6 +1421,58 @@ mod script_moves_player_character_tests {
             }
         }
         assert!(client_since.is_some(), "the client never had the server's CFrame");
+    }
+
+    /// A server script that moves a joint of the player's R15 character
+    /// (its shoulder frame, as a rescale or a script raising the arm does)
+    /// re-poses the limb past it on both sides: Part1 sits at
+    /// Part0 · frame0 · Transform · frame1⁻¹. The rig was read once, when
+    /// the character was taken, and kept posing the arm from the old frame
+    /// (1 stud off).
+    #[test]
+    fn a_joint_a_script_moves_poses_its_limb() {
+        let mut game = Game::new(None);
+        game.play_rig = Some(rustudio_engine::rig::RigType::R15);
+        game.start_play(RunMode::Play, &mut (), false, None);
+        let ctx = egui::Context::default();
+        tick(&mut game, &ctx, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 120);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local ch = game:GetService("Players"):GetPlayers()[1].Character
+                local j = ch:FindFirstChild("RightShoulder", true)
+                assert(j, "no RightShoulder")
+                if j:IsA("Motor6D") then
+                    j.C0 = j.C0 + Vector3.new(0, 1, 0)
+                else
+                    j.Attachment0.CFrame = j.Attachment0.CFrame + Vector3.new(0, 1, 0)
+                end
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 30);
+        let check = r#"
+            local ch = game:GetService("Players"):GetPlayers()[1].Character
+            local j = ch:FindFirstChild("RightShoulder", true)
+            local p0, p1, f0, f1
+            if j:IsA("Motor6D") then
+                p0, p1, f0, f1 = j.Part0, j.Part1, j.C0, j.C1
+            else
+                p0, p1, f0, f1 = j.Attachment0.Parent, j.Attachment1.Parent, j.Attachment0.CFrame, j.Attachment1.CFrame
+            end
+            local want = p0.CFrame * f0 * j.Transform * f1:Inverse()
+            local off = (want.Position - p1.Position).Magnitude
+            assert(off < 0.15, string.format("RightUpperArm %.3f studs off its moved shoulder", off))
+        "#;
+        assert_eq!(game.run_luau(Side::Server, check), None, "server");
+        assert_eq!(game.run_luau(Side::Client, &check.replace(r#"game:GetService("Players"):GetPlayers()[1]"#, "game.Players.LocalPlayer")), None, "client");
     }
 
     /// A player-owned R6 character whose legs exist only on its client

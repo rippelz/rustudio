@@ -276,7 +276,7 @@ fn character_clothing(
             }
             Some("ShirtGraphic") => {
                 graphic = content_string(doc.prop(*c, "Graphic"))
-                    .or_else(|| content_string(doc.prop(*c, "GraphicContent")))
+                    .or_else(|| content_string(doc.prop(*c, "TextureContent")))
             }
             _ => {}
         }

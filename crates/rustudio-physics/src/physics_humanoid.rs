@@ -1262,6 +1262,20 @@ impl Physics {
         }
     }
 
+    /// `humanoid_root` as it is drawn and published: between two solves of
+    /// the assembly's level, the pose that far along its last solve (Roblox's
+    /// interpolateAfterPhysics; solver `shown_pose`). The body steps on from
+    /// `humanoid_root`.
+    pub fn humanoid_root_shown(&self, model: Ref) -> Option<(Xform, Vec3, Vec3)> {
+        let (xf, v, w) = self.humanoid_root(model)?;
+        let body = self.hums.by_model.get(&model)?.body;
+        let rot = glam::Quat::from_mat3(&xf.rot).normalize();
+        match self.studio.as_ref().and_then(|sv| sv.shown_pose(body, xf.pos, rot)) {
+            Some((pos, rot)) => Some((Xform { pos, rot: glam::Mat3::from_quat(rot) }, v, w)),
+            None => Some((xf, v, w)),
+        }
+    }
+
     /// After a world tick: the contact points that pushed on each character
     /// and may bounce. Studio's live solver (the primal one: its contact rows
     /// are Studio, vtable slot 11) gives a row its restitution term only

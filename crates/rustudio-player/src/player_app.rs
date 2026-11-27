@@ -488,7 +488,8 @@ pub fn run() -> eframe::Result<()> {
     if headless {
         let code = offscreen::run(
             wgpu_options,
-            offscreen::Options { size: [width, height], render: !no_render, paced: !bench_mode },
+            // (RUSTUDIO_HEADLESS_HZ paces a bench too: frame work at a display's rate)
+            offscreen::Options { size: [width, height], render: !no_render, paced: !bench_mode || std::env::var_os("RUSTUDIO_HEADLESS_HZ").is_some() },
             move |ctx, rs| PlayerApp::new(ctx, rs, None, open, run, demo),
             PlayerApp::frame,
         );

@@ -31,8 +31,8 @@
 //! - Studio-side services and plugin objects (testing_studio.rs):
 //!   StudioService / DraggerService / Plugin read rustudio's editor settings
 //!   (snapping, local space), as Studio's read its toolbar; Collaborator,
-//!   LiveSyncService, PluginAction, PluginDragEvent, PluginGui,
-//!   DockWidgetPluginGui, Studio.
+//!   LiveSyncService, StudioDeviceSimulatorService, PluginAction,
+//!   PluginDragEvent, PluginGui, DockWidgetPluginGui, Studio.
 //! - RenderingTest: RenderdocTriggerCapture prints Studio's "RenderDoc
 //!   support is disabled."; the test run's rendering phase fails each test
 //!   as Studio does with no image service (TestFramesCountdownAboutToStart
@@ -154,6 +154,7 @@ pub const METHODS: &[(&str, &str)] = &[
     // Studio side
     ("GetSyncState", "LiveSyncService"),
     ("GetUserId", "StudioService"),
+    ("GetDeviceAsync", "StudioDeviceSimulatorService"),
     ("BindToClose", "PluginGui"),
 ];
 
@@ -180,6 +181,7 @@ const CLASSES: &[&str] = &[
     "RenderingTest", "ScriptDebugger", "DebuggerManager", "DebuggerBreakpoint", "DebuggerWatch",
     "StudioService", "DraggerService", "Collaborator", "LiveSyncService", "Studio", "Plugin",
     "PluginAction", "PluginDragEvent", "PluginGui", "DockWidgetPluginGui", "QWidgetPluginGui",
+    "StudioDeviceSimulatorService",
 ];
 
 fn mine(class: &str) -> bool {

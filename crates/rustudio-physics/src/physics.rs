@@ -3700,19 +3700,25 @@ impl Physics {
                 continue;
             }
             let body_pose = *b.position();
+            let body_rot = Quat::from_xyzw(body_pose.rotation.x, body_pose.rotation.y, body_pose.rotation.z, body_pose.rotation.w);
+            // Between two solves of its level the assembly shows the pose that
+            // far along its last solve (Roblox's interpolateAfterPhysics,
+            // solver `shown_pose`); the world steps on from the body's own.
+            let shown = self.studio.as_ref().and_then(|sv| sv.shown_pose(a.body, gv(body_pose.translation), body_rot));
             // Studio solver with the kept matrix: the part CFrame is the body's own R
             // (Studio copies it), not rapier's quaternion.
-            let kept = self.studio.as_ref().and_then(|sv| {
-                sv.body_matrix(a.body, gv(body_pose.translation), Quat::from_xyzw(body_pose.rotation.x, body_pose.rotation.y, body_pose.rotation.z, body_pose.rotation.w))
-            });
+            let kept = match shown {
+                Some((pos, rot)) => Some((Mat3::from_quat(rot), pos)),
+                None => self.studio.as_ref().and_then(|sv| sv.body_matrix(a.body, gv(body_pose.translation), body_rot)).map(|m| (m, gv(body_pose.translation))),
+            };
             for r in &a.parts {
                 let Some(pb) = self.parts.get(r) else {
                     continue;
                 };
                 let xf = match kept {
-                    Some(m) => {
+                    Some((m, origin)) => {
                         let lr = Mat3::from_quat(Quat::from_xyzw(pb.local.rotation.x, pb.local.rotation.y, pb.local.rotation.z, pb.local.rotation.w));
-                        Xform { pos: m * gv(pb.local.translation) + gv(body_pose.translation), rot: if pb.local.rotation == rp::Rotation::IDENTITY { m } else { m * lr } }
+                        Xform { pos: m * gv(pb.local.translation) + origin, rot: if pb.local.rotation == rp::Rotation::IDENTITY { m } else { m * lr } }
                     }
                     None => xform(&(body_pose * pb.local)),
                 };
@@ -5600,6 +5606,45 @@ mod tests {
                 assert_eq!(solver.next_solve(body), (1, true));
             }
         }
+    }
+
+    /// A body the timestep arbiter solves every 2nd or 4th tick, moving at a
+    /// constant velocity, is drawn on a 144 Hz frame cadence (1.67 ticks a
+    /// frame) where the world's ticks put it, not where its last solve ended
+    /// (Roblox's `World::interpolateAfterPhysics`): evenly spaced in time.
+    #[test]
+    fn adaptive_body_is_drawn_between_its_solves() {
+        let (mut doc, mut physics) = hum_world(vec![part("Block", Vec3::Y * 100.0, false)]);
+        if physics.studio.is_none() {
+            return;
+        }
+        let ws = doc.workspace().unwrap();
+        doc.set_prop_live(ws, ustr("Gravity"), Variant::Float32(0.0));
+        let block = doc.find_named(ws, "Block").unwrap();
+        let body = physics.body_of(block).unwrap();
+        let v = Vec3::new(8.0, 0.0, 0.0);
+        physics.set_velocity(block, v);
+        let h = 1.0 / step_rate().0;
+        let x = |doc: &Document| match doc.prop(block, "CFrame") {
+            Some(Variant::CFrame(cf)) => cf.position.x,
+            _ => panic!("no CFrame"),
+        };
+        // (half a second for the velocity to take and the arbiter to settle
+        // the level: a rise moves the body a tick ahead once)
+        for _ in 0..72 {
+            physics.step(&mut doc, 1.0 / 144.0);
+        }
+        let (x0, ticks0) = (x(&doc), physics.steps);
+        let mut between = 0;
+        for frame in 0..288 {
+            physics.step(&mut doc, 1.0 / 144.0);
+            let level = physics.studio.as_ref().unwrap().next_solve(body).0;
+            let ticks = physics.steps - ticks0;
+            between += usize::from(level > 1 && ticks % u64::from(level) != 0);
+            let want = x0 + v.x * h * ticks as f32;
+            assert!((x(&doc) - want).abs() < 2e-3, "frame {frame}: drawn at {} for tick {ticks} ({want}), level {level}", x(&doc));
+        }
+        assert!(between > 50, "the body was between two solves of a level above 1 on {between} frames");
     }
 
     /// A world with one big floor part (top at y = 0) and what else is given.

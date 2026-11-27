@@ -1431,6 +1431,10 @@ impl Editor {
                         for r in live.model.take_resolved() {
                             live_marks.push(rustudio_core::doc::Mark::Prop(r, rbx_dom_weak::ustr("SolidMeshHolder")));
                         }
+                        // References sent before the instances they name, filled in now.
+                        for (r, name) in live.model.take_resolved_refs() {
+                            live_marks.push(rustudio_core::doc::Mark::Prop(r, name));
+                        }
                         // The time of day as the server sends it (2026-11-05: rustudio
                         // joined Place B at ~02:xx while the place saves 14:00).
                         if let Some((id, Some(prop))) = &touched {

@@ -995,6 +995,14 @@
    "estimated": true
   },
   {
+   "name": "display waits for the gameplay step",
+   "group": "performance",
+   "value": 66.7,
+   "unit": "ms",
+   "source": "Studio 0.746 SurfaceController::RenderJob::stepDataModelJob (0x1013f2bc4): renderStep under the DataModel's write lock, its state handed to the render thread; the bound (one 1/15 s frame) is estimated",
+   "estimated": true
+  },
+  {
    "name": "max physics steps per frame",
    "group": "physics",
    "value": 3,

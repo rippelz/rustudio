@@ -2744,7 +2744,9 @@ pub fn content_twin(name: &str) -> Option<&'static str> {
         "TextureID" | "TextureId" | "Texture" => "TextureContent",
         "ShirtTemplate" => "ShirtTemplateContent",
         "PantsTemplate" => "PantsTemplateContent",
-        "Graphic" => "GraphicContent",
+        // ShirtGraphic has no GraphicContent: its twin is TextureContent
+        // (api-dump.json: Graphic ContentId, TextureContent Content).
+        "Graphic" => "TextureContent",
         "Image" => "ImageContent",
         "ColorMap" => "ColorMapContent",
         "NormalMap" => "NormalMapContent",
@@ -3083,6 +3085,24 @@ mod studio_defaults_tests {
         assert!(d.exists(btn));
         assert_eq!(d.dom.get_by_ref(btn).unwrap().parent(), sg1);
         assert_eq!(d.prop(btn, "Position"), Some(Variant::UDim2(pos1)));
+    }
+
+    #[test]
+    fn a_shirt_graphic_sent_as_texture_content_reads_as_its_graphic() {
+        let mut d = Document::empty();
+        let root = d.dom.root_ref();
+        let g = d.dom.insert(
+            root,
+            InstanceBuilder::new("ShirtGraphic").with_property(
+                "TextureContent",
+                rbx_dom_weak::types::Content::from_uri("rbxassetid://1523514".to_string()),
+            ),
+        );
+        assert_eq!(
+            d.prop(g, "Graphic"),
+            Some(Variant::ContentId(rbx_dom_weak::types::ContentId::from("rbxassetid://1523514".to_string())))
+        );
+        assert_eq!(content_legacy_names("TextureContent"), vec!["TextureID", "TextureId", "Texture", "Graphic"]);
     }
 }
 

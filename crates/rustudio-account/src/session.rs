@@ -10,7 +10,7 @@
 //! Debug and Display print `<redacted>`.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -278,32 +278,44 @@ pub fn account_forget(user_id: u64) {
 /// Next to the cookie file: the one-way key of the file's cookie once it has
 /// been imported, so a file left in place doesn't take the active slot back
 /// after a switch. A new value pasted into the file still wins.
-fn file_marker() -> PathBuf {
-    let mut p = cookie_file().into_os_string();
+fn file_marker(file: &Path) -> PathBuf {
+    let mut p = file.as_os_str().to_owned();
     p.push(".imported");
     PathBuf::from(p)
 }
 
-fn file_seen(c: &Cookie) -> bool {
-    std::fs::read_to_string(file_marker()).is_ok_and(|s| s.trim() == c.cache_key())
+fn file_seen(file: &Path, c: &Cookie) -> bool {
+    std::fs::read_to_string(file_marker(file)).is_ok_and(|s| s.trim() == c.cache_key())
 }
 
-fn mark_seen(c: &Cookie) {
-    let _ = std::fs::write(file_marker(), c.cache_key());
+fn mark_seen(file: &Path, c: &Cookie) {
+    let _ = std::fs::write(file_marker(file), c.cache_key());
 }
 
 /// Marks whatever the cookie file holds now as already imported (before a
 /// switch, so the file doesn't switch back).
 pub fn mark_file_seen() {
     if let Ok(Some(f)) = file_cookie() {
-        mark_seen(&f);
+        mark_seen(&cookie_file(), &f);
     }
 }
 
 /// The import file's cookie (only if it is not readable by others).
 pub fn file_cookie() -> Result<Option<Cookie>> {
-    let path = cookie_file();
-    let Ok(meta) = std::fs::metadata(&path) else {
+    read_cookie_file(&cookie_file())
+}
+
+/// A cookie file named for this run, never imported: a missing or empty
+/// file is an error, not a fall-back to the keyring's account.
+fn explicit_cookie(path: &Path) -> Result<Option<(Cookie, CookieSource)>> {
+    match read_cookie_file(path)? {
+        Some(c) => Ok(Some((c, CookieSource::File { imported: false }))),
+        None => Err(Error(format!("{} holds no Roblox session", path.display()))),
+    }
+}
+
+fn read_cookie_file(path: &Path) -> Result<Option<Cookie>> {
+    let Ok(meta) = std::fs::metadata(path) else {
         return Ok(None);
     };
     #[cfg(unix)]
@@ -327,21 +339,35 @@ pub fn file_cookie() -> Result<Option<Cookie>> {
 /// keyring). `allow_file` false skips the file (after an explicit sign-out).
 /// A cookie file that differs from the keyring copy wins once: it is the
 /// person pasting a fresh session after the old one expired.
+///
+/// A file named by `RUSTUDIO_COOKIE_FILE` is a choice for this one run: it
+/// is used as-is and never imported or marked seen. Imported, a second run
+/// with the same file lost to whatever the keyring held (the file was seen),
+/// and silently signed in as the keyring's account instead.
 pub fn load_cookie(allow_file: bool) -> Result<Option<(Cookie, CookieSource)>> {
+    load_cookie_from(allow_file, &cookie_file(), std::env::var_os("RUSTUDIO_COOKIE_FILE").is_some())
+}
+
+/// `load_cookie` with the cookie file at `file`, `explicit` when the run
+/// named it.
+fn load_cookie_from(allow_file: bool, file: &Path, explicit: bool) -> Result<Option<(Cookie, CookieSource)>> {
+    if explicit {
+        return explicit_cookie(file);
+    }
     let keyring = keyring_cookie();
     if !allow_file {
         return Ok(keyring.map(|c| (c, CookieSource::Keyring)));
     }
-    let file = match file_cookie() {
+    let from_file = match read_cookie_file(file) {
         Ok(f) => f,
         Err(e) if keyring.is_none() => return Err(e),
         Err(_) => None,
     };
-    match (keyring, file) {
-        (Some(k), Some(f)) if k.0 == f.0 || file_seen(&f) => Ok(Some((k, CookieSource::Keyring))),
+    match (keyring, from_file) {
+        (Some(k), Some(f)) if k.0 == f.0 || file_seen(file, &f) => Ok(Some((k, CookieSource::Keyring))),
         (_, Some(f)) => {
             let imported = keyring_store(&f).is_ok();
-            mark_seen(&f);
+            mark_seen(file, &f);
             Ok(Some((f, CookieSource::File { imported })))
         }
         (Some(k), None) => Ok(Some((k, CookieSource::Keyring))),
@@ -545,7 +571,7 @@ fn persist_rotation(new: &Cookie, old: &Cookie, user_id: u64) {
     }
     if let Ok(Some(f)) = file_cookie() {
         if f.0 == old.0 {
-            mark_seen(&f);
+            mark_seen(&cookie_file(), &f);
         }
     }
 }
@@ -1196,6 +1222,34 @@ mod tests {
         assert!(Cookie::new("").is_none());
         assert!(Cookie::new("   \n").is_none());
         assert!(Cookie::new(".ROBLOSECURITY=").is_none());
+    }
+
+    /// A run that names its cookie file (RUSTUDIO_COOKIE_FILE) signs in as
+    /// that file's account, every time, and leaves the keyring's session
+    /// alone. Imported, the file took over the keyring on its first run,
+    /// and once seen it lost to whatever the keyring held: a later run with
+    /// the same file signed in as another account.
+    #[test]
+    fn an_explicit_cookie_file_beats_the_keyring_and_is_not_imported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rustudio-explicit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("second-account");
+        std::fs::write(&path, "second-account-cookie\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let person = Cookie::new("first-account-cookie").unwrap();
+        keyring_store(&person).unwrap();
+        for run in 0..2 {
+            let (c, src) = load_cookie_from(true, &path, true).unwrap().unwrap();
+            assert_eq!(c.0, "second-account-cookie", "run {run}");
+            assert_eq!(src, CookieSource::File { imported: false });
+            assert_eq!(keyring_cookie().unwrap().0, person.0, "run {run}: the keyring keeps its session");
+        }
+        // A file seen by an earlier run (its import marker) still wins.
+        mark_seen(&path, &Cookie::new("second-account-cookie").unwrap());
+        assert_eq!(load_cookie_from(true, &path, true).unwrap().unwrap().0 .0, "second-account-cookie");
+        assert!(load_cookie_from(true, &dir.join("missing"), true).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn legacy_put(attrs: &[&str], v: &str) {

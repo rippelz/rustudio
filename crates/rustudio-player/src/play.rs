@@ -54,6 +54,9 @@ pub struct Character {
     pub floor_material: u32,
     pub humanoid: Ref,
     pub rig: Rig,
+    /// `rig::joints_key` when `rig` was read: a new key reads it again
+    /// (play_humanoid.rs `ensure_hum_body`).
+    pub rig_key: u64,
     pub rig_type: RigType,
     pub body: CharBody,
     /// HumanoidRootPart centre above the capsule centre.
@@ -2152,6 +2155,8 @@ impl Game {
             }
         }
         let rig = Rig::read(&self.doc, m);
+        let rig_key = rig::joints_key(&self.doc, m);
+
         let (start, start_yaw) = self.character_spawn_point();
         let root_lift =
             rig::root_height(&self.doc, m)
@@ -2162,6 +2167,7 @@ impl Game {
             floor_material: 0,
             humanoid,
             rig,
+            rig_key,
             rig_type,
             body: CharBody {
                 pos: start,

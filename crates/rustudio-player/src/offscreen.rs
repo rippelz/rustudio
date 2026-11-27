@@ -11,7 +11,8 @@
 //! (the harness writes no picture, only the log and frame times).
 //!
 //! Frames are paced at 60 Hz (a display's vsync, which a windowed test run
-//! gets from gamescope) except under --bench, which measures unpaced.
+//! gets from gamescope), or at `RUSTUDIO_HEADLESS_HZ`, except under --bench
+//! without it, which measures unpaced.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -128,7 +129,9 @@ pub fn run<A: eframe::App>(
     let frame = rs.as_ref().map(|rs| target(rs, size));
     let mut app = make(&ctx, rs.clone());
     let start = Instant::now();
-    let period = Duration::from_secs_f64(1.0 / 60.0);
+    // RUSTUDIO_HEADLESS_HZ: another display rate (a 144 Hz monitor's vsync).
+    let hz = std::env::var("RUSTUDIO_HEADLESS_HZ").ok().and_then(|v| v.parse::<f64>().ok()).filter(|hz| *hz > 0.0).unwrap_or(60.0);
+    let period = Duration::from_secs_f64(1.0 / hz);
     let mut next = Instant::now();
     let mut events: Vec<egui::Event> = vec![egui::Event::WindowFocused(true)];
     loop {
@@ -138,7 +141,7 @@ pub fn run<A: eframe::App>(
                 egui::vec2(size[0] as f32, size[1] as f32),
             )),
             time: Some(start.elapsed().as_secs_f64()),
-            predicted_dt: 1.0 / 60.0,
+            predicted_dt: period.as_secs_f32(),
             max_texture_side: font_limit,
             focused: true,
             events: std::mem::take(&mut events),

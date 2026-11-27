@@ -319,6 +319,22 @@ rustudio's `os.clock` now counts like Studio's (from the process start) and
 the harness passes Studio's reading at Play (`RUSTUDIO_CLOCK_BASE`): Place A
 camera 75 → 100 with the 2° tolerance unchanged.
 
+## Studio-side services plugins call
+
+StudioDeviceSimulatorService:GetDeviceAsync (a cloud plugin's
+`Photo.SceneControl` emulatorEnforcement errored "not a valid member" on
+Play) answers `"default"`: Studio's getDeviceAsync yields the device
+emulator's current device id, which is
+`StudioDeviceEmulator::DefaultEmulationDeviceId` ("default") while no device
+is emulated (read from the macOS binary: yieldCurrentDeviceId 0x10182124a,
+initializeEmulationMode 0x10181b2a0;
+crates/rustudio-engine/src/domains/testing_studio.rs). rustudio never
+emulates a device. Still open: the service's other 16 members
+(GetDeviceInfoAsync, GetDeviceListAsync, SetDeviceAsync, Get/Set
+Orientation / Resolution / PixelDensity / ScalingMode `…Async`,
+Create/Remove/UpdateDeviceAsync, StopSimulationAsync, ConfigurationChanged),
+not implemented.
+
 ## Next (open, by how much they block real games)
 
 1. **Soft spot lights** (render): Studio spreads a SpotLight's light well

@@ -142,6 +142,9 @@ pub struct Persist {
     /// Studio's pose state (body: R row-major, CoM x; STEP §4.2 [L2]) and the
     /// rapier pose it was written as; used while rapier still holds that pose.
     pub pose: Option<StudioPose>,
+    /// The last solve of a level-2+ island this body took part in
+    /// (`StudioSolver::shown_pose`).
+    pub span: Option<SolveSpan>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -150,6 +153,19 @@ pub struct StudioPose {
     pub x: Vec3,
     pub written_pos: Vec3,
     pub written_rot: Quat,
+}
+
+/// A solve over L ticks (L ≥ 2): the body pose it began from and the one it
+/// wrote (rapier's body origin and rotation), its level and the world tick
+/// it ran on.
+#[derive(Debug, Clone, Copy)]
+pub struct SolveSpan {
+    pub from_pos: Vec3,
+    pub from_rot: Quat,
+    pub to_pos: Vec3,
+    pub to_rot: Quat,
+    pub level: u8,
+    pub tick: u64,
 }
 
 impl Default for Persist {
@@ -174,6 +190,7 @@ impl Default for Persist {
             f_solver: Vec3::ZERO,
             t_solver: Vec3::ZERO,
             pose: None,
+            span: None,
         }
     }
 }

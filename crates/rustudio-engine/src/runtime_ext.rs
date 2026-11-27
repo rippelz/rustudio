@@ -8120,6 +8120,41 @@ end
         assert!(w.output.iter().any(|(_, t)| t.contains("OK")), "output: {:?}", w.output);
         assert_eq!(w.output.len(), 1, "unexpected output/errors: {:?}", w.output);
     }
+
+    /// Roblox's Backpack CoreScript equips with `tool.Parent = Character`:
+    /// on the client that is the character's Humanoid equipping the tool, and
+    /// a move back to the Backpack its unequip, as EquipTool / UnequipTools
+    /// ask for them. Other moves, and the server side, ask for nothing.
+    #[test]
+    fn client_tool_parent_into_character_asks_to_equip() {
+        let run = |side: crate::runtime::Side| {
+            let rt = Runtime::new().unwrap();
+            let mut w = World::new(Document::new_place(), RunMode::Play);
+            w.side = side;
+            rt.enter(w);
+            rt.bind_globals().unwrap();
+            rt.lua.load(r#"
+                character = Instance.new("Model", workspace)
+                humanoid = Instance.new("Humanoid", character)
+                backpack = Instance.new("Backpack", workspace)
+                tool = Instance.new("Tool", backpack)
+                other = Instance.new("Folder", workspace)
+                tool.Parent = character
+                tool.Parent = backpack
+                tool.Parent = other
+                tool.Parent = backpack
+                Instance.new("Part", character).Parent = backpack
+            "#).exec().unwrap();
+            let g = |name: &str| opt_inst(&rt.lua.globals().get::<Value>(name).unwrap()).unwrap();
+            let (humanoid, tool) = (g("humanoid"), g("tool"));
+            let requests = std::mem::take(&mut world(&rt.lua).unwrap().requests.equip);
+            (requests, humanoid, tool)
+        };
+        let (requests, humanoid, tool) = run(crate::runtime::Side::Client);
+        assert_eq!(requests, vec![(humanoid, Some(tool)), (humanoid, None)]);
+        let (requests, _, _) = run(crate::runtime::Side::Server);
+        assert!(requests.is_empty(), "{requests:?}");
+    }
 }
 
 /// Humanoid:EquipTool / UnequipTools in this DataModel at once: tools held
@@ -8165,4 +8200,38 @@ fn equip_now(lua: &Lua, humanoid: Ref, tool: Option<Ref>) -> mlua::Result<()> {
         set_parent(lua, t, model)?;
     }
     Ok(())
+}
+
+/// A client script setting a Tool's Parent: into a character with a
+/// Humanoid it is that Humanoid's equip, from a character into a Backpack its
+/// unequip, as when the Humanoid itself did it (`Humanoid:EquipTool` /
+/// `UnequipTools`). The play session takes the request the same way: the
+/// tool's Equipped / Unequipped fire on both sides and the hand holds it.
+/// Roblox's Backpack CoreScript equips this way, not by EquipTool
+/// (`EquipNewTool`: `tool.Parent = Character`, "Switch back to above line
+/// after EquipTool is fixed", Studio 0.744 ExtraContent
+/// CoreScripts/Modules/BackpackScript.lua; the CorePackages copy Play loads
+/// has `UnequipTools` among its constants and no `EquipTool`). Read before
+/// the move; None when it is neither.
+pub(crate) fn script_tool_move(lua: &Lua, tool: Ref, new_parent: Ref) -> mlua::Result<Option<(Ref, Option<Ref>)>> {
+    let w = world(lua)?;
+    if w.side != Side::Client || w.mode == RunMode::Edit {
+        return Ok(None);
+    }
+    let d = w.d();
+    if !d.dom.get_by_ref(tool).is_some_and(|i| rustudio_core::doc::is_a(&i.class, "BackpackItem")) {
+        return Ok(None);
+    }
+    let old = d.dom.get_by_ref(tool).map(|i| i.parent()).unwrap_or_else(Ref::none);
+    if old == new_parent {
+        return Ok(None);
+    }
+    let humanoid_of = |m: Ref| {
+        d.dom.get_by_ref(m).filter(|i| rustudio_core::doc::is_a(&i.class, "Model"))?.children().iter().copied().find(|c| d.class_of(*c).is_some_and(|k| k == "Humanoid"))
+    };
+    if let Some(h) = humanoid_of(new_parent) {
+        return Ok(Some((h, Some(tool))));
+    }
+    let to_backpack = d.class_of(new_parent).is_some_and(|k| k == "Backpack");
+    Ok(humanoid_of(old).filter(|_| to_backpack).map(|h| (h, None)))
 }

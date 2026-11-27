@@ -1093,6 +1093,27 @@ impl Walk<'_, '_> {
                     };
                     (gr, sr, ila, mn, mx)
                 }).collect();
+                // An item that grows along a row and on Y is as tall as it
+                // is at the width it grows to (Sizer::flex_heights), before
+                // the lines and their heights are worked out.
+                if !vertical && !wraps {
+                    let used = sizes.iter().map(|s| s.x).sum::<f32>() + gap * sizes.len().saturating_sub(1) as f32;
+                    let free = room_main - used;
+                    let gsum: f32 = flex_items.iter().map(|f| f.0).sum();
+                    if free > 0.0 && gsum > 0.0 {
+                        for (i, k) in order.iter().enumerate() {
+                            let (gr, _, _, _, mx) = flex_items[i];
+                            if gr > 0.0 && enum_u32(d.prop(*k, "AutomaticSize")).unwrap_or(0) & 2 != 0 {
+                                let w = (sizes[i].x + free * gr / gsum).min(mx);
+                                sizes[i].y = if reading {
+                                    Sizer { d, m: super::FaceText }.height_at_width(*k, w, content, scale, 0)
+                                } else {
+                                    Sizer { d, m: &mut *self }.height_at_width(*k, w, content, scale, 0)
+                                };
+                            }
+                        }
+                    }
+                }
                 let lines = list_lines(&sizes, vertical, wraps, room_main, gap);
                 // Across the fill axis: the lines, their gaps and the room
                 // left, shared by the lines (Fill), spread between them, or
@@ -1558,6 +1579,11 @@ impl<M: AutoText> Sizer<'_, M> {
                     && boolp(d, *c, "Visible", true)
             })
             .collect();
+        // Growing on X, its children may take the room its parent leaves
+        // it, not its width before growing: a wrapped label sized by Scale
+        // in a frame of no width otherwise wrapped a character per line
+        // (ExpChat's translation notice).
+        let kid_room = if auto & 1 != 0 && room.is_finite() { (room - pl - pr).max(inner.width()) } else { inner.width() };
         if let Some(lay) = child_of_class(d, r, "UIListLayout") {
             let vertical = enum_u32(d.prop(lay, "FillDirection")).unwrap_or(1) == 1;
             let p = udim(d, lay, "Padding");
@@ -1567,15 +1593,24 @@ impl<M: AutoText> Sizer<'_, M> {
                 } else {
                     inner.width()
                 } + p[1] * scale;
-            let sizes: Vec<egui::Vec2> = kids
+            let mut sizes: Vec<egui::Vec2> = kids
                 .iter()
-                .map(|k| self.auto_child_size(*k, inner, scale, auto, depth + 1))
+                .map(|k| self.auto_child_size(*k, inner, kid_room, scale, auto, depth + 1))
                 .collect();
             // A wrapping list breaks at the fill axis' extent — unless that
             // axis is the one growing (nothing to wrap at: one line).
             let main_auto = if vertical { auto & 2 != 0 } else { auto & 1 != 0 };
             let room = if vertical { inner.height() } else { inner.width() };
-            let lines = list_lines(&sizes, vertical, boolp(d, lay, "Wraps", false) && !main_auto, room, gap);
+            let wraps = boolp(d, lay, "Wraps", false) && !main_auto;
+            // A row that isn't growing on X fills its width as `place_children`
+            // lays it out: the items that flex wider are as tall as they are
+            // at their new width.
+            if !vertical && !main_auto && !wraps {
+                let used = sizes.iter().map(|s| s.x).sum::<f32>() + gap * kids.len().saturating_sub(1) as f32;
+                let fill = enum_u32(d.prop(lay, "HorizontalFlex")) == Some(1);
+                self.flex_heights(&kids, &mut sizes, inner, room - used, fill, scale, depth + 1);
+            }
+            let lines = list_lines(&sizes, vertical, wraps, room, gap);
             let along = lines.iter().map(|l| l.along).fold(0.0f32, f32::max);
             let across = lines.iter().map(|l| l.across).sum::<f32>() + gap * lines.len().saturating_sub(1) as f32;
             let e = if vertical {
@@ -1660,7 +1695,7 @@ impl<M: AutoText> Sizer<'_, M> {
                 }
                 let szs: Vec<egui::Vec2> = cells
                     .iter()
-                    .map(|c| self.auto_child_size(*c, inner, scale, auto, depth + 1))
+                    .map(|c| self.auto_child_size(*c, inner, kid_room, scale, auto, depth + 1))
                     .collect();
                 max_minor = max_minor.max(szs.len());
                 rows_cells.push(szs);
@@ -1694,7 +1729,7 @@ impl<M: AutoText> Sizer<'_, M> {
             }
         } else {
             for k in kids {
-                let s = self.auto_child_size(k, inner, scale, auto, depth + 1);
+                let s = self.auto_child_size(k, inner, kid_room, scale, auto, depth + 1);
                 let p = udim2(d, k, "Position");
                 let anchor = vec2(d, k, "AnchorPoint", [0.0, 0.0]);
                 let at = egui::vec2(
@@ -1714,7 +1749,7 @@ impl<M: AutoText> Sizer<'_, M> {
     /// Archimedes' window (an AutomaticSize Y button whose content sits in a
     /// `UDim2.new(1, 0, 1, -20)` frame: Studio shows the whole panel,
     /// checks/plugins/ref/corpus/screens/archimedes-click-main.jpg).
-    pub(super) fn auto_child_size(&mut self, k: Ref, inner: Rect, scale: f32, auto: u32, depth: usize) -> egui::Vec2 {
+    pub(super) fn auto_child_size(&mut self, k: Ref, inner: Rect, room: f32, scale: f32, auto: u32, depth: usize) -> egui::Vec2 {
         let mut s = self.own_size_in_auto(k, inner, scale, depth, auto).max(egui::Vec2::ZERO);
         if depth >= 24 {
             return s;
@@ -1724,7 +1759,7 @@ impl<M: AutoText> Sizer<'_, M> {
         let (gx, gy) = (grows(1, sz[0]), grows(2, sz[2]));
         if gx || gy {
             let axes = (gx as u32) | ((gy as u32) << 1);
-            let c = self.content_size_in(k, s, scale, axes, depth, inner.width());
+            let c = self.content_size_in(k, s, scale, axes, depth, room);
             if gx {
                 s.x = s.x.max(c.x);
             }
@@ -1733,6 +1768,64 @@ impl<M: AutoText> Sizer<'_, M> {
             }
         }
         s
+    }
+
+    /// A horizontal row's items grown by `room` (UIFlexItem's grow ratio, or
+    /// every item when the layout's HorizontalFlex is Fill), and those
+    /// growing on Y made as tall as their content is at the new width (an
+    /// item sized 0 wide measured first at 0: ExpChat's TextContainer wrapped
+    /// the typed text a word per line, the chat input over 200 px tall).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn flex_heights(
+        &mut self,
+        kids: &[Ref],
+        sizes: &mut [egui::Vec2],
+        parent: Rect,
+        room: f32,
+        fill: bool,
+        scale: f32,
+        depth: usize,
+    ) {
+        let d = self.d;
+        if !room.is_finite() || room <= 0.0 || kids.is_empty() || depth >= 24 {
+            return;
+        }
+        let ratios: Vec<f32> = kids
+            .iter()
+            .map(|k| match child_of_class(d, *k, "UIFlexItem") {
+                Some(item) => flex_ratios(d, item).0,
+                None => if fill { 1.0 } else { 0.0 },
+            })
+            .collect();
+        let sum: f32 = ratios.iter().sum();
+        if sum <= 0.0 {
+            return;
+        }
+        for ((k, s), r) in kids.iter().zip(sizes.iter_mut()).zip(&ratios) {
+            if *r > 0.0 {
+                s.x += room * r / sum;
+                if enum_u32(d.prop(*k, "AutomaticSize")).unwrap_or(0) & 2 != 0 {
+                    s.y = self.height_at_width(*k, s.x, parent, scale, depth);
+                }
+            }
+        }
+    }
+
+    /// An AutomaticSize Y object's height when it is `width` wide.
+    pub(super) fn height_at_width(&mut self, r: Ref, width: f32, parent: Rect, scale: f32, depth: usize) -> f32 {
+        let d = self.d;
+        let s = udim2(d, r, "Size");
+        let mut base = s[2] * parent.height() + s[3] * scale;
+        if let Some(c) = child_of_class(d, r, "UISizeConstraint") {
+            let min = vec2(d, c, "MinSize", [0.0, 0.0]);
+            let max = vec2(d, c, "MaxSize", [f32::INFINITY, f32::INFINITY]);
+            if min[1] <= max[1] {
+                base = base.clamp(min[1] * scale, max[1] * scale);
+            }
+        }
+        let c = self.content_size_in(r, egui::vec2(width, base), scale, 2, depth, width);
+        let ui_scale = child_of_class(d, r, "UIScale").map_or(1.0, |sc| num(d, sc, "Scale", 1.0));
+        base.max(c.y) * ui_scale
     }
 
     /// A GuiObject's size from Size, AutomaticSize and its constraints (and UIScale).
@@ -1818,11 +1911,28 @@ impl<M: AutoText> Sizer<'_, M> {
             }
             .min(parent.width())
             .max(0.0);
+            // A UISizeConstraint's MaxSize is as wide as wrapped content
+            // grows (what doesn't wrap still grows past it, as above):
+            // ExpChat's translation notice, an XY bubble of MaxSize 300
+            // holding two wrapped labels, wraps them at 300 less its padding.
+            let room = match child_of_class(d, r, "UISizeConstraint") {
+                Some(c) if auto & 1 != 0 => room.min(vec2(d, c, "MaxSize", [f32::INFINITY, f32::INFINITY])[0] * scale),
+                _ => room,
+            };
             let c = self.content_size_in(r, size, scale, auto, depth, room);
             if auto & 1 != 0 {
                 size.x = size.x.max(c.x);
             }
-            if auto & 2 != 0 {
+            if auto == 3 {
+                // Growing on both axes, the content is laid out again at the
+                // width it settled on: children sized by Scale on X and
+                // wrapped text take that width, and the height is what they
+                // need there. (Measured at the old width, ExpChat's
+                // translation notice wrapped a character per line, 1534 px
+                // tall.)
+                let c = self.content_size_in(r, size, scale, auto, depth, room);
+                size.y = size.y.max(c.y);
+            } else if auto & 2 != 0 {
                 size.y = size.y.max(c.y);
             }
         }
@@ -3796,6 +3906,56 @@ mod layout_tests {
             });
             out.textures_delta.clear();
         }
+    }
+
+    /// An AutomaticSize XY bubble of no size with a UISizeConstraint and two
+    /// wrapped labels sized by Scale on X (ExpChat's translation notice):
+    /// the labels wrap at MaxSize less the padding, and the bubble is as
+    /// tall as they are at that width, not a character per line.
+    #[test]
+    fn automatic_xy_bubble_wraps_at_its_max_width() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let holder = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let bubble = doc.dom.insert(holder, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 0)))
+            .with_property("AutomaticSize", Enum::from_u32(3)));
+        doc.dom.insert(bubble, InstanceBuilder::new("UIListLayout")
+            .with_property("Padding", UDim::new(0.0, 10)));
+        doc.dom.insert(bubble, InstanceBuilder::new("UISizeConstraint")
+            .with_property("MaxSize", Vector2::new(300.0, 400.0)));
+        doc.dom.insert(bubble, InstanceBuilder::new("UIPadding")
+            .with_property("PaddingLeft", UDim::new(0.0, 10))
+            .with_property("PaddingRight", UDim::new(0.0, 10))
+            .with_property("PaddingTop", UDim::new(0.0, 10))
+            .with_property("PaddingBottom", UDim::new(0.0, 10)));
+        let label = |order: i32, text: &str| InstanceBuilder::new("TextLabel")
+            .with_property("LayoutOrder", order)
+            .with_property("Text", text.to_string())
+            .with_property("TextSize", 16.0f32)
+            .with_property("TextWrapped", true)
+            .with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(0.0, 0)))
+            .with_property("AutomaticSize", Enum::from_u32(2));
+        let title = doc.dom.insert(bubble, label(0, "Chat translation is on for supported languages"));
+        let body = doc.dom.insert(bubble, label(1, &"Messages you send and receive will be translated. ".repeat(2)));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(holder, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let size = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.size;
+            let (b, t, m) = (size(bubble), size(title), size(body));
+            assert!(b[0] > 200.0 && b[0] <= 300.0, "the bubble grows to its MaxSize at most: {b:?}");
+            assert!((t[0] - (b[0] - 20.0)).abs() < 0.5 && (m[0] - (b[0] - 20.0)).abs() < 0.5, "labels take its width: {t:?} {m:?}");
+            assert!(t[1] < 80.0 && m[1] < 120.0, "wrapped at that width, not a character per line: {t:?} {m:?}");
+            assert!((b[1] - (t[1] + m[1] + 10.0 + 20.0)).abs() < 0.5, "as tall as they are: {b:?} {t:?} {m:?}");
+        });
+        out.textures_delta.clear();
     }
 
     /// SizeConstraint RelativeYY / RelativeXX: both scales take the parent's

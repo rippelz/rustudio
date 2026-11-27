@@ -40,6 +40,10 @@ sections were dead).
   `roblox-cookie.imported` holds the one-way key of the value already
   imported). **Sign out** removes the keyring copy and stops the file from
   being imported again until **Try again**.
+- `RUSTUDIO_COOKIE_FILE=<path>` names another cookie file for one run. That
+  run signs in as the file's account and nothing else: the file is never
+  imported into the keyring or marked imported, and a missing or empty file
+  is an error rather than a fall-back to the keyring's account.
 - Saved accounts (switching): service `rustudio`, user `roblox-account-<id>`
   (older builds used `service rustudio key roblox-account user <id>`, moved
   over the same way), one per account that signed in; switching copies one

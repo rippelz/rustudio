@@ -29,6 +29,9 @@ cargo test --workspace           # unit tests (undo/redo, files, Luau runtime, p
 ```
 `RUSTUDIO_GUI_DEBUG=1` logs GUI clicks and remote calls to Output;
 `RUSTUDIO_NO_GUI=1` hides every GUI (to tell GUI from 3D in a picture).
+`RUSTUDIO_HEADLESS_HZ=144` paces a headless run (and a `--bench` with it,
+which is otherwise unpaced) at that display rate instead of 60 Hz, to see
+how Play behaves on a faster monitor.
 
 The `--bench` report (round 20) has, besides avg / 1%-low fps and the
 section timers per frame (`play_tick`, `p6b_lua`, `gui_walk`, `gui_mesh`,

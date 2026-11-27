@@ -1269,6 +1269,127 @@ mod tests {
             "seam gap! lower={l_world:?} upper={u_world:?}"
         );
     }
+
+    /// An S15 skinned arm (a catalog body whose meshes have no Bone
+    /// instances: their bones are the rig's parts, Root, …, RightUpperArm,
+    /// RightLowerArm) on an R15 rig jointed by AnimationConstraints, as a
+    /// place file or Team Create holds one (StarterPlayer.AvatarJointUpgrade
+    /// rigs; the constraint's Part0 / Part1 are neither saved nor
+    /// replicated). Bending the elbow moves the upper arm mesh's vertices
+    /// weighted to RightLowerArm with the lower arm, and the two meshes meet
+    /// at the elbow.
+    #[test]
+    fn s15_limb_follows_its_bone_parts_across_animation_constraints() {
+        use rbx_dom_weak::InstanceBuilder;
+        let v3 = |x: f32, y: f32, z: f32| rbx_dom_weak::types::Vector3::new(x, y, z);
+        let at = |p: Vec3| Xform { pos: p, rot: Mat3::IDENTITY };
+        let mut doc = rustudio_core::doc::Document::new_place();
+        let ws = doc.workspace().unwrap();
+        let model = doc.dom.insert(ws, InstanceBuilder::new("Model").with_name("Character"));
+        let upper_rest = at(Vec3::new(1.5, 0.5, 0.0));
+        let lower_rest = at(Vec3::new(1.5, -0.5, 0.0));
+        let limb = |name: &str, cf: Xform, elbow_y: f32| {
+            InstanceBuilder::new("MeshPart")
+                .with_name(name)
+                .with_property("CFrame", cf.to_cframe())
+                .with_property("Size", v3(1.0, 1.0, 1.0))
+                .with_property("InitialSize", v3(1.0, 1.0, 1.0))
+                .with_child(
+                    InstanceBuilder::new("Attachment")
+                        .with_name("RightElbowRigAttachment")
+                        .with_property("CFrame", at(Vec3::new(0.0, elbow_y, 0.0)).to_cframe()),
+                )
+        };
+        let upper = doc.dom.insert(model, limb("RightUpperArm", upper_rest, -0.5));
+        let lower = doc.dom.insert(model, limb("RightLowerArm", lower_rest, 0.5));
+        let (a0, a1) = (doc.dom.get_by_ref(upper).unwrap().children()[0], doc.dom.get_by_ref(lower).unwrap().children()[0]);
+        doc.dom.insert(
+            lower,
+            InstanceBuilder::new("AnimationConstraint")
+                .with_name("RightElbow")
+                .with_property("Attachment0", Variant::Ref(a0))
+                .with_property("Attachment1", Variant::Ref(a1)),
+        );
+        // A weld whose Part1 is gone (a tool's handle destroyed while it was
+        // welded) holds nothing: the rig is read past it (it panicked in
+        // `descendants_of` before).
+        let gone = doc.dom.insert(model, InstanceBuilder::new("Part").with_name("Handle"));
+        doc.dom.insert(model, InstanceBuilder::new("Weld").with_property("Part0", Variant::Ref(upper)).with_property("Part1", Variant::Ref(gone)));
+        doc.dom.destroy(gone);
+        rig_changed();
+        // The mesh's bones as the file has them (mesh space = the part's,
+        // the limb bones turned 180° about X), one vertex at the elbow seam
+        // split between the two bones and one below it on RightLowerArm.
+        let flip = Mat3::from_diagonal(Vec3::new(1.0, -1.0, -1.0));
+        let arm_base = |verts: Vec<Vec3>, bones: Vec<[u16; 4]>, weights: Vec<[f32; 4]>, part_y: f32| {
+            let n = verts.len();
+            // (bone positions in this mesh's space: the part's centre at part_y)
+            let bone = |name: &str, parent: Option<usize>, rot: Mat3, y: f32| SkinBone { name: name.into(), parent, rot, pos: Vec3::new(0.0, y - part_y, 0.0) };
+            Base {
+                positions: verts,
+                normals: vec![Vec3::Z; n],
+                uvs: vec![Vec2::ZERO; n],
+                colors: Vec::new(),
+                extent: Vec3::ONE,
+                center: Vec3::ZERO,
+                facs: None,
+                whole: true,
+                firsts: (0..n as u32).collect(),
+                corner_unique: (0..n as u32).collect(),
+                skin: Skin {
+                    bones: vec![
+                        bone("Root", None, Mat3::IDENTITY, -1.0),
+                        bone("HumanoidRootNode", Some(0), Mat3::IDENTITY, -1.0),
+                        bone("RightUpperArm", Some(1), flip, 0.75),
+                        bone("RightLowerArm", Some(2), flip, 0.0),
+                    ],
+                    corner_bones: bones,
+                    corner_weights: weights,
+                    corner_vertex: (0..n as u32).collect(),
+                    vertex_bones: Vec::new(),
+                    vertex_weights: Vec::new(),
+                },
+            }
+        };
+        let half = [0.5, 0.5, 0.0, 0.0];
+        let whole = [1.0, 0.0, 0.0, 0.0];
+        // Upper arm mesh: seam (0.3, 0, 0.2) world → local y -0.5; overlap at y -0.7.
+        let upper_base = arm_base(
+            vec![Vec3::new(0.3, -0.5, 0.2), Vec3::new(0.3, -0.7, 0.2)],
+            vec![[2, 3, 0, 0], [3, 0, 0, 0]],
+            vec![half, whole],
+            0.5,
+        );
+        let lower_base = arm_base(vec![Vec3::new(0.3, 0.5, 0.2)], vec![[2, 3, 0, 0]], vec![half], -0.5);
+
+        // AnimationConstraint-jointed parts are one jointed model: skinned.
+        assert_eq!(rustudio_core::body::joint_parts(&doc, doc.dom.get_by_ref(lower).unwrap().children()[1]), Some((upper, lower)));
+        assert!(part_in_jointed_model(&doc, upper));
+        assert!(lookup(&doc, upper, &upper_base).any);
+        assert!(lookup(&doc, upper, &upper_base).deps.contains(&lower));
+        assert!(matrices(&doc, upper, &upper_base, Vec3::ONE).is_none(), "at rest");
+
+        // Bend the elbow 90° about X (the constraint's Transform):
+        // lower = upper × Attachment0 × T × Attachment1⁻¹.
+        let t = Xform { pos: Vec3::ZERO, rot: Mat3::from_rotation_x(std::f32::consts::FRAC_PI_2) };
+        let lower_now = mul(&mul(&mul(&upper_rest, &at(Vec3::new(0.0, -0.5, 0.0))), &t), &inv(&at(Vec3::new(0.0, 0.5, 0.0))));
+        doc.dom.get_by_ref_mut(lower).unwrap().properties.insert(rbx_dom_weak::ustr("CFrame"), Variant::CFrame(lower_now.to_cframe()));
+        doc.mark_prop(lower, rbx_dom_weak::ustr("CFrame"));
+
+        let um = matrices(&doc, upper, &upper_base, Vec3::ONE).expect("the upper arm deforms");
+        let lm = matrices(&doc, lower, &lower_base, Vec3::ONE).expect("the lower arm deforms");
+        let (up, _) = deform(&upper_base, &um, Vec3::ONE, origin_of(&doc, upper));
+        let (lp, _) = deform(&lower_base, &lm, Vec3::ONE, origin_of(&doc, lower));
+        // The overlap vertex rides on the lower arm: its rest point in the
+        // lower arm's frame, carried by the lower arm's pose now.
+        let rest_world = upper_rest.apply(Vec3::new(0.3, -0.7, 0.2));
+        let follows = lower_now.apply(inv(&lower_rest).apply(rest_world));
+        assert!(upper_rest.apply(up[1]).abs_diff_eq(follows, 1e-5), "{:?} vs {follows:?}", upper_rest.apply(up[1]));
+        assert!(!follows.abs_diff_eq(rest_world, 1e-2), "the bend moves it");
+        // Both meshes put the seam vertex at the same place.
+        let (us, ls) = (upper_rest.apply(up[0]), lower_now.apply(lp[0]));
+        assert!(us.abs_diff_eq(ls, 1e-5), "seam gap: upper {us:?} lower {ls:?}");
+    }
 }
 
 #[cfg(test)]

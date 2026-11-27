@@ -86,11 +86,16 @@ pub fn attachment_part(doc: &Document, a: Ref) -> Option<Ref> {
 
 /// The two parts a rigid joint holds: Part0 / Part1 (alias-aware: files and
 /// the live wire keep a WeldConstraint's as Part0Internal / Part1Internal),
-/// or a RigidConstraint's attachments' parts.
+/// a RigidConstraint's attachments' parts, or an AnimationConstraint's
+/// (`joint_frames`: its Part0 / Part1 are derived from its attachments and
+/// neither saved nor replicated, api-dump.json; R15 rigs with
+/// StarterPlayer.AvatarJointUpgrade are jointed with them). None while
+/// either part is not in the DOM (a reference whose instance was removed,
+/// or hasn't arrived): such a joint holds nothing.
 pub fn joint_parts(doc: &Document, j: Ref) -> Option<(Ref, Ref)> {
     let class = doc.class_of(j)?;
     let pr = |k: rbx_dom_weak::Ustr| match doc.prop_key(j, k) {
-        Some(Variant::Ref(x)) if x.is_some() => Some(x),
+        Some(Variant::Ref(x)) if x.is_some() && doc.dom.get_by_ref(x).is_some() => Some(x),
         _ => None,
     };
     if class == "RigidConstraint" {
@@ -98,6 +103,9 @@ pub fn joint_parts(doc: &Document, j: Ref) -> Option<(Ref, Ref)> {
             attachment_part(doc, pr(crate::ukey!("Attachment0"))?)?,
             attachment_part(doc, pr(crate::ukey!("Attachment1"))?)?,
         ));
+    }
+    if class == "AnimationConstraint" {
+        return joint_frames(doc, j).map(|(p0, p1, _, _)| (p0, p1));
     }
     Some((pr(crate::ukey!("Part0"))?, pr(crate::ukey!("Part1"))?))
 }

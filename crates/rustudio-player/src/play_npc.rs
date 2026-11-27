@@ -712,7 +712,7 @@ impl Game {
         let poses = {
             let _scope = rustudio_core::bench::scope("npc_solve_pose");
             let inputs: Vec<_> = s.npcs.by_model.iter().filter_map(|(&model, npc)| {
-                let (root, _, _) = s.physics.humanoid_root(model)?;
+                let (root, _, _) = s.physics.humanoid_root_shown(model)?;
                 Some((model, root, &npc.rig, &npc.transforms))
             }).collect();
             let solve = |(model, root, rig, transforms): (Ref, Xform, &rig::Rig, &rustc_hash::FxHashMap<Ref, Xform>)| {

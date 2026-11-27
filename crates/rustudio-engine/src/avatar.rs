@@ -37,9 +37,13 @@ pub struct AvatarLook {
     /// Accessory models (.rbxm bytes).
     pub accessories: Vec<Vec<u8>>,
     /// Body part packages (Torso / arms / legs: .rbxm bytes with R6
-    /// CharacterMeshes and R15 MeshParts) and the head (a SpecialMesh).
+    /// CharacterMeshes and R15 MeshParts).
     pub body_parts: Vec<Vec<u8>>,
-    pub head: Option<Vec<u8>>,
+    /// The head package in each form a rig takes, since the rig Play builds
+    /// follows the place, not the avatar's own type: the asset itself (R6:
+    /// a SpecialMesh) and its `avatar_meshpart_head` form (R15: a Head
+    /// MeshPart). Each rig picks the form it can wear.
+    pub head: Vec<Vec<u8>>,
     /// Animation packages (Enum.AssetType name such as "IdleAnimation",
     /// asset id, .rbxm bytes): an `R15Anim` folder of StringValues named
     /// like the Animate script's slots (idle, walk, run, jump, fall, climb,
@@ -51,12 +55,13 @@ pub struct AvatarLook {
     pub skipped: Vec<String>,
 }
 
-/// A content property, under its classic name or the newer `…Content` name
-/// files are migrated to (e.g. ShirtTemplate → ShirtTemplateContent).
+/// A content property, under its classic name or the newer `…Content` twin
+/// files are migrated to (e.g. ShirtTemplate → ShirtTemplateContent,
+/// ShirtGraphic's Graphic → TextureContent).
 fn content_of(dom: &WeakDom, class: &str, prop: &str) -> Option<String> {
     let i = dom.descendants().find(|i| i.class == class)?;
-    [prop.to_string(), format!("{prop}Content")]
-        .iter()
+    std::iter::once(prop)
+        .chain(doc::content_twin(prop))
         .find_map(|name| match i.properties.get(&ustr(name)) {
             Some(Variant::ContentId(c)) => Some(c.as_str().to_string()),
             Some(Variant::Content(c)) => c.as_uri().map(str::to_string),
@@ -252,7 +257,7 @@ pub fn look_from_info(
         accessory_ids: Vec::new(),
         accessories: Vec::new(),
         body_parts: Vec::new(),
-        head: None,
+        head: Vec::new(),
         animations: Vec::new(),
         emotes: Vec::new(),
         skipped: Vec::new(),
@@ -314,7 +319,8 @@ pub fn look_from_info(
                 look.face_id = Some(a.id);
             }
             "Head" | "DynamicHead" => {
-                look.head = Some(head_for_rig(client, a.id, look.r15, bytes));
+                look.head.extend(meshpart_head(client, a.id));
+                look.head.push(bytes);
                 look.head_id = Some(a.id);
             }
             k if is_body_part(k) => {
@@ -715,20 +721,16 @@ pub fn meshpart_accessory(id: u64) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// The head package for the avatar's rig. A head asset as served plainly is
-/// its legacy R6 form (a SpecialMesh, "NoFace" on a dynamic head); R15
-/// characters wear its MeshPart head, which asset delivery hands out for
-/// `assetFormat: avatar_meshpart_head` (as Studio's avatar loader asks):
-/// a MeshPart "Head" with its mesh, texture, FaceControls and cage. Falls
-/// back to the legacy bytes when that form isn't available.
-fn head_for_rig(client: &SharedClient, id: u64, r15: bool, legacy: Vec<u8>) -> Vec<u8> {
-    if !r15 {
-        return legacy;
-    }
+/// A head asset's R15 form. Served plainly, a head asset is its legacy R6
+/// form (a SpecialMesh, "NoFace" on a dynamic head); R15 characters wear
+/// its MeshPart head, which asset delivery hands out for `assetFormat:
+/// avatar_meshpart_head` (as Studio's avatar loader asks): a MeshPart
+/// "Head" with its mesh, texture, FaceControls and cage. Disk-cached.
+fn meshpart_head(client: &SharedClient, id: u64) -> Option<Vec<u8>> {
     let cache = rustudio_core::assets::cache_dir().join(format!("assets/{id}_avatar_meshpart_head.bin"));
     if let Ok(b) = std::fs::read(&cache) {
         if !b.is_empty() {
-            return b;
+            return Some(b);
         }
     }
     let fetched = (|| {
@@ -752,17 +754,12 @@ fn head_for_rig(client: &SharedClient, id: u64, r15: bool, legacy: Vec<u8>) -> V
         let loc = v.pointer("/0/location")?.as_str()?.to_string();
         let (status, bytes) = s.fetch_bytes(&loc, false).ok()?;
         (status == 200 && decode_model(&bytes).is_ok()).then_some(bytes)
-    })();
-    match fetched {
-        Some(b) => {
-            if let Some(dir) = cache.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(&cache, &b);
-            b
-        }
-        None => legacy,
+    })()?;
+    if let Some(dir) = cache.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
+    let _ = std::fs::write(&cache, &fetched);
+    Some(fetched)
 }
 
 /// A MeshPart head package (the `avatar_meshpart_head` form) onto an R15
@@ -1038,6 +1035,20 @@ fn put_on_r15_part(
                 .with_property("Value", Variant::String(scale_type.clone())),
         );
     }
+    // The package's part replaces the old one whole, cage included: a part
+    // whose package has no WrapTarget has none (Headless Head's
+    // avatar_meshpart_head form is a MeshPart with attachments only).
+    let old_cages: Vec<Ref> = doc
+        .dom
+        .get_by_ref(dst)
+        .map(|i| i.children().to_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| doc.dom.get_by_ref(*c).is_some_and(|i| i.class == "WrapTarget"))
+        .collect();
+    for o in old_cages {
+        doc.dom.destroy(o);
+    }
     for k in kids {
         let Some(ki) = pkg.get_by_ref(k) else { continue };
         match ki.class.as_str() {
@@ -1066,20 +1077,7 @@ fn put_on_r15_part(
                 }
             }
             // The cage layered clothing fits to.
-            "WrapTarget" => {
-                let old: Vec<Ref> = doc
-                    .dom
-                    .get_by_ref(dst)
-                    .map(|i| i.children().to_vec())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|c| doc.dom.get_by_ref(*c).is_some_and(|i| i.class == "WrapTarget"))
-                    .collect();
-                for o in old {
-                    doc.dom.destroy(o);
-                }
-                pkg.transfer(k, &mut doc.dom, dst);
-            }
+            "WrapTarget" => pkg.transfer(k, &mut doc.dom, dst),
             _ => {}
         }
     }
@@ -1166,7 +1164,7 @@ mod tests {
             accessory_ids: Vec::new(),
             accessories: Vec::new(),
             body_parts: Vec::new(),
-            head: None,
+            head: Vec::new(),
             animations: vec![("IdleAnimation".into(), 5, bytes)],
             emotes: Vec::new(),
             skipped: Vec::new(),
@@ -1179,6 +1177,94 @@ mod tests {
         assert_eq!(names(walk), vec!["WalkAnim"]);
         let a1 = d.dom.get_by_ref(idle).unwrap().children()[0];
         assert_eq!(names(a1), vec!["Weight"]);
+    }
+
+    /// An R6 avatar wearing Headless Head (15093053680) in a place that
+    /// spawns R15: the R15 rig wears the head's MeshPart form, as asset
+    /// delivery's `avatar_meshpart_head` form has it (mesh 6686307858, no
+    /// texture, FaceControls or WrapTarget), not the default dynamic head.
+    #[test]
+    fn an_r15_rig_wears_the_meshpart_head_of_an_r6_avatar() {
+        let encode = |dom: &WeakDom| {
+            let mut b = Vec::new();
+            rbx_binary::to_writer(&mut b, dom, dom.root().children()).unwrap();
+            b
+        };
+        let headless = "rbxassetid://6686307858";
+        let meshpart_form = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("MeshPart")
+                    .with_name("Head")
+                    .with_property("MeshContent", Content::from(headless.to_string()))
+                    .with_property("Size", rbx_dom_weak::types::Vector3::new(1.0, 1.0, 1.0))
+                    .with_child(
+                        InstanceBuilder::new("Attachment")
+                            .with_name("FaceFrontAttachment")
+                            .with_property(
+                                "CFrame",
+                                rbx_dom_weak::types::CFrame::new(
+                                    rbx_dom_weak::types::Vector3::new(0.0, 0.0, -0.6),
+                                    rbx_dom_weak::types::Matrix3::identity(),
+                                ),
+                            ),
+                    ),
+            ),
+        );
+        let legacy_form = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("SpecialMesh")
+                    .with_name("Mesh")
+                    .with_property("MeshId", ContentId::from("http://www.roblox.com/asset/?id=134079402")),
+            ),
+        );
+        let mut d = doc::Document::empty();
+        let root = d.dom.root_ref();
+        let ch = d.dom.insert(root, InstanceBuilder::new("Model").with_name("Player"));
+        d.dom.insert(ch, InstanceBuilder::new("MeshPart").with_name("UpperTorso"));
+        let head = d.dom.insert(
+            ch,
+            InstanceBuilder::new("MeshPart")
+                .with_name("Head")
+                .with_property("MeshId", ContentId::from("rbxassetid://123480233606534"))
+                .with_property("TextureID", ContentId::from("rbxassetid://111092388570647"))
+                .with_child(InstanceBuilder::new("FaceControls").with_name("FaceControls"))
+                .with_child(InstanceBuilder::new("WrapTarget").with_name("HeadWrapTarget"))
+                .with_child(InstanceBuilder::new("Attachment").with_name("FaceFrontAttachment")),
+        );
+        let look = AvatarLook {
+            user_id: 1,
+            r15: false,
+            colors: BodyColors::default(),
+            scales: Scales::default(),
+            proportion: 0.0,
+            body_type: 0.0,
+            shirt: None,
+            pants: None,
+            tshirt: None,
+            face: None,
+            shirt_id: None,
+            pants_id: None,
+            tshirt_id: None,
+            face_id: None,
+            head_id: Some(15093053680),
+            body_part_ids: Vec::new(),
+            accessory_ids: Vec::new(),
+            accessories: Vec::new(),
+            body_parts: Vec::new(),
+            head: vec![encode(&meshpart_form), encode(&legacy_form)],
+            animations: Vec::new(),
+            emotes: Vec::new(),
+            skipped: Vec::new(),
+        };
+        assert!(!put_on_body(&mut d, ch, &look), "Headless Head brings no face of its own");
+        let h = d.dom.get_by_ref(head).unwrap();
+        assert!(
+            matches!(h.properties.get(&ustr("MeshContent")), Some(Variant::Content(c)) if c.as_uri() == Some(headless))
+        );
+        assert!(h.properties.get(&ustr("MeshId")).is_none());
+        assert!(h.properties.get(&ustr("TextureID")).is_none());
+        let kids: Vec<String> = h.children().iter().map(|c| d.dom.get_by_ref(*c).unwrap().class.to_string()).collect();
+        assert_eq!(kids, vec!["Attachment"], "no FaceControls, WrapTarget or SpecialMesh left on the head");
     }
 
 }

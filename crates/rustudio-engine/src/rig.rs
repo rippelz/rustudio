@@ -1181,6 +1181,33 @@ fn cf_prop(doc: &Document, r: Ref, name: &str) -> Xform {
     }
 }
 
+/// The classes `Rig::read` builds a rig's joints from.
+fn is_rig_joint(class: &str) -> bool {
+    matches!(class, "Motor6D" | "Weld" | "ManualWeld" | "AnimationConstraint")
+}
+
+/// What `Rig::read` would build `model`'s joints from now, folded into one
+/// key: each rig joint that holds two parts, with its parts and frames. A
+/// key that changed means the rig read before is stale: a script rescaled
+/// the body (the joints' C0 / C1 or attachments moved), replaced a joint,
+/// or set an R15 AnimationConstraint's attachment after the character was
+/// taken (its Part0 / Part1 / C0 / C1 come from its attachments). Roblox
+/// reads joints as they are each step.
+pub fn joints_key(doc: &Document, model: Ref) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for i in doc.dom.descendants_of(model).filter(|i| is_rig_joint(&i.class)) {
+        let Some((p0, p1, c0, c1)) = joint_frames(doc, i.referent()) else { continue };
+        (i.referent(), p0, p1).hash(&mut h);
+        for x in [c0, c1] {
+            for f in x.pos.to_array().into_iter().chain(x.rot.to_cols_array()) {
+                f.to_bits().hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
 impl Rig {
     /// Reads the Motor6Ds of a character, ordered from the root outward,
     /// and attaches accessories by matching attachment names.
@@ -1191,9 +1218,7 @@ impl Rig {
         let mut motors: Vec<Joint> = doc
             .dom
             .descendants_of(model)
-            .filter(|i| {
-                matches!(i.class.as_str(), "Motor6D" | "Weld" | "ManualWeld" | "AnimationConstraint")
-            })
+            .filter(|i| is_rig_joint(&i.class))
             .filter_map(|i| {
                 let r = i.referent();
                 let (part0, part1, c0, c1) = joint_frames(doc, r)?;
@@ -1576,6 +1601,60 @@ mod tests {
         let foot = d.find_named(m, "LeftFoot").unwrap();
         let at = |p: &Vec<(Ref, Xform)>| p.iter().find(|(x, _)| *x == foot).unwrap().1.pos;
         assert!((at(&bent) - at(&after)).length() > 0.3);
+    }
+
+    /// An R15 AnimationConstraint with no Attachment0 when the character is
+    /// taken (a script sets it later): read then, the rig has no
+    /// RightShoulder and nothing past it. `joints_key` changes once the
+    /// attachment is there, and the rig read again poses the arm: a
+    /// RightShoulder Transform of 157° about X (an arm raised overhead) puts
+    /// the hand above the shoulder and in front of the body
+    /// (Part1 = Part0 · Attachment0 · Transform · Attachment1⁻¹).
+    #[test]
+    fn a_rig_read_before_a_joint_held_its_parts_is_read_again() {
+        let (mut d, m) = spawn(RigType::R15);
+        upgrade_rig(&mut d.dom, m);
+        // As a file or Team Create holds them: the attachments, not the
+        // derived Part0 / Part1 / C0 / C1 (api-dump.json: Hidden,
+        // NotReplicated, neither loaded nor saved).
+        let constraints: Vec<Ref> = d.dom.descendants_of(m).filter(|i| i.class == "AnimationConstraint").map(|i| i.referent()).collect();
+        for c in constraints {
+            let props = &mut d.dom.get_by_ref_mut(c).unwrap().properties;
+            for k in ["Part0", "Part1", "C0", "C1"] {
+                props.remove(&ustr(k));
+            }
+        }
+        let ident = Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY };
+        let shoulder = d
+            .dom
+            .descendants_of(m)
+            .find(|i| i.class == "AnimationConstraint" && i.name == "RightShoulder")
+            .map(|i| i.referent())
+            .unwrap();
+        let Some(Variant::Ref(a0)) = d.prop(shoulder, "Attachment0") else { panic!() };
+        let full = joints_key(&d, m);
+        d.dom.get_by_ref_mut(shoulder).unwrap().properties.insert(ustr("Attachment0"), Variant::Ref(Ref::none()));
+        let early = Rig::read(&d, m);
+        // RightShoulder, and RightElbow / RightWrist past it, can't be placed.
+        assert_eq!(early.joints.len(), 12);
+        let key = joints_key(&d, m);
+        assert_ne!(key, full);
+        assert_eq!(key, joints_key(&d, m));
+        d.dom.get_by_ref_mut(shoulder).unwrap().properties.insert(ustr("Attachment0"), Variant::Ref(a0));
+        assert_eq!(joints_key(&d, m), full);
+        let rig = Rig::read(&d, m);
+        assert_eq!(rig.joints.len(), 15);
+        let mut t = HashMap::new();
+        t.insert(shoulder, Xform { pos: Vec3::ZERO, rot: Mat3::from_rotation_x(157f32.to_radians()) });
+        let pose = rig.solve(ident, &t);
+        let at = |name: &str| pose.iter().find(|(r, _)| Some(*r) == d.find_named(m, name)).unwrap().1;
+        let (torso, hand) = (at("UpperTorso"), at("RightHand"));
+        let hand = torso.inverse().apply(hand.pos);
+        assert!(hand.y > 1.0 && hand.z < -0.2 && hand.x > 0.5, "{hand:?}");
+        // A rescale moving the shoulder's attachment changes the key too.
+        let cf = |x: f32| Variant::CFrame(CFrame::new(Vector3::new(x, 0.5, 0.0), rbx_dom_weak::types::Matrix3::identity()));
+        d.dom.get_by_ref_mut(a0).unwrap().properties.insert(ustr("CFrame"), cf(1.2));
+        assert_ne!(joints_key(&d, m), full);
     }
 
     #[test]

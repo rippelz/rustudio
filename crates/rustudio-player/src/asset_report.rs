@@ -88,15 +88,11 @@ impl Game {
                 Kind::Mesh => self.meshes.state(id),
                 Kind::Image => self.textures.state(id).or_else(|| self.gui.image_state(id)),
             };
-            let (status, why) = match state {
-                Some(Ok(())) => ("loaded", None),
-                Some(Err(w)) => ("failed", Some(w)),
-                None => match self.assets.why_not(id) {
-                    Some(w) if w == "still downloading" => ("downloading", None),
-                    Some(w) => ("failed", Some(format!("not fetched: {w}"))),
-                    None => ("not requested", None),
-                },
-            };
+            let (status, why) = status_of(
+                state,
+                self.assets.why_not(id),
+                rustudio_core::assets::content_fetch_status(id),
+            );
             let k = if *kind == Kind::Mesh { "mesh" } else { "image" };
             *summary.entry(k).or_default().entry(status.to_string()).or_default() += 1;
             rows.push(json!({
@@ -116,5 +112,47 @@ impl Game {
         let Some(path) = std::env::var_os("RUSTUDIO_ASSET_REPORT") else { return };
         let r = self.asset_report();
         let _ = std::fs::write(path, serde_json::to_string_pretty(&r).unwrap_or_default());
+    }
+}
+
+/// An id's report status from the view's own state, else the place asset
+/// store's (`why_not`), else the shared fetch status
+/// (`assets::content_fetch_status`: 1 fetching, 2 fetched, 3 failed). The
+/// last covers what loads outside the view's caches: layered garments'
+/// meshes and cages (wrap.rs) and SurfaceAppearance PBR maps (matpack.rs),
+/// which read as "not requested" while drawn.
+fn status_of(
+    state: Option<Result<(), String>>,
+    why_not: Option<String>,
+    fetch: u8,
+) -> (&'static str, Option<String>) {
+    match state {
+        Some(Ok(())) => ("loaded", None),
+        Some(Err(w)) => ("failed", Some(w)),
+        None => match why_not {
+            Some(w) if w == "still downloading" => ("downloading", None),
+            Some(w) => ("failed", Some(format!("not fetched: {w}"))),
+            None => match fetch {
+                1 => ("downloading", None),
+                2 => ("loaded", None),
+                3 => ("failed", Some("not fetched".to_string())),
+                _ => ("not requested", None),
+            },
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_of;
+
+    #[test]
+    fn an_id_loaded_outside_the_view_caches_reports_its_fetch() {
+        assert_eq!(status_of(None, None, 2).0, "loaded");
+        assert_eq!(status_of(None, None, 1).0, "downloading");
+        assert_eq!(status_of(None, None, 3).0, "failed");
+        assert_eq!(status_of(None, None, 0).0, "not requested");
+        // The view's own state wins.
+        assert_eq!(status_of(Some(Err("bad".into())), None, 2), ("failed", Some("bad".into())));
     }
 }

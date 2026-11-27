@@ -8,7 +8,7 @@
 
 use crate::replicator::{NetAssetId, PropValue, RefMap, RepOp};
 use rbx_dom_weak::types::{Ref, Variant};
-use rbx_dom_weak::{InstanceBuilder, WeakDom};
+use rbx_dom_weak::{InstanceBuilder, Ustr, WeakDom};
 use std::collections::HashMap;
 
 pub struct LiveModel {
@@ -27,6 +27,9 @@ pub struct LiveModel {
     waiting_asset_targets: HashMap<(Ref, String), NetAssetId>,
     /// Unions given their geometry since the last `take_resolved`.
     resolved: Vec<Ref>,
+    /// (instance, property) whose reference named an instance that has
+    /// arrived since the last `take_resolved_refs`.
+    resolved_refs: Vec<(Ref, Ustr)>,
     /// SET_GLOBALS' top-level services by server referent (class names).
     services: HashMap<u64, String>,
     /// Referents the server sent for two different instances, with both
@@ -61,6 +64,7 @@ impl LiveModel {
             waiting_assets: HashMap::new(),
             waiting_asset_targets: HashMap::new(),
             resolved: Vec::new(),
+            resolved_refs: Vec::new(),
             services: HashMap::new(),
             conflicts: Vec::new(),
         }
@@ -105,6 +109,14 @@ impl LiveModel {
     /// Unions that got their geometry since the last call (for change marks).
     pub fn take_resolved(&mut self) -> Vec<Ref> {
         std::mem::take(&mut self.resolved)
+    }
+    /// References that named instances not here yet and now hold them,
+    /// since the last call: the instance and property each was set on.
+    /// The property changed after its own op was applied, so a reader that
+    /// follows changes (Team Create's marks into the editor's document)
+    /// learns it only from here.
+    pub fn take_resolved_refs(&mut self) -> Vec<(Ref, Ustr)> {
+        std::mem::take(&mut self.resolved_refs)
     }
 
     pub fn reference(&self, id: u64) -> Option<Ref> {
@@ -449,7 +461,9 @@ impl LiveModel {
                 }
                 self.pending_ref_targets.remove(&(target, name.clone()));
                 if let Some(inst) = self.dom.get_by_ref_mut(target) {
-                    inst.properties.insert(name.into(), Variant::Ref(referent));
+                    let key = rbx_dom_weak::ustr(&name);
+                    inst.properties.insert(key, Variant::Ref(referent));
+                    self.resolved_refs.push((target, key));
                 }
             }
         }
@@ -512,10 +526,9 @@ impl LiveModel {
 fn content_legacy_names(twin: &str) -> &'static [&'static str] {
     match twin {
         "MeshContent" => &["MeshId"],
-        "TextureContent" => &["TextureID", "TextureId", "Texture"],
+        "TextureContent" => &["TextureID", "TextureId", "Texture", "Graphic"],
         "ShirtTemplateContent" => &["ShirtTemplate"],
         "PantsTemplateContent" => &["PantsTemplate"],
-        "GraphicContent" => &["Graphic"],
         "ImageContent" => &["Image"],
         "ColorMapContent" => &["ColorMap"],
         "NormalMapContent" => &["NormalMap"],
@@ -1186,6 +1199,44 @@ mod tests {
                 .get(&"Object".into()),
             Some(&Variant::Ref(Ref::none()))
         );
+    }
+
+    /// A Team Create stream can send an instance before the one a reference
+    /// of it names (an AnimationConstraint before the next part's rig
+    /// attachment): the reference is filled in when that instance arrives,
+    /// and reported, so the editor's copy, which took the constraint with a
+    /// nil Attachment0, gets it too.
+    #[test]
+    fn a_forward_reference_filled_in_later_is_reported() {
+        let mut m = LiveModel::new();
+        let new = |id: u64, class: &str, parent: u64, props: Vec<(String, PropValue)>| RepOp::NewInstance {
+            id,
+            class: class.into(),
+            parent: Some(parent),
+            props,
+        };
+        m.apply(RepOp::NewInstance { id: 1, class: "DataModel".into(), parent: None, props: vec![] });
+        m.apply(new(2, "MeshPart", 1, vec![]));
+        m.apply(new(
+            3,
+            "AnimationConstraint",
+            2,
+            vec![("Attachment0".into(), PropValue::Ref(Some(5))), ("Attachment1".into(), PropValue::Ref(Some(4)))],
+        ));
+        m.apply(new(4, "Attachment", 2, vec![]));
+        // Attachment1 named an instance that came later in the same stream.
+        let joint = m.reference(3).unwrap();
+        assert_eq!(m.take_resolved_refs(), vec![(joint, rbx_dom_weak::ustr("Attachment1"))]);
+        m.apply(new(6, "MeshPart", 1, vec![]));
+        m.apply(new(5, "Attachment", 6, vec![]));
+        assert_eq!(m.take_resolved_refs(), vec![(joint, rbx_dom_weak::ustr("Attachment0"))]);
+        let a0 = m.reference(5).unwrap();
+        assert_eq!(m.dom().get_by_ref(joint).unwrap().properties.get(&rbx_dom_weak::ustr("Attachment0")), Some(&Variant::Ref(a0)));
+        // A reference superseded before its instance came is not reported.
+        m.apply(RepOp::ChangeProperty { id: 3, name: "Attachment0".into(), value: PropValue::Ref(Some(8)) });
+        m.apply(RepOp::ChangeProperty { id: 3, name: "Attachment0".into(), value: PropValue::Ref(Some(5)) });
+        m.apply(new(8, "Attachment", 6, vec![]));
+        assert!(m.take_resolved_refs().is_empty());
     }
 
     #[test]

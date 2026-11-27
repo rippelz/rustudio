@@ -76,6 +76,7 @@
 | Camera | every client has Workspace.CurrentCamera (made when the place has none) | Roblox docs |
 | Output | every script line is tagged [Server] or [Client] while Play runs | person's request |
 | Explorer | Server / Client toggle at the top while Play runs; the viewport shows the side you pick | person's request |
+| Display pacing | with the gameplay step on its worker thread, each display frame waits for the step in flight, at most 66.7 ms (`PLAY_STEP_WAIT_MS`), so a frame shows a new state instead of the last one again | Studio 0.746 `SurfaceController::RenderJob::stepDataModelJob` (0x1013f2bc4) fires renderStep under the DataModel's write lock and hands that state to the render thread; the bound is estimated |
 
 ## Character (Play)
 
@@ -2972,6 +2973,7 @@ Studio is `checks/humanoid-physics/RESULTS.md` (probes T1 to T19 from in a hidde
 | World step | 240 Hz for every body (`mech::PHYSICS_HZ`), at most 16 a frame | Studio's world step |
 | State machine, forces | `crates/rustudio-physics/src/humanoid.rs`: Running (hip-height spring on the floor rays, horizontal PD with the friction limit, yaw servo, balance torque P 5000 / D 100), Jumping, Freefall, Landed, Climbing, Swimming, Seated, PlatformStanding, FallingDown, GettingUp, Ragdoll, Dead | Studio and the state classes' force functions (SPEC §2) |
 | Timestep level | a Running character at WalkSpeed 8 to 16 is solved on every 2nd tick over 2h and is out of the solver in between; a drop of level is immediate, a rise waits 60 ticks | Studio; probes T1, T3, T10 |
+| Drawn pose between solves | after a frame's world steps, a body solved over L ticks (level 2 or 4) is drawn, and its CFrame published, k/L of the way from where its last solve began to where it ended (k = world ticks since; linear position, slerped rotation); the world steps on from the solve's end; a body moved since (teleport, CFrame write) is shown where it is | Studio 0.746 `World::interpolateAfterPhysics` (0x10030a31c) → `Body::interpolatePvOnBody` → `SolverRigidBody::interpolateWithTimestepId` (0x1073633b6, fraction `(timestepId mod L) / L`), DFFlagSimAdaptiveUseLinearInterpolation2 = true (Roblox's published PCDesktopClient settings). Without it a body moves only on its solve ticks: on a 144 Hz display (1.67 ticks a frame) a level-2 body skips frames and a level-4 one is drawn up to a solve ahead (test `adaptive_body_is_drawn_between_its_solves`) |
 | Jump | the take-off speed 1.06 × JumpPower in one step; the push repeats while the root part's own velocity is short of it (a spinning assembly: until the floor rays lose the floor) and never starts under a ceiling (rays 1.5 × root height + Head height up from the root) | Studio; probes T4, T19; tools/fidelity movement-Place B jump_run |
 | Mass | parts weigh their physics geometry (the Head its mesh hull); the assembly's centre and inertia are those of the joints' own pose, whatever the animation does | Studio; measured (AssemblyCenterOfMass constant under animation) |
 | AssemblyLinearVelocity | the centre of mass's velocity | measured (53.0114 against the root part's 52.9998) |
