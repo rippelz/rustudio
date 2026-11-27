@@ -22,6 +22,7 @@ fn divider(ui: &mut egui::Ui) {
 
 /// Studio's ribbon button: a 24-px icon over an 11-px label.
 pub fn ribbon_button(ui: &mut egui::Ui, icon: &str, label: &str, active: bool, enabled: bool) -> egui::Response {
+    let label = crate::luau_panic::zh(label);
     let font = egui::FontId::proportional(11.5);
     let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.into(), font.clone(), theme::TEXT).size().x);
     let w = (tw + 10.0).max(48.0);
@@ -154,7 +155,7 @@ impl Editor {
                 ui.painter().rect_filled(r, 4.0, bg);
                 let col = if active { theme::TEXT } else { theme::TEXT.gamma_multiply(0.75) };
                 let font = egui::FontId::proportional(13.0);
-                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, t.label(), font, col);
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, crate::luau_panic::zh(t.label()), font, col);
                 self.ui_rects.insert(tab_rect_key(t), r);
                 if resp.clicked() {
                     self.ui.tab = t;
@@ -416,6 +417,7 @@ impl Editor {
         active: bool,
         enabled: bool,
     ) -> egui::Response {
+        let label = crate::luau_panic::zh(label);
         let font = egui::FontId::proportional(11.5);
         let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.into(), font.clone(), theme::TEXT).size().x);
         let w = (tw + 10.0).max(48.0);

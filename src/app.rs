@@ -353,6 +353,7 @@ pub struct RustudioApp {
     egui_ctx: Option<egui::Context>,
     last_hidden_tick: Instant,
     pub dock: DockState<Tab>,
+    luau_panic: crate::luau_panic::LuauPanic,
     pub ed: Editor,
     /// Keeps the dock, window and view settings (src/layout_store.rs).
     layout: Option<crate::layout_store::Saver>,
@@ -645,6 +646,7 @@ impl RustudioApp {
             egui_ctx: None,
             last_hidden_tick: Instant::now(),
             dock,
+            luau_panic: Default::default(),
             ed,
             layout,
             panels,
@@ -1900,7 +1902,7 @@ impl TabViewer for Viewer<'_> {
             },
             Tab::Properties => crate::properties::panel_title(self.ed).into(),
             Tab::Plugin(n) => self.ed.plugin_widget_title(*n).into(),
-            other => other.title().into(),
+            other => crate::luau_panic::zh(other.title()).into(),
         }
     }
 
@@ -2584,6 +2586,8 @@ impl RustudioApp {
             }
         }
 
+        let errors = self.ed.scripts.bufs.values().filter(|b| b.error.is_some()).count();
+        self.luau_panic.update(&mut self.dock, errors);
         let _dock_scope = rustudio_core::bench::scope("dock_panels");
         let windows: Vec<(String, String)> = self.panels.popped.iter().map(|w| (w.key.clone(), w.title())).collect();
         let mut dock_rect = egui::Rect::NOTHING;

@@ -22,6 +22,7 @@ pub fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool, 
 }
 
 pub(crate) fn menu_item_at(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool, checked: Option<bool>, col: f32, w: f32) -> egui::Response {
+    let label = crate::luau_panic::zh(label);
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 22.0), sense);
     let p = ui.painter();
@@ -63,7 +64,7 @@ fn menu_metrics(ui: &egui::Ui, items: &[M]) -> (f32, f32) {
 
 /// A submenu title, indented like the items beside it (their check column).
 fn sub_label(label: &str) -> egui::RichText {
-    RichText::new(format!("\u{2007}\u{2007}\u{2007}{label}")).size(13.0)
+    RichText::new(format!("\u{2007}\u{2007}\u{2007}{}", crate::luau_panic::zh(label))).size(13.0)
 }
 
 impl Editor {
@@ -885,7 +886,7 @@ impl Editor {
         let mut chosen: Option<String> = None;
         egui::MenuBar::new().ui(ui, |ui| {
             for (title, items) in MENUS {
-                let r = ui.menu_button(*title, |ui| {
+                let r = ui.menu_button(crate::luau_panic::zh(title), |ui| {
                     self.menu_items(ui, items, &mut chosen);
                     if *title == "Plugins" {
                         // One submenu per plugin toolbar (src/plugin_host/ui_ribbon.rs).
