@@ -519,7 +519,7 @@ impl Editor {
             e.on_hover_text("Toggle UI Visibility (ShowDevelopmentGui)")
         });
         // The "+" just right of the name while the row is hovered (Studio's quick insert).
-        let label = if name.is_empty() { format!("({class})") } else { name.clone() };
+        let label = if name.is_empty() { format!("({})", crate::luau_panic::zh(&class)) } else { crate::luau_panic::zh(&name).to_string() };
         let name_w = ui.fonts_mut(|f| f.layout_no_wrap(label, egui::FontId::proportional(13.0), theme::TEXT).size().x);
         let right_pad = if is_starter_gui { 28.0 } else { 10.0 };
         let plus_x = (text_pos.x + name_w + 6.0 + 8.0).min(rect.max.x - right_pad);
@@ -565,7 +565,7 @@ impl Editor {
             } else {
                 theme::TEXT
             };
-            let (label, col) = if name.is_empty() { (format!("({class})"), theme::TEXT_DIM) } else { (name.clone(), color) };
+            let (label, col) = if name.is_empty() { (format!("({})", crate::luau_panic::zh(&class)), theme::TEXT_DIM) } else { (crate::luau_panic::zh(&name).to_string(), color) };
             painter.text(text_pos, egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), col);
         }
 
