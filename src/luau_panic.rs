@@ -1,6 +1,9 @@
 //! Luau Panic Mode: with more than one open script failing to parse, the
-//! dock layout is shuffled and the editor's labels switch to Mandarin. Fixing
-//! the scripts back down to one error puts the layout and English back.
+//! dock layout is shuffled, the window is drawn mirrored
+//! (vendor/egui/src/mirror.rs) and the editor's text switches to Mandarin, through
+//! egui's text hook (vendor/egui/src/text_filter.rs: every label, button and
+//! painted text, not code or logs). Fixing the scripts back down to one error
+//! puts the layout and English back.
 //! (Not a Studio behaviour: requested in the project Discord.)
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +17,7 @@ const ERROR_LIMIT: usize = 1;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Whether the panic is on (labels read through [`zh`]).
+/// Whether the panic is on.
 pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
@@ -28,11 +31,13 @@ pub struct LuauPanic {
 impl LuauPanic {
     /// Starts or ends the panic from this frame's error count.
     pub fn update(&mut self, dock: &mut DockState<Tab>, errors: usize) {
+        egui::text_filter::set(translate);
         match (errors > ERROR_LIMIT, self.saved.is_some()) {
             (true, false) => {
                 self.saved = Some(dock.clone());
                 *dock = shuffled(dock);
                 ACTIVE.store(true, Ordering::Relaxed);
+                egui::mirror::set(true);
             }
             (false, true) => {
                 let mut restored = self.saved.take().unwrap();
@@ -46,9 +51,26 @@ impl LuauPanic {
                 }
                 *dock = restored;
                 ACTIVE.store(false, Ordering::Relaxed);
+                egui::mirror::set(false);
             }
             _ => {}
         }
+    }
+}
+
+/// The pointer's position mirrored like the window, so a click lands on
+/// what is drawn under it.
+pub fn mirror_input(ctx: &egui::Context, raw: &mut egui::RawInput) {
+    if !egui::mirror::is_on() {
+        return;
+    }
+    let screen = ctx.viewport_rect();
+    for event in &mut raw.events {
+        let pos = match event {
+            egui::Event::PointerMoved(pos) | egui::Event::PointerButton { pos, .. } | egui::Event::Touch { pos, .. } => pos,
+            _ => continue,
+        };
+        pos.x = egui::mirror::x(screen, pos.x);
     }
 }
 
@@ -100,13 +122,77 @@ impl Rng {
     }
 }
 
-/// `label` in Mandarin while the panic is on (labels without a translation
-/// stay as they are).
-pub fn zh(label: &str) -> &str {
-    if !active() {
-        return label;
+/// egui's text filter: a known label as a whole, else word by word
+/// (CamelCase split), keeping words without a translation.
+fn translate(text: &str) -> Option<String> {
+    if !active() || !text.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return None;
     }
-    match label {
+    let trimmed = text.trim();
+    if let Some(whole) = zh(trimmed) {
+        return Some(text.replace(trimmed, whole));
+    }
+    let mut out = String::with_capacity(text.len() * 2);
+    let mut changed = false;
+    let mut rest = text;
+    while let Some(start) = rest.find(|c: char| c.is_ascii_alphabetic()) {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let end = rest.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(rest.len());
+        // (letters touching digits are ids and hex, not words)
+        let in_id = out.ends_with(|c: char| c.is_ascii_digit()) || rest[end..].starts_with(|c: char| c.is_ascii_digit());
+        match (!in_id).then(|| word(&rest[..end])).flatten() {
+            Some(t) => {
+                out.push_str(&t);
+                changed = true;
+            }
+            None => out.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    changed.then(|| without_spaces_between_cjk(&out))
+}
+
+/// One word, or its CamelCase parts, in Mandarin.
+fn word(w: &str) -> Option<String> {
+    if let Some(t) = zh(w).or_else(|| zh_word(&w.to_ascii_lowercase())) {
+        return Some(t.to_string());
+    }
+    let starts: Vec<usize> = w.char_indices().filter(|(i, c)| *i == 0 || c.is_ascii_uppercase()).map(|(i, _)| i).collect();
+    if starts.len() < 2 {
+        return None;
+    }
+    let mut out = String::new();
+    let mut changed = false;
+    for (n, &a) in starts.iter().enumerate() {
+        let part = &w[a..starts.get(n + 1).copied().unwrap_or(w.len())];
+        match zh(part).or_else(|| zh_word(&part.to_ascii_lowercase())) {
+            Some(t) => {
+                out.push_str(t);
+                changed = true;
+            }
+            None => out.push_str(part),
+        }
+    }
+    changed.then_some(out)
+}
+
+/// Chinese doesn't put spaces between words.
+fn without_spaces_between_cjk(s: &str) -> String {
+    let cjk = |c: Option<char>| c.is_some_and(|c| c >= '\u{2E80}');
+    let chars: Vec<char> = s.chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .filter(|&(i, &c)| !(c == ' ' && i > 0 && cjk(Some(chars[i - 1])) && cjk(chars.get(i + 1).copied())))
+        .map(|(_, &c)| c)
+        .collect()
+}
+
+/// A whole label (as written) in Mandarin.
+fn zh(label: &str) -> Option<&'static str> {
+    Some(match label {
         // Dock tabs
         "Viewport" => "视口",
         "Explorer" => "资源管理器",
@@ -375,8 +461,492 @@ pub fn zh(label: &str) -> &str {
         "Tower" => "塔",
         "Ramp" => "坡道",
         "PivotOffset" => "枢轴偏移",
-        _ => label,
-    }
+        _ => return None,
+    })
+}
+
+/// A lowercase word in Mandarin.
+fn zh_word(w: &str) -> Option<&'static str> {
+    Some(match w {
+        "a" => "一个",
+        "about" => "关于",
+        "above" => "上方",
+        "accessory" => "配饰",
+        "account" => "账户",
+        "action" => "操作",
+        "actions" => "操作",
+        "active" => "活动",
+        "activity" => "活动",
+        "add" => "添加",
+        "added" => "已添加",
+        "advanced" => "高级",
+        "align" => "对齐",
+        "all" => "全部",
+        "allow" => "允许",
+        "alpha" => "透明",
+        "amount" => "数量",
+        "an" => "一个",
+        "analysis" => "分析",
+        "and" => "和",
+        "angle" => "角度",
+        "angular" => "角",
+        "animation" => "动画",
+        "any" => "任何",
+        "api" => "接口",
+        "apply" => "应用",
+        "are" => "是",
+        "area" => "区域",
+        "as" => "作为",
+        "asset" => "资源",
+        "assets" => "资源",
+        "at" => "在",
+        "attach" => "附加",
+        "attachment" => "附件",
+        "attribute" => "特性",
+        "attributes" => "特性",
+        "audio" => "音频",
+        "auto" => "自动",
+        "automatic" => "自动",
+        "available" => "可用",
+        "avatar" => "头像",
+        "axis" => "轴",
+        "back" => "后",
+        "background" => "背景",
+        "bar" => "栏",
+        "base" => "基础",
+        "baseplate" => "底板",
+        "be" => "是",
+        "been" => "已经",
+        "before" => "之前",
+        "behavior" => "行为",
+        "below" => "下方",
+        "bevel" => "斜面",
+        "black" => "黑色",
+        "blue" => "蓝色",
+        "body" => "身体",
+        "bold" => "粗体",
+        "border" => "边框",
+        "both" => "两者",
+        "bottom" => "底部",
+        "box" => "框",
+        "brick" => "砖块",
+        "bright" => "亮",
+        "brightness" => "亮度",
+        "browse" => "浏览",
+        "browser" => "浏览器",
+        "brush" => "笔刷",
+        "build" => "构建",
+        "button" => "按钮",
+        "by" => "按",
+        "call" => "调用",
+        "camera" => "摄像机",
+        "can" => "可以",
+        "cancel" => "取消",
+        "cast" => "投射",
+        "category" => "类别",
+        "center" => "中心",
+        "change" => "更改",
+        "changes" => "更改",
+        "character" => "角色",
+        "chat" => "聊天",
+        "check" => "检查",
+        "checking" => "正在检查",
+        "child" => "子级",
+        "children" => "子级",
+        "class" => "类",
+        "classes" => "类",
+        "clear" => "清除",
+        "click" => "点击",
+        "client" => "客户端",
+        "clip" => "剪辑",
+        "clock" => "时钟",
+        "close" => "关闭",
+        "cloud" => "云",
+        "code" => "代码",
+        "collaborate" => "协作",
+        "collaborators" => "协作者",
+        "collide" => "碰撞",
+        "collision" => "碰撞",
+        "color" => "颜色",
+        "colors" => "颜色",
+        "command" => "命令",
+        "config" => "配置",
+        "connect" => "连接",
+        "connected" => "已连接",
+        "constraint" => "约束",
+        "constraints" => "约束",
+        "content" => "内容",
+        "context" => "上下文",
+        "contexts" => "上下文",
+        "cookie" => "饼干",
+        "copy" => "复制",
+        "corner" => "角",
+        "create" => "创建",
+        "creator" => "创作者",
+        "current" => "当前",
+        "custom" => "自定义",
+        "cut" => "剪切",
+        "dark" => "深色",
+        "data" => "数据",
+        "database" => "数据库",
+        "default" => "默认",
+        "delete" => "删除",
+        "density" => "密度",
+        "depth" => "深度",
+        "description" => "描述",
+        "detail" => "细节",
+        "diagnostics" => "诊断",
+        "disable" => "禁用",
+        "disabled" => "已禁用",
+        "display" => "显示",
+        "distance" => "距离",
+        "do" => "做",
+        "document" => "文档",
+        "done" => "完成",
+        "down" => "下",
+        "draft" => "草稿",
+        "drafts" => "草稿",
+        "drag" => "拖动",
+        "draw" => "绘制",
+        "duplicate" => "复制",
+        "duration" => "持续时间",
+        "edit" => "编辑",
+        "editor" => "编辑器",
+        "effect" => "效果",
+        "effects" => "效果",
+        "elasticity" => "弹性",
+        "emit" => "发射",
+        "empty" => "空",
+        "enable" => "启用",
+        "enabled" => "已启用",
+        "end" => "结束",
+        "enter" => "输入",
+        "error" => "错误",
+        "errors" => "错误",
+        "event" => "事件",
+        "events" => "事件",
+        "exit" => "退出",
+        "explorer" => "资源管理器",
+        "export" => "导出",
+        "face" => "面",
+        "faces" => "面",
+        "false" => "否",
+        "file" => "文件",
+        "files" => "文件",
+        "fill" => "填充",
+        "filter" => "筛选",
+        "find" => "查找",
+        "first" => "第一",
+        "fit" => "适应",
+        "flat" => "平",
+        "fluid" => "流体",
+        "focus" => "焦点",
+        "fog" => "雾",
+        "folder" => "文件夹",
+        "font" => "字体",
+        "for" => "为",
+        "force" => "力",
+        "forces" => "力",
+        "format" => "格式",
+        "forward" => "向前",
+        "frame" => "框架",
+        "friction" => "摩擦",
+        "from" => "从",
+        "front" => "前",
+        "full" => "完整",
+        "game" => "游戏",
+        "general" => "常规",
+        "generate" => "生成",
+        "generator" => "生成器",
+        "geometric" => "几何",
+        "get" => "获取",
+        "glass" => "玻璃",
+        "global" => "全局",
+        "go" => "前往",
+        "gravity" => "重力",
+        "green" => "绿色",
+        "grid" => "网格",
+        "group" => "组",
+        "groups" => "组",
+        "gui" => "界面",
+        "has" => "有",
+        "have" => "有",
+        "health" => "生命值",
+        "height" => "高度",
+        "help" => "帮助",
+        "hidden" => "隐藏",
+        "hide" => "隐藏",
+        "history" => "历史",
+        "home" => "主页",
+        "horizontal" => "水平",
+        "hover" => "悬停",
+        "icon" => "图标",
+        "id" => "编号",
+        "image" => "图像",
+        "import" => "导入",
+        "in" => "在",
+        "increment" => "增量",
+        "info" => "信息",
+        "input" => "输入",
+        "insert" => "插入",
+        "inspect" => "检查",
+        "instance" => "实例",
+        "instances" => "实例",
+        "into" => "到",
+        "inventory" => "物品",
+        "invite" => "邀请",
+        "is" => "是",
+        "it" => "它",
+        "item" => "项目",
+        "items" => "项目",
+        "join" => "加入",
+        "joint" => "关节",
+        "jump" => "跳跃",
+        "key" => "键",
+        "keyboard" => "键盘",
+        "label" => "标签",
+        "language" => "语言",
+        "last" => "最后",
+        "layer" => "图层",
+        "layout" => "布局",
+        "left" => "左",
+        "length" => "长度",
+        "level" => "级别",
+        "light" => "光",
+        "lighting" => "光照",
+        "line" => "行",
+        "linear" => "线性",
+        "lines" => "行",
+        "link" => "链接",
+        "list" => "列表",
+        "live" => "实时",
+        "load" => "加载",
+        "loaded" => "已加载",
+        "local" => "本地",
+        "localization" => "本地化",
+        "lock" => "锁定",
+        "locked" => "已锁定",
+        "log" => "日志",
+        "look" => "外观",
+        "loop" => "循环",
+        "main" => "主",
+        "manage" => "管理",
+        "manager" => "管理器",
+        "mass" => "质量",
+        "material" => "材质",
+        "materials" => "材质",
+        "max" => "最大",
+        "medium" => "中等",
+        "menu" => "菜单",
+        "mesh" => "网格",
+        "message" => "消息",
+        "messages" => "消息",
+        "min" => "最小",
+        "mode" => "模式",
+        "model" => "模型",
+        "module" => "模块",
+        "more" => "更多",
+        "move" => "移动",
+        "my" => "我的",
+        "name" => "名称",
+        "network" => "网络",
+        "new" => "新建",
+        "next" => "下一个",
+        "no" => "没有",
+        "none" => "无",
+        "normal" => "正常",
+        "not" => "不",
+        "nothing" => "无",
+        "number" => "数字",
+        "object" => "对象",
+        "objects" => "对象",
+        "of" => "的",
+        "off" => "关",
+        "offset" => "偏移",
+        "on" => "开",
+        "only" => "仅",
+        "open" => "打开",
+        "options" => "选项",
+        "or" => "或",
+        "order" => "顺序",
+        "orientation" => "方向",
+        "origin" => "原点",
+        "other" => "其他",
+        "out" => "出",
+        "output" => "输出",
+        "over" => "上",
+        "page" => "页面",
+        "pane" => "窗格",
+        "panel" => "面板",
+        "parent" => "父级",
+        "part" => "零件",
+        "parts" => "零件",
+        "paste" => "粘贴",
+        "path" => "路径",
+        "pause" => "暂停",
+        "performance" => "性能",
+        "permissions" => "权限",
+        "physical" => "物理",
+        "physics" => "物理",
+        "pivot" => "枢轴",
+        "place" => "场景",
+        "plastic" => "塑料",
+        "play" => "开始",
+        "player" => "玩家",
+        "players" => "玩家",
+        "please" => "请",
+        "plugin" => "插件",
+        "plugins" => "插件",
+        "point" => "点",
+        "position" => "位置",
+        "preview" => "预览",
+        "primary" => "主要",
+        "priority" => "优先级",
+        "profiler" => "分析器",
+        "project" => "项目",
+        "properties" => "属性",
+        "property" => "属性",
+        "publish" => "发布",
+        "put" => "放",
+        "quality" => "质量",
+        "query" => "查询",
+        "quick" => "快速",
+        "range" => "范围",
+        "ready" => "就绪",
+        "recent" => "最近",
+        "red" => "红色",
+        "redo" => "重做",
+        "reflectance" => "反射率",
+        "reflection" => "反射",
+        "refresh" => "刷新",
+        "remote" => "远程",
+        "remove" => "移除",
+        "rename" => "重命名",
+        "render" => "渲染",
+        "replicated" => "复制",
+        "reset" => "重置",
+        "resize" => "调整大小",
+        "resizeable" => "可调整",
+        "restore" => "还原",
+        "resume" => "继续",
+        "right" => "右",
+        "root" => "根",
+        "rotate" => "旋转",
+        "rotation" => "旋转",
+        "run" => "运行",
+        "running" => "运行中",
+        "save" => "保存",
+        "scale" => "缩放",
+        "scene" => "场景",
+        "screen" => "屏幕",
+        "script" => "脚本",
+        "scripts" => "脚本",
+        "search" => "搜索",
+        "security" => "安全",
+        "select" => "选择",
+        "selected" => "已选",
+        "selection" => "选择",
+        "server" => "服务器",
+        "service" => "服务",
+        "session" => "会话",
+        "set" => "设置",
+        "settings" => "设置",
+        "setup" => "设置",
+        "shadow" => "阴影",
+        "shadows" => "阴影",
+        "shape" => "形状",
+        "show" => "显示",
+        "side" => "侧",
+        "sign" => "登录",
+        "signed" => "已登录",
+        "size" => "大小",
+        "sky" => "天空",
+        "smooth" => "平滑",
+        "snap" => "吸附",
+        "sound" => "声音",
+        "sounds" => "声音",
+        "source" => "源",
+        "spawn" => "重生",
+        "speed" => "速度",
+        "start" => "开始",
+        "starter" => "初始",
+        "stats" => "统计",
+        "status" => "状态",
+        "step" => "步",
+        "stop" => "停止",
+        "storage" => "存储",
+        "store" => "商店",
+        "studio" => "工作室",
+        "studs" => "螺柱",
+        "style" => "样式",
+        "summary" => "摘要",
+        "surface" => "表面",
+        "switch" => "切换",
+        "sync" => "同步",
+        "system" => "系统",
+        "tab" => "标签页",
+        "table" => "表",
+        "tag" => "标签",
+        "tags" => "标签",
+        "team" => "团队",
+        "terrain" => "地形",
+        "test" => "测试",
+        "text" => "文本",
+        "texture" => "纹理",
+        "the" => "这",
+        "theme" => "主题",
+        "this" => "此",
+        "time" => "时间",
+        "to" => "到",
+        "toggle" => "切换",
+        "tool" => "工具",
+        "toolbox" => "工具箱",
+        "tools" => "工具",
+        "top" => "顶部",
+        "touch" => "触碰",
+        "transform" => "变换",
+        "transparency" => "透明度",
+        "true" => "是",
+        "type" => "类型",
+        "ui" => "界面",
+        "undo" => "撤销",
+        "union" => "联合",
+        "unique" => "唯一",
+        "unlock" => "解锁",
+        "up" => "上",
+        "update" => "更新",
+        "use" => "使用",
+        "user" => "用户",
+        "using" => "使用",
+        "value" => "值",
+        "variant" => "变体",
+        "velocity" => "速度",
+        "version" => "版本",
+        "vertical" => "垂直",
+        "view" => "视图",
+        "viewport" => "视口",
+        "visibility" => "可见性",
+        "visible" => "可见",
+        "voice" => "语音",
+        "volume" => "音量",
+        "walk" => "行走",
+        "watch" => "监视",
+        "weight" => "重量",
+        "weld" => "焊接",
+        "white" => "白色",
+        "width" => "宽度",
+        "window" => "窗口",
+        "with" => "与",
+        "workspace" => "工作区",
+        "world" => "世界",
+        "yellow" => "黄色",
+        "yes" => "是",
+        "yet" => "尚",
+        "you" => "你",
+        "your" => "你的",
+        "zoom" => "缩放",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -393,15 +963,18 @@ mod tests {
         let mut panic = LuauPanic::default();
 
         panic.update(&mut dock, 2);
-        assert!(active());
-        assert_eq!(zh("Explorer"), "资源管理器");
+        assert!(active() && egui::mirror::is_on());
+        assert_eq!(translate("Explorer").as_deref(), Some("资源管理器"));
+        assert_eq!(translate("PivotOffset").as_deref(), Some("枢轴偏移"));
+        assert_eq!(translate("1 selected").as_deref(), Some("1 已选"));
+        assert_eq!(translate("175a9455db8"), None);
         let mut tabs: Vec<_> = dock.iter_all_tabs().map(|(_, t)| format!("{t:?}")).collect();
         tabs.sort();
         assert_eq!(tabs, ["Explorer", "Output", "Properties", "Viewport"]);
 
         panic.update(&mut dock, 1);
-        assert!(!active());
-        assert_eq!(zh("Explorer"), "Explorer");
+        assert!(!active() && !egui::mirror::is_on());
+        assert_eq!(translate("Explorer"), None);
         let after = format!("{:?}", dock.main_surface().iter().map(|n| n.iter_tabs().copied().collect::<Vec<_>>()).collect::<Vec<_>>());
         assert_eq!(before, after);
     }

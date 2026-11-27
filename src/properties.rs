@@ -580,7 +580,6 @@ impl Editor {
     /// its click through the returned flag's second meaning via `plus_hit`.
     fn band(&mut self, p: &mut Painter, name: &str, folded: bool, plus_hit: Option<&mut bool>) -> bool {
         let (r, resp) = p.row(name, CAT_H);
-        let name = crate::luau_panic::zh(name);
         let painter = p.ui.painter();
         painter.rect_filled(r, 0.0, BAND);
         let tri = Rect::from_center_size(Pos2::new(r.min.x + 10.0, r.center().y), Vec2::splat(12.0));
@@ -621,7 +620,6 @@ impl Editor {
     }
 
     fn name_text_styled(p: &mut Painter, r: Rect, depth: f32, name: &str, color: Color32, arrow: Option<bool>, bold: bool) {
-        let name = crate::luau_panic::zh(name);
         // Clipped at the divider, as Studio's name column is.
         let div = r.min.x + (r.width() * DIVIDER).round();
         let clip = if depth < 0.0 { r } else { Rect::from_min_max(r.min, Pos2::new(div - 2.0, r.max.y)) };

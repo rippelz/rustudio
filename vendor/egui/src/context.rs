@@ -1102,7 +1102,7 @@ impl Context {
             })
         })?;
         let shapes = std::mem::take(&mut snapshot.shapes);
-        snapshot.shapes = self.tessellate(shapes, self.pixels_per_point()).into_iter().map(|primitive| {
+        snapshot.shapes = self.tessellate_unmirrored(shapes, self.pixels_per_point()).into_iter().map(|primitive| {
             let shape = match primitive.primitive {
                 epaint::Primitive::Mesh(mesh) => epaint::Shape::mesh(mesh),
                 epaint::Primitive::Callback(callback) => epaint::Shape::Callback(callback),
@@ -2963,6 +2963,16 @@ impl Context {
         // shapes are the same, but just comparing the shapes takes about 50% of the time
         // it takes to tessellate them, so it is not a worth optimization.
 
+        let mut primitives = self.tessellate_unmirrored(shapes, pixels_per_point);
+        if crate::mirror::is_on() {
+            crate::mirror::apply(self.viewport_rect(), &mut primitives);
+        }
+        primitives
+    }
+
+    /// [`Self::tessellate`] without rustudio's mirroring (UI snapshots are
+    /// replayed through `tessellate`, which mirrors them then).
+    fn tessellate_unmirrored(&self, shapes: Vec<ClippedShape>, pixels_per_point: f32) -> Vec<ClippedPrimitive> {
         self.write(|ctx| {
             let tessellation_options = ctx.memory.options.tessellation_options;
             let texture_atlas = if let Some(fonts) = ctx.fonts.as_ref() {

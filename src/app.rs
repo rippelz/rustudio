@@ -1902,7 +1902,7 @@ impl TabViewer for Viewer<'_> {
             },
             Tab::Properties => crate::properties::panel_title(self.ed).into(),
             Tab::Plugin(n) => self.ed.plugin_widget_title(*n).into(),
-            other => crate::luau_panic::zh(other.title()).into(),
+            other => other.title().into(),
         }
     }
 
@@ -2234,6 +2234,7 @@ impl eframe::App for RustudioApp {
                 )
             });
         }
+        crate::luau_panic::mirror_input(ctx, raw);
         if let Some(t) = self.ed.harness.selftest.as_mut() {
             t.inject(raw);
         }

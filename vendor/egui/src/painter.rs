@@ -492,6 +492,7 @@ impl Painter {
         color: crate::Color32,
         wrap_width: f32,
     ) -> Arc<Galley> {
+        let text = crate::text_filter::apply(&text, &font_id.family).unwrap_or(text);
         self.fonts_mut(|f| f.layout(text, font_id, color, wrap_width))
     }
 
@@ -506,7 +507,7 @@ impl Painter {
         font_id: FontId,
         color: crate::Color32,
     ) -> Arc<Galley> {
-        self.fonts_mut(|f| f.layout(text, font_id, color, f32::INFINITY))
+        self.layout(text, font_id, color, f32::INFINITY)
     }
 
     /// Lay out this text layut job in a galley.
@@ -515,7 +516,7 @@ impl Painter {
     #[inline]
     #[must_use]
     pub fn layout_job(&self, layout_job: LayoutJob) -> Arc<Galley> {
-        self.fonts_mut(|f| f.layout_job(layout_job))
+        self.fonts_mut(|f| f.layout_job(crate::text_filter::apply_job(layout_job)))
     }
 
     /// Paint text that has already been laid out in a [`Galley`].
