@@ -94,6 +94,18 @@ pub fn cache_dir() -> PathBuf {
     crate::paths::cache().join("rustudio")
 }
 
+/// `RUSTUDIO_OFFLINE=1` (FORK-PLAN §8.3): serve the disk cache and the
+/// local asset store only — no download is scheduled or attempted, and no
+/// session is waited for. Read on every call so a harness or a test can
+/// toggle it; the launcher sets it before the player starts.
+pub fn offline() -> bool {
+    std::env::var_os("RUSTUDIO_OFFLINE").is_some_and(|v| v == "1")
+}
+
+fn offline_unavailable(id: u64) -> String {
+    format!("offline (RUSTUDIO_OFFLINE=1): asset {id} is not in the cache or the local asset store")
+}
+
 /// An optional local asset store: a folder of `<id>` or `<id>.<ext>` files,
 /// named by `RUSTUDIO_LOCAL_ASSETS`. Off unless that is set. Read only.
 pub fn local_assets_dir() -> Option<PathBuf> {
@@ -790,8 +802,12 @@ pub fn preload_content(id: &str, done: Arc<Mutex<Option<bool>>>) {
 
 /// Waits (up to `max`) for a session check that is still running, so a
 /// download made right at Play start sees the session (LoadAsset in a
-/// server script's first frame).
+/// server script's first frame). Offline never waits: nothing will be
+/// downloaded.
 pub fn wait_for_session(max: std::time::Duration) -> bool {
+    if offline() {
+        return false;
+    }
     let t0 = std::time::Instant::now();
     while CHECKING.load(std::sync::atomic::Ordering::SeqCst) && t0.elapsed() < max {
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -799,11 +815,12 @@ pub fn wait_for_session(max: std::time::Duration) -> bool {
     signed_in()
 }
 
-/// Whether an asset can be had: already on disk, or a session can fetch it.
+/// Whether an asset can be had: already on disk, or a session can fetch it
+/// (never in offline mode: there the cache and the local store are all).
 pub fn reachable(id: u64) -> bool {
     cache_path(AssetRef { id, version: None }).exists()
         || local_asset_path(id).is_some()
-        || session_client().is_some()
+        || (!offline() && session_client().is_some())
 }
 
 /// A public asset's bytes, blocking: the disk cache, the local asset store,
@@ -837,6 +854,16 @@ fn fetch_cached(id: u64, local: bool) -> Result<Arc<Vec<u8>>, String> {
     // the local store only after Roblox's copy (see `local_store_path`).
     if let Some(b) = local.then(|| ledger_path(id).and_then(|p| std::fs::read(p).ok())).flatten() {
         return Ok(Arc::new(b));
+    }
+    if offline() {
+        // The local store is all that is left: no download, no session wait.
+        let bytes = local
+            .then(|| local_store_path(id).and_then(|p| std::fs::read(p).ok()))
+            .flatten();
+        return match bytes {
+            Some(b) => Ok(Arc::new(b)),
+            None => Err(offline_unavailable(id)),
+        };
     }
     let fetched = match refused(id) {
         Some(why) => Err(why),
@@ -1231,6 +1258,13 @@ pub fn public_prefetch(id: u64) -> Fetch {
     result
 }
 fn public_prefetch_inner(id: u64) -> Fetch {
+    if offline() {
+        // No background download is scheduled; cache and local store only.
+        return match fetch_cached(id, true) {
+            Ok(b) => Fetch::Ready(b),
+            Err(e) => Fetch::Unavailable(e),
+        };
+    }
     use std::sync::Mutex;
     static STATES: Mutex<Option<HashMap<u64, Option<Result<(), String>>>>> = Mutex::new(None);
     let a = AssetRef { id, version: None };
@@ -1513,6 +1547,20 @@ impl AssetStore {
         }
         if let Some(why) = self.failed.get(&a) {
             return Fetch::Unavailable(why.clone());
+        }
+        if offline() {
+            // F2: the local store is the only source besides the cache; no
+            // download is scheduled and no session is waited for.
+            if a.version.is_none() {
+                if let Some(bytes) = local_store_path(a.id).and_then(|p| std::fs::read(p).ok()) {
+                    let b = Arc::new(bytes);
+                    self.memory.insert(a, b.clone());
+                    return Fetch::Ready(b);
+                }
+            }
+            let why = offline_unavailable(a.id);
+            self.failed.insert(a, why.clone());
+            return Fetch::Unavailable(why);
         }
         if a.version.is_none() {
             if let Some(why) = refused(a.id) {
@@ -3558,6 +3606,52 @@ mod tests {
         store.scripts_running = false;
         assert!(textures.image(&locals[0], Some(&dir), &mut store, &mut up).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F2: `RUSTUDIO_OFFLINE=1` serves the cache and the local store and
+    /// never schedules a download or waits for a session.
+    #[test]
+    fn offline_mode_serves_cache_and_local_store_only() {
+        let root = std::env::temp_dir().join(format!("rustudio-offline-{}", std::process::id()));
+        let cache = root.join("cache");
+        let store = root.join("store");
+        std::fs::create_dir_all(cache.join("assets")).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        std::env::set_var("RUSTUDIO_CACHE_DIR", &cache);
+        std::env::set_var("RUSTUDIO_LOCAL_ASSETS", &store);
+        std::env::set_var("RUSTUDIO_OFFLINE", "1");
+
+        let id = 987_654_321u64;
+        let plain = AssetRef { id, version: None };
+
+        // Nothing on disk: Unavailable at once, no download attempted.
+        assert!(matches!(public_prefetch(id), Fetch::Unavailable(why) if why.contains("offline")));
+        let mut assets = AssetStore::default();
+        assert!(matches!(assets.fetch(plain), Fetch::Unavailable(why) if why.contains("offline")));
+        assert!(assets.why_not(&format!("rbxassetid://{id}")).is_some_and(|why| why.contains("offline")));
+
+        // The local store serves an unversioned id, through both paths.
+        std::fs::write(store.join(format!("{id}.png")), b"local bytes").unwrap();
+        assert!(matches!(public_prefetch(id), Fetch::Ready(b) if b.as_slice() == b"local bytes"));
+        let mut assets = AssetStore::default();
+        assert!(matches!(assets.fetch(plain), Fetch::Ready(b) if b.as_slice() == b"local bytes"));
+
+        // A versioned id comes from the cache.
+        std::fs::write(cache.join("assets").join(format!("{id}_v3.bin")), b"cached bytes").unwrap();
+        let versioned = AssetRef { id, version: Some(3) };
+        assert!(matches!(assets.fetch(versioned), Fetch::Ready(b) if b.as_slice() == b"cached bytes"));
+
+        // A session check in flight is not waited for.
+        session_checking(true);
+        let start = std::time::Instant::now();
+        assert!(!wait_for_session(std::time::Duration::from_secs(5)));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        session_checking(false);
+
+        std::env::remove_var("RUSTUDIO_OFFLINE");
+        std::env::remove_var("RUSTUDIO_LOCAL_ASSETS");
+        std::env::remove_var("RUSTUDIO_CACHE_DIR");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
