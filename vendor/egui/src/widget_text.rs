@@ -717,8 +717,8 @@ impl WidgetText {
         fallback_font: FontSelection,
         default_valign: Align,
     ) -> Arc<LayoutJob> {
-        match self {
-            Self::Text(text) => Arc::new(LayoutJob::simple_format(
+        let job = match self {
+            Self::Text(text) => LayoutJob::simple_format(
                 text,
                 TextFormat {
                     font_id: FontSelection::Default.resolve(style),
@@ -726,15 +726,16 @@ impl WidgetText {
                     valign: default_valign,
                     ..Default::default()
                 },
-            )),
-            Self::RichText(text) => Arc::new(Arc::unwrap_or_clone(text).into_layout_job(
+            ),
+            Self::RichText(text) => Arc::unwrap_or_clone(text).into_layout_job(
                 style,
                 fallback_font,
                 default_valign,
-            )),
-            Self::LayoutJob(job) => job,
-            Self::Galley(galley) => Arc::clone(&galley.job),
-        }
+            ),
+            Self::LayoutJob(job) => Arc::unwrap_or_clone(job),
+            Self::Galley(galley) => return Arc::clone(&galley.job),
+        };
+        Arc::new(crate::text_filter::apply_job(job))
     }
 
     /// Layout with wrap mode based on the containing [`Ui`].
@@ -787,7 +788,7 @@ impl WidgetText {
                     },
                 );
                 layout_job.wrap = text_wrapping;
-                ctx.fonts_mut(|f| f.layout_job(layout_job))
+                ctx.fonts_mut(|f| f.layout_job(crate::text_filter::apply_job(layout_job)))
             }
             Self::RichText(text) => {
                 let mut layout_job = Arc::unwrap_or_clone(text).into_layout_job(
@@ -796,12 +797,12 @@ impl WidgetText {
                     default_valign,
                 );
                 layout_job.wrap = text_wrapping;
-                ctx.fonts_mut(|f| f.layout_job(layout_job))
+                ctx.fonts_mut(|f| f.layout_job(crate::text_filter::apply_job(layout_job)))
             }
             Self::LayoutJob(job) => {
                 let mut job = Arc::unwrap_or_clone(job);
                 job.wrap = text_wrapping;
-                ctx.fonts_mut(|f| f.layout_job(job))
+                ctx.fonts_mut(|f| f.layout_job(crate::text_filter::apply_job(job)))
             }
             Self::Galley(galley) => galley,
         }

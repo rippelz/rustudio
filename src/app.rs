@@ -364,6 +364,7 @@ pub struct RustudioApp {
     egui_ctx: Option<egui::Context>,
     last_hidden_tick: Instant,
     pub dock: DockState<Tab>,
+    luau_panic: crate::luau_panic::LuauPanic,
     pub ed: Editor,
     /// Keeps the dock, window and view settings (src/layout_store.rs).
     layout: Option<crate::layout_store::Saver>,
@@ -674,6 +675,7 @@ impl RustudioApp {
             egui_ctx: None,
             last_hidden_tick: Instant::now(),
             dock,
+            luau_panic: Default::default(),
             ed,
             layout,
             panels,
@@ -2268,6 +2270,7 @@ impl eframe::App for RustudioApp {
                 )
             });
         }
+        crate::luau_panic::mirror_input(ctx, raw);
         if let Some(t) = self.ed.harness.selftest.as_mut() {
             t.inject(raw);
         }
@@ -2624,6 +2627,8 @@ impl RustudioApp {
             }
         }
 
+        let errors = self.ed.scripts.bufs.values().filter(|b| b.error.is_some()).count();
+        self.luau_panic.update(&mut self.dock, errors);
         let _dock_scope = rustudio_core::bench::scope("dock_panels");
         let windows: Vec<(String, String)> = self.panels.popped.iter().map(|w| (w.key.clone(), w.title())).collect();
         let mut dock_rect = egui::Rect::NOTHING;

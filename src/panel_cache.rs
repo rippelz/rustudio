@@ -63,6 +63,8 @@ struct Geometry {
     clip: Rect,
     enabled: bool,
     focus: Option<Id>,
+    /// (Luau Panic Mode translates the text: a different paint)
+    panic: bool,
 }
 
 struct Fonts {
@@ -115,6 +117,7 @@ impl Editor {
             clip: ui.clip_rect(),
             enabled: ui.is_enabled(),
             focus,
+            panic: crate::luau_panic::active(),
         };
         let editing_text =
             focus.is_some_and(|id| egui::text_edit::TextEditState::load(&ctx, id).is_some());

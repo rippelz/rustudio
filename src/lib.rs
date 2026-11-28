@@ -51,6 +51,7 @@ pub mod engine_tables;
 pub mod icons;
 pub mod live_drafts;
 pub mod live_sync;
+pub mod luau_panic;
 pub mod mcp;
 pub mod file_sync;
 pub mod layout_store;

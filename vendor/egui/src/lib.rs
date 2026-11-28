@@ -392,6 +392,8 @@ mod animation_manager;
 mod atomics;
 pub mod cache;
 pub mod containers;
+pub mod mirror;
+pub mod text_filter;
 mod context;
 mod data;
 pub mod debug_text;
