@@ -199,6 +199,8 @@ const TABLE: &[(&str, &str, Color32)] = &[
     ("PlaneConstraint", "square-rotated", PHYS),
     ("UniversalConstraint", "arrows-cross", PHYS),
     ("RigidConstraint", "lock", PHYS),
+    ("TorsionSpringConstraint", "rotate-clockwise-2", PHYS),
+    ("AnimationConstraint", "bone", PHYS),
     ("BodyVelocity", "arrow-big-right", PHYS),
     ("BodyPosition", "target", PHYS),
     ("BodyGyro", "compass", PHYS),

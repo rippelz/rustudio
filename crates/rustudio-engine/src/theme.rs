@@ -44,6 +44,8 @@ pub fn apply(ctx: &egui::Context) {
     v.hyperlink_color = ACCENT;
     v.window_corner_radius = CornerRadius::same(3);
     v.menu_corner_radius = CornerRadius::same(3);
+    // Studio's menus and tooltips sit flat on the view (no drop shadow).
+    v.popup_shadow = egui::epaint::Shadow::NONE;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, DIVIDER);
     v.widgets.inactive.weak_bg_fill = PANEL_ALT;
     v.widgets.inactive.bg_fill = PANEL_ALT;

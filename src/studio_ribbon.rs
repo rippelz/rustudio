@@ -13,6 +13,37 @@ pub(crate) const DRAGGER_MENU_ID: &str = "dragger_menu";
 /// Model > Constraint drop-down's popup id (the `constraint_menu` action opens it).
 pub(crate) const CONSTRAINT_MENU_ID: &str = "constraint_menu";
 
+/// Model > Constraint's native menu, in Studio's order: two columns,
+/// `(class, label)`. The left column takes the extra entry so the one empty
+/// cell is at the bottom right, where a left-to-right reading ends (Studio's
+/// capture leaves it under Line Force instead). Weld is its own ribbon
+/// button and No Collision is not in Studio's menu.
+/// `rustudio_core::constraint` joins the two selected parts or attachments
+/// with the chosen class.
+const CONSTRAINT_MENU_LEFT: &[(&str, &str)] = &[
+    ("AlignPosition", "Align Position"),
+    ("AlignOrientation", "Align Orientation"),
+    ("AngularVelocity", "Angular Velocity"),
+    ("AnimationConstraint", "Animation Constraint"),
+    ("BallSocketConstraint", "Ball in Socket"),
+    ("CylindricalConstraint", "Cylindrical"),
+    ("HingeConstraint", "Hinge"),
+    ("LinearVelocity", "Linear Velocity"),
+    ("LineForce", "Line Force"),
+    ("VectorForce", "Vector Force"),
+];
+const CONSTRAINT_MENU_RIGHT: &[(&str, &str)] = &[
+    ("PlaneConstraint", "Plane"),
+    ("PrismaticConstraint", "Prismatic"),
+    ("RigidConstraint", "Rigid Constraint"),
+    ("RodConstraint", "Rod"),
+    ("RopeConstraint", "Rope"),
+    ("SpringConstraint", "Spring"),
+    ("Torque", "Torque"),
+    ("TorsionSpringConstraint", "Torsion Spring"),
+    ("UniversalConstraint", "Universal"),
+];
+
 fn divider(ui: &mut egui::Ui) {
     ui.add_space(4.0);
     let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, 46.0), Sense::hover());
@@ -63,6 +94,22 @@ fn ribbon_icon_color(icon: &str) -> Color32 {
         _ => [225, 229, 241],
     };
     Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+}
+
+/// One row of Model > Constraint's native menu: the class's glyph and its
+/// Studio label.
+fn constraint_menu_entry(ui: &mut egui::Ui, entry: Option<(&str, &str)>, act: &mut Option<String>) {
+    let Some((class, label)) = entry else {
+        ui.label("");
+        return;
+    };
+    ui.horizontal(|ui| {
+        crate::icons::class_icon(ui, class, 16.0);
+        if ui.add(egui::Button::selectable(false, label)).clicked() {
+            *act = Some(format!("constraint:{class}"));
+            ui.close();
+        }
+    });
 }
 
 /// A top-row icon button (Play, Pause, Stop, Notifications…).
@@ -549,11 +596,35 @@ impl Editor {
         });
     }
 
-    /// Model > Constraint: Studio 0.748's ConstraintTool dropdown listing all
-    /// mechanical & mover constraints with their Studio PNG icons.
+    /// Model > Constraint: Studio's ConstraintTool dropdown. Without Roblox's
+    /// built-in plugins it lists the same classes natively (one insertion
+    /// between the selected parts); with them, their own Studio PNG icons.
     fn constraint_button(&mut self, ui: &mut egui::Ui, act: &mut Option<String>) {
         let (enabled, active) = self.action_state("constraint");
-        if !self.builtin_tools.plugins_enabled || !enabled {
+        if !self.builtin_tools.plugins_enabled {
+            let resp = self.rb_icon(ui, "link", None, "Constraint", active == Some(true), enabled);
+            self.ui_rects.insert("model.constraint", resp.rect);
+            let arrow = Rect::from_min_size(resp.rect.right_top() + Vec2::new(-13.0, 18.0), Vec2::splat(12.0));
+            rustudio_engine::ti::paint(ui.painter(), arrow, "chevron-down", theme::TEXT_DIM);
+            egui::Popup::menu(&resp)
+                .id(egui::Id::new(CONSTRAINT_MENU_ID))
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    egui::Grid::new("constraint_menu_grid")
+                        .num_columns(4)
+                        .spacing([18.0, 4.0])
+                        .show(ui, |ui| {
+                            let rows = CONSTRAINT_MENU_LEFT.len().max(CONSTRAINT_MENU_RIGHT.len());
+                            for row in 0..rows {
+                                constraint_menu_entry(ui, CONSTRAINT_MENU_LEFT.get(row).copied(), act);
+                                constraint_menu_entry(ui, CONSTRAINT_MENU_RIGHT.get(row).copied(), act);
+                                ui.end_row();
+                            }
+                        });
+                });
+            return;
+        }
+        if !enabled {
             let r = self.rb(ui, "link", "Constraint", "constraint", false, act);
             self.ui_rects.insert("model.constraint", r);
             return;

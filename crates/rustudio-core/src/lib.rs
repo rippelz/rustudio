@@ -55,6 +55,7 @@ pub mod math;
 pub mod mech;
 pub mod mesh;
 pub mod body;
+pub mod constraint;
 pub mod truss;
 pub mod mesh_bvh;
 pub mod project_values;
