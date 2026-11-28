@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
-use glam::Vec3;
+use glam::{Mat3, Vec3};
 use rbx_dom_weak::types::{
     BrickColor, Color3, Color3uint8, ColorSequence, ColorSequenceKeypoint, CustomPhysicalProperties, Enum,
     Font as RbxFont, FontStyle, FontWeight, NumberRange, NumberSequence, NumberSequenceKeypoint, PhysicalProperties,
@@ -232,6 +232,32 @@ fn brick_name(rgb: [u8; 3]) -> Option<String> {
 
 fn mul(a: &Xform, b: &Xform) -> Xform {
     Xform { pos: a.pos + a.rot * b.pos, rot: a.rot * b.rot }
+}
+
+/// The rotation after setting an Attachment's Axis (or SecondaryAxis): the
+/// same rule as the Lua runtime's setter (runtime.rs). Axis becomes the X
+/// axis, the old Y made perpendicular to it (the old Z when parallel);
+/// SecondaryAxis keeps X and takes Y perpendicular to it, ignored when
+/// parallel. Z = X × Y, and a zero vector changes nothing.
+fn attachment_rot_after_axis(rot: Mat3, v: Vec3, secondary: bool) -> Mat3 {
+    let (x0, y0, z0) = (rot.x_axis, rot.y_axis, rot.z_axis);
+    if v.length_squared() < 1e-12 {
+        rot
+    } else if secondary {
+        let y = v - x0 * v.dot(x0);
+        if y.length_squared() < 1e-10 {
+            rot
+        } else {
+            let y = y.normalize();
+            Mat3::from_cols(x0, y, x0.cross(y))
+        }
+    } else {
+        let x = v.normalize();
+        let y = y0 - x * y0.dot(x);
+        let y = if y.length_squared() < 1e-10 { z0.cross(x) } else { y };
+        let y = y.normalize();
+        Mat3::from_cols(x, y, x.cross(y))
+    }
 }
 
 fn cf_of(v: Option<Variant>) -> Option<Xform> {
@@ -822,6 +848,29 @@ impl Editor {
                     read(if class == "Sound" { "SoundId" } else { "Asset" })
                 };
                 Some(Variant::Content(rbx_dom_weak::types::Content::from(uri)))
+            }
+            // An Attachment's axes come from its CFrame: Axis is the local X
+            // axis, SecondaryAxis the local Y. The World forms apply the
+            // parent part's frame (and any Bones above it). Nothing stores
+            // them as separate properties, so reading them from the document
+            // would show zero.
+            "Axis" | "SecondaryAxis" | "WorldAxis" | "WorldSecondaryAxis" if doc::is_a(class, "Attachment") => {
+                let doc = &self.game.doc;
+                let world = name.starts_with("World");
+                let xf = if world {
+                    rustudio_core::attachment::world(doc, r, false)?
+                } else {
+                    rustudio_core::attachment::local(doc, r, false)
+                };
+                let axis = if name.ends_with("SecondaryAxis") { xf.rot.y_axis } else { xf.rot.x_axis };
+                Some(Variant::Vector3(rustudio_core::math::rv3(axis)))
+            }
+            // WorldCFrame is computed from the attachment's CFrame and its
+            // parent part, so it moves with the part and is never a stored
+            // property. (The row itself is a Position / Orientation frame;
+            // this covers reads outside the row, such as multi-selection.)
+            "WorldCFrame" if doc::is_a(class, "Attachment") => {
+                rustudio_core::attachment::world(&self.game.doc, r, false).map(|xf| Variant::CFrame(xf.to_cframe()))
             }
             _ if matches!(class, "Sound" | "AudioPlayer") && self.live_sound_prop(r, name).is_some() => {
                 self.live_sound_prop(r, name)
@@ -1930,6 +1979,9 @@ impl Editor {
                 };
                 cf_of(self.game.doc.prop(pp, "CFrame"))
             }),
+            // An Attachment's CFrame defaults to identity, as Roblox's does.
+            Frame::AttachmentCFrame => Some(cf_of(self.game.doc.prop(r, "CFrame")).unwrap_or(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY })),
+            Frame::AttachmentWorldCFrame => rustudio_core::attachment::world(&self.game.doc, r, false),
         }
     }
 
@@ -2159,6 +2211,21 @@ impl Editor {
                     }
                     self.game.doc.set_props(&format!("Set {name}"), changes, None);
                 }
+                // An Attachment's axes are not stored: setting one turns the
+                // attachment's CFrame (attachment_axis_change).
+                Edit::Prop(name, Variant::Vector3(v))
+                    if matches!(name.as_str(), "Axis" | "SecondaryAxis" | "WorldAxis" | "WorldSecondaryAxis")
+                        && self.game.doc.class_of(first).is_some_and(|c| doc::is_a(&c, "Attachment")) =>
+                {
+                    let v = rustudio_core::math::v3(v);
+                    let changes: Vec<_> = sel
+                        .iter()
+                        .filter_map(|&r| self.attachment_axis_change(r, &name, v))
+                        .collect();
+                    if !changes.is_empty() {
+                        self.game.doc.set_props(&format!("Set {name}"), changes, None);
+                    }
+                }
                 Edit::Prop(name, v) => {
                     let targets: Vec<Ref> = sel
                         .iter()
@@ -2169,6 +2236,29 @@ impl Editor {
                     self.game.doc.set_props(&format!("Set {name}"), changes, Some(format!("prop:{name}:{targets:?}")));
                 }
                 Edit::SubProp(name, sub) => {
+                    // A per-component edit (X / Y / Z under the row) of an
+                    // Attachment axis turns the CFrame too, not a stored prop.
+                    let attachment_axis = matches!(name.as_str(), "Axis" | "SecondaryAxis" | "WorldAxis" | "WorldSecondaryAxis")
+                        && self.game.doc.class_of(first).is_some_and(|c| doc::is_a(&c, "Attachment"));
+                    if attachment_axis {
+                        let changes: Vec<_> = sel
+                            .iter()
+                            .filter_map(|&r| {
+                                let c = self.game.doc.class_of(r)?;
+                                if !doc::is_a(&c, "Attachment") {
+                                    return None;
+                                }
+                                let Variant::Vector3(nv) = self.prop_value(r, &c, &name).and_then(|old| sub.apply(&old))? else {
+                                    return None;
+                                };
+                                self.attachment_axis_change(r, &name, rustudio_core::math::v3(nv))
+                            })
+                            .collect();
+                        if !changes.is_empty() {
+                            self.game.doc.set_props(&format!("Set {name}"), changes, None);
+                        }
+                        continue;
+                    }
                     let mut changes = Vec::new();
                     for &r in sel {
                         let Some(c) = self.game.doc.class_of(r).map(|s| s.to_string()) else { continue };
@@ -2245,7 +2335,35 @@ impl Editor {
                 changes.push((r, ustr("WorldPivotData"), Variant::OptionalCFrame(Some(new.to_cframe()))));
                 self.game.doc.set_props("Set Origin", changes, None);
             }
+            Frame::AttachmentCFrame => self.game.doc.set_props("Set CFrame", vec![(r, ustr("CFrame"), cf(&new))], None),
+            Frame::AttachmentWorldCFrame => {
+                // WorldCFrame is the parent part's frame (with the Bones above
+                // it) × the stored local CFrame; write the local part.
+                let parent = rustudio_core::attachment::parent(&self.game.doc, r, true)
+                    .unwrap_or(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY });
+                let local = mul(&parent.inverse(), &new);
+                self.game.doc.set_props("Set WorldCFrame", vec![(r, ustr("CFrame"), cf(&local))], None);
+            }
         }
+    }
+
+    /// The `CFrame` change that sets `Attachment.Axis` / `SecondaryAxis` (or
+    /// their World versions), the same rule as the Lua runtime's setter
+    /// (crates/rustudio-engine/src/runtime.rs): Axis becomes the X axis and
+    /// the old Y is made perpendicular to it (Z = X × Y); SecondaryAxis
+    /// keeps X and takes Y perpendicular to it. A zero vector changes
+    /// nothing.
+    fn attachment_axis_change(&self, r: Ref, name: &str, v: Vec3) -> Option<(Ref, rbx_dom_weak::Ustr, Variant)> {
+        let doc = &self.game.doc;
+        if !doc.class_of(r).is_some_and(|c| doc::is_a(&c, "Attachment")) {
+            return None;
+        }
+        let local_cf = cf_of(doc.prop(r, "CFrame")).unwrap_or(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY });
+        let parent = rustudio_core::attachment::parent(doc, r, true)
+            .unwrap_or(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY });
+        let v = if name.starts_with("World") { parent.rot.transpose() * v } else { v };
+        let rot = attachment_rot_after_axis(local_cf.rot, v, name.ends_with("SecondaryAxis"));
+        Some((r, ustr("CFrame"), Variant::CFrame(Xform { pos: local_cf.pos, rot }.to_cframe())))
     }
 }
 
@@ -2668,6 +2786,52 @@ fn parse_like(old: &Variant, raw: &str) -> Option<Variant> {
 
 #[cfg(test)]
 mod tests {
+    /// Attachment Axis / SecondaryAxis edits turn the frame the same way the
+    /// Lua runtime does (runtime.rs): Axis = new X, Y kept perpendicular; a
+    /// SecondaryAxis parallel to X is ignored; Z = X × Y.
+    #[test]
+    fn attachment_axis_edits_turn_the_frame() {
+        use glam::{Mat3, Vec3};
+        let id = Mat3::IDENTITY;
+        let x = Vec3::X;
+        let y = Vec3::Y;
+
+        // Axis to +Y: X = +Y, the old Y is parallel so Z (0,0,1) × X gives
+        // the new Y = (-1, 0, 0), and Z = X × Y = (0, 0, 1).
+        let r = super::attachment_rot_after_axis(id, y, false);
+        assert!((r.x_axis - y).length() < 1e-5);
+        assert!((r.y_axis - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-5);
+        assert!((r.z_axis - Vec3::new(0.0, 0.0, 1.0)).length() < 1e-5);
+
+        // Axis (-1, 0, 0): X flips, Y stays +Y, Z flips (still right-handed).
+        let r = super::attachment_rot_after_axis(id, -x, false);
+        assert!((r.x_axis + x).length() < 1e-5);
+        assert!((r.y_axis - y).length() < 1e-5);
+        assert!((r.z_axis + Vec3::Z).length() < 1e-5);
+
+        // SecondaryAxis (-1, 0, 0) is parallel to X: no change.
+        let r = super::attachment_rot_after_axis(id, -x, true);
+        assert!((r.x_axis - x).length() < 1e-5);
+        assert!((r.y_axis - y).length() < 1e-5);
+
+        // SecondaryAxis (0, 0, 1): Y becomes +Z, Z = X × Y = -Y.
+        let r = super::attachment_rot_after_axis(id, Vec3::Z, true);
+        assert!((r.y_axis - Vec3::Z).length() < 1e-5);
+        assert!((r.z_axis + y).length() < 1e-5);
+
+        // A zero vector changes nothing.
+        assert_eq!(super::attachment_rot_after_axis(id, Vec3::ZERO, false), id);
+        assert_eq!(super::attachment_rot_after_axis(id, Vec3::ZERO, true), id);
+
+        // A rotated starting frame: the new X is the vector, Y perpendicular.
+        let start = Mat3::from_rotation_y(0.7);
+        let v = Vec3::new(0.3, 1.0, -0.2).normalize();
+        let r = super::attachment_rot_after_axis(start, v, false);
+        assert!((r.x_axis - v).length() < 1e-5);
+        assert!(r.y_axis.dot(v).abs() < 1e-5);
+        assert!((r.x_axis.cross(r.y_axis) - r.z_axis).length() < 1e-5);
+    }
+
     #[test]
     fn single_number_fills_vector() {
         assert_eq!(super::parse_nums("0", 3), Some(vec![0.0; 3]));

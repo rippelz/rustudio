@@ -42,6 +42,10 @@ pub struct GizmoDrag {
     turned: f32,
     center_px: Pos2,
     parts: Vec<(Ref, Xform, Vec3)>,
+    /// Selected Attachments the drag turns too: (ref, world frame at the
+    /// press, its parent's frame) — the parent turns a dragged world frame
+    /// back into the attachment's local CFrame.
+    attachments: Vec<(Ref, Xform, Xform)>,
     /// The applied amount (studs or degrees) for the status readout.
     pub amount: f32,
     /// Collisions: the last amount that didn't overlap anything
@@ -115,6 +119,15 @@ pub(crate) struct MarqueeCentres {
 pub(crate) struct HoverPick {
     key: Option<HoverKey>,
     hit: Option<Ref>,
+}
+
+/// Visible Attachments (`Attachment.Visible`) under Workspace, cached by
+/// document revision: each draws its green sphere every frame, but the walk
+/// that finds them runs only when the document changes.
+#[derive(Default)]
+pub(crate) struct VisibleAttachments {
+    key: Option<(u64, u64)>,
+    refs: Vec<Ref>,
 }
 
 #[derive(PartialEq)]
@@ -252,10 +265,39 @@ impl Editor {
         target
     }
 
+    /// The selected Attachment instances. Bones are the Animation Editor's,
+    /// not the viewport tool's.
+    pub(crate) fn selected_attachments(&self) -> Vec<Ref> {
+        let doc = &self.game.doc;
+        let mut out = Vec::new();
+        for &r in &doc.selection {
+            if doc.class_of(r).is_some_and(|c| c == "Attachment") && !out.contains(&r) {
+                out.push(r);
+            }
+        }
+        out
+    }
+
     fn gizmo_frame(&self) -> Option<(Vec3, Mat3, Vec3)> {
         let parts = self.selected_parts();
         if parts.is_empty() {
-            return None;
+            // Only Attachments: the gizmo sits at their world position (the
+            // first one's frame in Local space); they have no size, so the
+            // handles start at the attachment itself.
+            let frames: Vec<Xform> = self
+                .selected_attachments()
+                .iter()
+                .filter_map(|&r| rustudio_core::attachment::world(&self.game.doc, r, true))
+                .collect();
+            let first = *frames.first()?;
+            let mut lo = Vec3::splat(f32::INFINITY);
+            let mut hi = Vec3::splat(f32::NEG_INFINITY);
+            for xf in &frames {
+                lo = lo.min(xf.pos);
+                hi = hi.max(xf.pos);
+            }
+            let rot = if self.game.local_space { first.rot } else { Mat3::IDENTITY };
+            return Some(((lo + hi) * 0.5, rot, Vec3::ZERO));
         }
         if self.game.doc.selection.len() == 1 {
             if let Some(pivot) = crate::part_drag::editor_model_pivot(&self.game.doc, self.game.doc.selection[0]) {
@@ -286,6 +328,11 @@ impl Editor {
     fn handles_for_tool(&self, rect: Rect, tool: Tool) -> Vec<(Handle, Vec<Pos2>)> {
         let mut out = Vec::new();
         if matches!(tool, Tool::Select | Tool::None) {
+            return out;
+        }
+        // Attachments have no size: only Move and Rotate have handles for
+        // an attachment-only selection.
+        if tool == Tool::Scale && self.selected_parts().is_empty() {
             return out;
         }
         let Some((origin, axes, half)) = self.gizmo_frame() else {
@@ -364,6 +411,32 @@ impl Editor {
             .into_iter()
             .filter_map(|r| self.game.scene.get(r).map(|sp| (r, sp.xf, sp.size)))
             .collect();
+        // Directly selected Attachments move and turn too. One under a part
+        // that is moving with the selection is left alone: its parent
+        // carries it.
+        let part_refs: rustc_hash::FxHashSet<Ref> = parts.iter().map(|(r, _, _)| *r).collect();
+        let attachments: Vec<(Ref, Xform, Xform)> = self
+            .selected_attachments()
+            .into_iter()
+            .filter(|&r| {
+                let doc = &self.game.doc;
+                let mut cur = doc.dom.get_by_ref(r).map(|i| i.parent());
+                while let Some(parent) = cur.filter(|p| p.is_some()) {
+                    if part_refs.contains(&parent) {
+                        return false;
+                    }
+                    cur = doc.dom.get_by_ref(parent).map(|i| i.parent());
+                }
+                true
+            })
+            .filter_map(|r| {
+                let doc = &self.game.doc;
+                let world = rustudio_core::attachment::world(doc, r, true)?;
+                let parent = rustudio_core::attachment::parent(doc, r, true)
+                    .unwrap_or(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY });
+                Some((r, world, parent))
+            })
+            .collect();
         let ray = self.game.cam.ray(rect, p);
         let dir = axes.col(handle.axis) * handle.sign;
         let start_param = ray.closest_on_line(origin, dir).unwrap_or(0.0);
@@ -381,6 +454,7 @@ impl Editor {
             turned: 0.0,
             center_px,
             parts,
+            attachments,
             amount: 0.0,
             last_good: 0.0,
         });
@@ -448,11 +522,24 @@ impl Editor {
                     .set_prop_live(r, ustr("Size"), Variant::Vector3(rustudio_core::math::rv3(size)));
             }
         }
+        // Attachments use the same amount; their world frame turns back into
+        // the local CFrame the parent's frame wants.
+        for (r, world) in gizmo_attachment_updates(&drag, dir, amount) {
+            let Some((_, _, parent)) = drag.attachments.iter().find(|(ar, _, _)| *ar == r) else {
+                continue;
+            };
+            let inv = parent.inverse();
+            let local = Xform { pos: inv.apply(world.pos), rot: inv.rot * world.rot };
+            self.game.doc.set_prop_live(r, ustr("CFrame"), Variant::CFrame(local.to_cframe()));
+        }
     }
 
     pub(crate) fn duplicate_handle_drag(&mut self, map: &std::collections::HashMap<Ref, Ref>) {
         let Some(d) = self.drag.as_mut() else { return };
         d.parts.retain_mut(|(r, _, _)| {
+            if let Some(copy) = map.get(r) { *r = *copy; true } else { false }
+        });
+        d.attachments.retain_mut(|(r, _, _)| {
             if let Some(copy) = map.get(r) { *r = *copy; true } else { false }
         });
         d.pivots.retain_mut(|p| { if let Some(copy) = map.get(&p.r) { p.r = *copy; true } else { false } });
@@ -492,6 +579,20 @@ impl Editor {
                         new_size,
                     ));
                 }
+            }
+        }
+        // The Attachments the drag moved: their local CFrame before and now.
+        for (r, world, parent) in &drag.attachments {
+            let inv = parent.inverse();
+            let old_local = Xform { pos: inv.apply(world.pos), rot: inv.rot * world.rot };
+            if let Some(new_cf) = self
+                .game
+                .doc
+                .dom
+                .get_by_ref(*r)
+                .and_then(|i| i.properties.get(&ustr("CFrame")).cloned())
+            {
+                changes.push((*r, ustr("CFrame"), Some(Variant::CFrame(old_local.to_cframe())), new_cf));
             }
         }
         let label = match drag.handle.tool {
@@ -1318,6 +1419,53 @@ impl Editor {
             Stroke::new(crate::studio_settings::selection_outline_px(), crate::studio_settings::color("Studio", "Select Color", theme::SELECT)), true);
     }
 
+    /// Appends the attachment visuals to the frame's 3D adorn list: Studio's
+    /// selection widget (a green sphere with the yellow `Axis` and orange
+    /// `SecondaryAxis` arrows) for every selected Attachment, and the green
+    /// sphere alone for `Visible` ones, which Studio draws whether selected
+    /// or not. Bones are left to the Animation Editor's own visualization.
+    pub(crate) fn collect_attachment_gizmos(&mut self) {
+        let _p = rustudio_core::bench::scope("vp_attachment_gizmos");
+        let draws: Vec<_> = {
+            let doc = &self.game.doc;
+            let key = (doc.id, doc.journal_end());
+            if self.visible_attachments.key != Some(key) {
+                let mut refs = Vec::new();
+                if let Some(ws) = doc.workspace() {
+                    for inst in doc.dom.descendants_of(ws) {
+                        if inst.class == "Attachment"
+                            && matches!(doc.prop(inst.referent(), "Visible"), Some(Variant::Bool(true)))
+                        {
+                            refs.push(inst.referent());
+                        }
+                    }
+                }
+                self.visible_attachments = VisibleAttachments { key: Some(key), refs };
+            }
+            let mut draws = Vec::new();
+            let mut selected: Vec<Ref> = Vec::new();
+            for &r in &doc.selection {
+                if !doc.class_of(r).is_some_and(|c| c == "Attachment") || selected.contains(&r) {
+                    continue;
+                }
+                selected.push(r);
+                if let Some(xf) = rustudio_core::attachment::world(doc, r, true) {
+                    draws.extend(rustudio_render::adorn::attachment_gizmo_draws(xf));
+                }
+            }
+            for &r in &self.visible_attachments.refs {
+                if selected.contains(&r) {
+                    continue;
+                }
+                if let Some(xf) = rustudio_core::attachment::world(doc, r, true) {
+                    draws.push(rustudio_render::adorn::attachment_sphere_draw(xf));
+                }
+            }
+            draws
+        };
+        self.game.extra_adorn.extend(draws);
+    }
+
     /// Releasing the box keeps what it held (with Shift / Ctrl, added to
     /// the selection it started from).
     fn marquee_select(&mut self, rect: Rect, area: Rect) {
@@ -1390,6 +1538,24 @@ impl Editor {
                 _ => {
                     order.push(t);
                     centres.insert(t, Err((lo, hi)));
+                }
+            }
+        }
+        // Studio's beginBoxSelect also lists visible Attachments, each by its
+        // WorldPosition (docs/MECHANICS.md, Round 17). Bones are Attachment
+        // subclasses but belong to the Animation Editor, not box selection.
+        if let Some(ws) = self.game.doc.workspace() {
+            for inst in self.game.doc.dom.descendants_of(ws) {
+                if inst.class != "Attachment" {
+                    continue;
+                }
+                let r = inst.referent();
+                if !matches!(self.game.doc.prop(r, "Visible"), Some(Variant::Bool(true))) {
+                    continue;
+                }
+                if let Some(xf) = rustudio_core::attachment::world(&self.game.doc, r, true) {
+                    order.push(r);
+                    centres.insert(r, Ok(xf.pos));
                 }
             }
         }
@@ -1583,6 +1749,31 @@ impl Editor {
 
 /// The parts' new (CFrame, Size) for a handle drag of `d` studs (Move,
 /// Scale) or degrees (Rotate).
+/// The Attachments' world frames after the drag's amount `d`: Move slides
+/// them along `dir`; Rotate turns them about the gizmo's origin and axis,
+/// as `gizmo_updates` does for parts. Scale leaves them alone.
+fn gizmo_attachment_updates(drag: &GizmoDrag, dir: Vec3, d: f32) -> Vec<(Ref, Xform)> {
+    let h = drag.handle;
+    match h.tool {
+        Tool::Move => drag
+            .attachments
+            .iter()
+            .map(|(r, xf, _)| (*r, Xform { pos: xf.pos + dir * d, rot: xf.rot }))
+            .collect(),
+        Tool::Rotate => {
+            let rot = Mat3::from_axis_angle(drag.axes.col(h.axis), d.to_radians());
+            drag.attachments
+                .iter()
+                .map(|(r, xf, _)| {
+                    let world = Xform { pos: drag.origin + rot * (xf.pos - drag.origin), rot: rot * xf.rot };
+                    (*r, world.orthonormalized())
+                })
+                .collect()
+        }
+        Tool::Scale | Tool::Select | Tool::None | Tool::Transform => Vec::new(),
+    }
+}
+
 fn gizmo_updates(drag: &GizmoDrag, dir: Vec3, d: f32, symmetric: bool, uniform: bool) -> Vec<(Ref, Xform, Vec3)> {
     let h = drag.handle;
     let mut updates = Vec::new();
@@ -2591,5 +2782,74 @@ mod outline_tests {
         for s in std::iter::once(&many).chain(&many_extra).chain(std::iter::once(&one)) {
             assert!(s.delta.iter().all(|d| *d == 0), "buffers are left clear");
         }
+    }
+}
+
+#[cfg(test)]
+mod gizmo_tests {
+    use super::*;
+
+    fn drag(handle: Handle, origin: Vec3, axes: Mat3, attachments: Vec<(Ref, Xform, Xform)>) -> GizmoDrag {
+        GizmoDrag {
+            undo_parts: None,
+            undo_pivots: None,
+            pivots: Vec::new(),
+            handle,
+            origin,
+            axes,
+            start_param: 0.0,
+            last_angle: 0.0,
+            turned: 0.0,
+            center_px: Pos2::ZERO,
+            parts: Vec::new(),
+            attachments,
+            amount: 0.0,
+            last_good: 0.0,
+        }
+    }
+
+    /// Move slides an Attachment's world frame along the arrow; Rotate turns
+    /// it about the gizmo's origin and axis; Scale leaves it alone.
+    #[test]
+    fn attachment_drag_moves_and_turns_world_frames() {
+        let r = Ref::none();
+        let parent = Xform { pos: Vec3::new(10.0, 0.0, 0.0), rot: Mat3::from_rotation_z(0.5) };
+        let start = Xform { pos: Vec3::new(1.0, 2.0, 3.0), rot: Mat3::from_rotation_x(0.25) };
+        let axes = Mat3::IDENTITY;
+
+        let move_drag = drag(
+            Handle { tool: Tool::Move, axis: 1, sign: 1.0 },
+            Vec3::ZERO,
+            axes,
+            vec![(r, start, parent)],
+        );
+        let moved = gizmo_attachment_updates(&move_drag, axes.col(1), 2.0);
+        assert_eq!(moved.len(), 1);
+        assert!((moved[0].1.pos - (start.pos + Vec3::Y * 2.0)).length() < 1e-5);
+        for (a, b) in [(moved[0].1.rot.x_axis, start.rot.x_axis), (moved[0].1.rot.y_axis, start.rot.y_axis)] {
+            assert!((a - b).length() < 1e-5);
+        }
+
+        let rotate_drag = drag(
+            Handle { tool: Tool::Rotate, axis: 2, sign: 1.0 },
+            Vec3::ZERO,
+            axes,
+            vec![(r, start, parent)],
+        );
+        let turned = gizmo_attachment_updates(&rotate_drag, Vec3::Z, 90.0);
+        assert_eq!(turned.len(), 1);
+        let want_pos = Vec3::new(-start.pos.y, start.pos.x, start.pos.z);
+        assert!((turned[0].1.pos - want_pos).length() < 1e-4);
+        let want = Mat3::from_axis_angle(Vec3::Z, std::f32::consts::FRAC_PI_2) * start.rot;
+        assert!((turned[0].1.rot.x_axis - want.x_axis).length() < 1e-4);
+        assert!((turned[0].1.rot.y_axis - want.y_axis).length() < 1e-4);
+
+        let scale_drag = drag(
+            Handle { tool: Tool::Scale, axis: 0, sign: 1.0 },
+            Vec3::ZERO,
+            axes,
+            vec![(r, start, parent)],
+        );
+        assert!(gizmo_attachment_updates(&scale_drag, Vec3::X, 1.0).is_empty());
     }
 }

@@ -37,6 +37,30 @@ pub const SPHERE_LAT_SEGS: u32 = 9;
 /// Cylinder and cone radial segments.
 pub const RADIAL_SEGS: u32 = 24;
 
+/// Attachment widget sphere radius in studs. Studio renders an attachment as a
+/// "small green sphere" (`Attachment.Visible` docs); the widget's arrows are
+/// proportional to it.
+pub const ATTACHMENT_SPHERE_RADIUS: f32 = 0.1875;
+/// Attachment widget alpha: slightly see-through so the part behind it
+/// still reads.
+pub const ATTACHMENT_GIZMO_ALPHA: f32 = 0.8;
+/// Attachment widget sphere colour (green, as `Attachment.Visible`).
+pub const ATTACHMENT_SPHERE_COLOR: [f32; 3] = [0.0, 1.0, 0.0];
+/// `Attachment.Axis` arrow: yellow (Roblox's constraint documentation calls
+/// the Axis arrows yellow).
+pub const ATTACHMENT_AXIS_COLOR: [f32; 3] = [1.0, 1.0, 0.0];
+/// `Attachment.SecondaryAxis` arrow: orange (same documentation).
+pub const ATTACHMENT_SECONDARY_COLOR: [f32; 3] = [1.0, 0.5, 0.0];
+/// Arrow proportions in sphere radii, measured from a Studio capture of a
+/// selected attachment: the shaft runs from 2 R behind the sphere to the cone
+/// base at 3.2 R, the cone tip reaches 4.2 R, the shaft is 0.15 R thick and
+/// the cone 0.3 R wide.
+pub const ATTACHMENT_ARROW_TAIL_R: f32 = 2.0;
+pub const ATTACHMENT_ARROW_TIP_R: f32 = 4.2;
+pub const ATTACHMENT_ARROW_HEAD_LEN_R: f32 = 1.0;
+pub const ATTACHMENT_ARROW_SHAFT_RADIUS_R: f32 = 0.15;
+pub const ATTACHMENT_ARROW_HEAD_RADIUS_R: f32 = 0.3;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdornShape {
     Sphere,
@@ -45,7 +69,8 @@ pub enum AdornShape {
 }
 
 /// One 3D adornment mesh instance to draw in world space, depth-tested against
-/// the scene depth buffer (`zIndex = -1`, `alwaysOnTop = false`).
+/// the scene depth buffer (`zIndex = -1`) unless `always_on_top` is set
+/// (`alwaysOnTop = true`), as the attachment widget is.
 #[derive(Clone, Copy, Debug)]
 pub struct AdornDraw {
     pub xf: Xform,
@@ -53,6 +78,8 @@ pub struct AdornDraw {
     pub shape: AdornShape,
     /// Display-space RGB + alpha.
     pub color: [f32; 4],
+    /// Skip the scene-depth test: the object draws over the scene.
+    pub always_on_top: bool,
 }
 
 /// Build an orthonormal basis whose `+X` axis points along unit vector `dir`,
@@ -87,6 +114,7 @@ pub fn collaborator_camera_draws(xf: Xform, color: [f32; 3]) -> [AdornDraw; 3] {
         scale: Vec3::new(shaft_len * 0.5, shaft_len * RAY_CYL_RADIUS_K, shaft_len * RAY_CYL_RADIUS_K),
         shape: AdornShape::Cylinder,
         color: col,
+        always_on_top: false,
     };
 
     let cone_base = xf.apply(origin_local + dir_local * inv_div);
@@ -95,6 +123,7 @@ pub fn collaborator_camera_draws(xf: Xform, color: [f32; 3]) -> [AdornDraw; 3] {
         scale: Vec3::new(shaft_len * RAY_CONE_HEIGHT_K, shaft_len * RAY_CONE_RADIUS_K, shaft_len * RAY_CONE_RADIUS_K),
         shape: AdornShape::Cone,
         color: col,
+        always_on_top: false,
     };
 
     let sphere = AdornDraw {
@@ -102,9 +131,72 @@ pub fn collaborator_camera_draws(xf: Xform, color: [f32; 3]) -> [AdornDraw; 3] {
         scale: Vec3::splat(COLLAB_SPHERE_RADIUS),
         shape: AdornShape::Sphere,
         color: col,
+        always_on_top: false,
     };
 
     [cyl, cone, sphere]
+}
+
+/// A shaft and a cone head for one attachment axis, pointing along `dir`
+/// from `pos`. The shaft passes through the attachment (the widget's arrows
+/// start behind the sphere) and the cone sits at its far end.
+fn attachment_arrow_draws(pos: Vec3, dir: Vec3, color: [f32; 3]) -> [AdornDraw; 2] {
+    let r = ATTACHMENT_SPHERE_RADIUS;
+    let dir = dir.normalize_or_zero();
+    let dir = if dir == Vec3::ZERO { Vec3::X } else { dir };
+    let basis = ray_basis(dir);
+    let col = [color[0], color[1], color[2], ATTACHMENT_GIZMO_ALPHA];
+    let tail = -ATTACHMENT_ARROW_TAIL_R * r;
+    let head_base = (ATTACHMENT_ARROW_TIP_R - ATTACHMENT_ARROW_HEAD_LEN_R) * r;
+    let head_len = ATTACHMENT_ARROW_HEAD_LEN_R * r;
+    let shaft_center = pos + dir * (0.5 * (tail + head_base));
+    let shaft_half = 0.5 * (head_base - tail);
+    let shaft_radius = ATTACHMENT_ARROW_SHAFT_RADIUS_R * r;
+    let head_radius = ATTACHMENT_ARROW_HEAD_RADIUS_R * r;
+    [
+        AdornDraw {
+            xf: Xform { pos: shaft_center, rot: basis },
+            scale: Vec3::new(shaft_half, shaft_radius, shaft_radius),
+            shape: AdornShape::Cylinder,
+            color: col,
+            always_on_top: true,
+        },
+        AdornDraw {
+            xf: Xform { pos: pos + dir * head_base, rot: basis },
+            scale: Vec3::new(head_len, head_radius, head_radius),
+            shape: AdornShape::Cone,
+            color: col,
+            always_on_top: true,
+        },
+    ]
+}
+
+/// The green sphere alone: what `Attachment.Visible` draws in Studio, also
+/// while the attachment is not selected.
+pub fn attachment_sphere_draw(xf: Xform) -> AdornDraw {
+    AdornDraw {
+        xf,
+        scale: Vec3::splat(ATTACHMENT_SPHERE_RADIUS),
+        shape: AdornShape::Sphere,
+        color: [
+            ATTACHMENT_SPHERE_COLOR[0],
+            ATTACHMENT_SPHERE_COLOR[1],
+            ATTACHMENT_SPHERE_COLOR[2],
+            ATTACHMENT_GIZMO_ALPHA,
+        ],
+        always_on_top: true,
+    }
+}
+
+/// The 5 draws of an attachment's selection widget at its world frame `xf`:
+/// the green sphere, the yellow `Axis` arrow and the orange `SecondaryAxis`
+/// arrow. Always on top, so an attachment inside a part (most of them) is
+/// still visible. The arrows draw first and the sphere last, so the sphere
+/// hides the shafts where they pass through it.
+pub fn attachment_gizmo_draws(xf: Xform) -> [AdornDraw; 5] {
+    let axis = attachment_arrow_draws(xf.pos, xf.rot.x_axis, ATTACHMENT_AXIS_COLOR);
+    let secondary = attachment_arrow_draws(xf.pos, xf.rot.y_axis, ATTACHMENT_SECONDARY_COLOR);
+    [axis[0], axis[1], secondary[0], secondary[1], attachment_sphere_draw(xf)]
 }
 
 #[repr(C)]
@@ -271,6 +363,7 @@ struct VOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) always_on_top: f32,
 };
 
 @vertex
@@ -285,15 +378,19 @@ fn vs_main(v: VIn) -> VOut {
     out.clip = p.view_proj * vec4<f32>(world, 1.0);
     out.normal = wn;
     out.color = v.color;
+    // scale.w: 1 = alwaysOnTop, 0 = depth-tested against the scene.
+    out.always_on_top = v.scale.w;
     return out;
 }
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
-    let px = vec2<i32>(in.clip.xy);
-    let scene_d = sample_depth(px);
-    if in.clip.z < scene_d {
-        discard;
+    if in.always_on_top < 0.5 {
+        let px = vec2<i32>(in.clip.xy);
+        let scene_d = sample_depth(px);
+        if in.clip.z < scene_d {
+            discard;
+        }
     }
     let n = normalize(in.normal);
     let ndl = max(dot(n, p.light_dir.xyz), 0.0);
@@ -476,7 +573,7 @@ impl AdornPass {
                     r0: [c0.x, c0.y, c0.z, d.xf.pos.x],
                     r1: [c1.x, c1.y, c1.z, d.xf.pos.y],
                     r2: [c2.x, c2.y, c2.z, d.xf.pos.z],
-                    scale: [d.scale.x, d.scale.y, d.scale.z, 0.0],
+                    scale: [d.scale.x, d.scale.y, d.scale.z, if d.always_on_top { 1.0 } else { 0.0 }],
                     color: d.color,
                 }
             })
@@ -554,6 +651,49 @@ mod tests {
         assert!((cone.xf.pos - cyl_end).length() < 1e-4);
         assert!((cone_tip - Vec3::new(10.0, 5.0, -4.0 - 1.8)).length() < 1e-4);
         assert!((cone.scale.y - shaft_len * 0.075).abs() < 1e-5);
+    }
+
+    #[test]
+    fn attachment_gizmo_sphere_and_axis_arrows() {
+        // Rotated so the world axes and the attachment's axes differ.
+        let rot = Mat3::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let xf = Xform { pos: Vec3::new(3.0, 4.0, 5.0), rot };
+        let [axis_shaft, axis_head, secondary_shaft, secondary_head, sphere] = attachment_gizmo_draws(xf);
+
+        // The sphere sits at the attachment, green and on top of everything.
+        assert_eq!(sphere.shape, AdornShape::Sphere);
+        assert!((sphere.xf.pos - xf.pos).length() < 1e-6);
+        assert!((sphere.scale - Vec3::splat(ATTACHMENT_SPHERE_RADIUS)).length() < 1e-6);
+        assert_eq!(sphere.color, [0.0, 1.0, 0.0, ATTACHMENT_GIZMO_ALPHA]);
+        assert!(sphere.always_on_top);
+
+        // The Axis arrow points along the attachment's X axis, yellow.
+        let r = ATTACHMENT_SPHERE_RADIUS;
+        for d in [axis_shaft, axis_head] {
+            assert!(d.always_on_top);
+            assert_eq!(d.color, [1.0, 1.0, 0.0, ATTACHMENT_GIZMO_ALPHA]);
+        }
+        assert_eq!(axis_shaft.shape, AdornShape::Cylinder);
+        let shaft_start = axis_shaft.xf.apply(Vec3::new(-axis_shaft.scale.x, 0.0, 0.0));
+        let shaft_end = axis_shaft.xf.apply(Vec3::new(axis_shaft.scale.x, 0.0, 0.0));
+        let axis = xf.rot.x_axis;
+        assert!((shaft_start - (xf.pos - axis * ATTACHMENT_ARROW_TAIL_R * r)).length() < 1e-4);
+        assert!((shaft_end - (xf.pos + axis * (ATTACHMENT_ARROW_TIP_R - ATTACHMENT_ARROW_HEAD_LEN_R) * r)).length() < 1e-4);
+        assert_eq!(axis_head.shape, AdornShape::Cone);
+        let tip = axis_head.xf.apply(Vec3::new(axis_head.scale.x, 0.0, 0.0));
+        assert!((tip - (xf.pos + axis * ATTACHMENT_ARROW_TIP_R * r)).length() < 1e-4);
+
+        // The SecondaryAxis arrow is orange and points along the Y axis.
+        for d in [secondary_shaft, secondary_head] {
+            assert_eq!(d.color, [1.0, 0.5, 0.0, ATTACHMENT_GIZMO_ALPHA]);
+        }
+        let secondary = xf.rot.y_axis;
+        assert!((secondary_shaft.xf.rot.x_axis - secondary).length() < 1e-5);
+        let tip = secondary_head.xf.apply(Vec3::new(secondary_head.scale.x, 0.0, 0.0));
+        assert!((tip - (xf.pos + secondary * ATTACHMENT_ARROW_TIP_R * r)).length() < 1e-4);
+
+        // The sphere is drawn last, over the shafts passing through it.
+        assert_eq!(attachment_gizmo_draws(xf)[4].shape, AdornShape::Sphere);
     }
 
     #[test]

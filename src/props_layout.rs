@@ -62,6 +62,11 @@ pub enum Frame {
     ModelOrigin,
     /// Model.WorldPivotData (the pivot alone).
     WorldPivot,
+    /// Attachment.CFrame: its frame in the parent part (or Bone).
+    AttachmentCFrame,
+    /// Attachment.WorldCFrame, computed from the part and ancestor Bones;
+    /// setting it writes the local CFrame that puts the attachment there.
+    AttachmentWorldCFrame,
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +169,20 @@ pub fn rows(class: &str, can_collide: bool) -> Vec<Category> {
             rows.retain(|r| matches!(r, Row::Prop(n, _) if n == "PrimaryPart" || n == "Scale"));
             rows.push(Row::Frame("WorldPivot", Frame::WorldPivot));
         }
+        // An Attachment's CFrame and WorldCFrame are edited as Position /
+        // Orientation children, like a part's frame; WorldCFrame is worked
+        // out from the parent part (and Bones) rather than stored.
+        if is("Attachment") {
+            for row in &mut rows {
+                if let Row::Prop(name, _) = row {
+                    match name.as_str() {
+                        "CFrame" if cat == "Transform" => *row = Row::Frame("CFrame", Frame::AttachmentCFrame),
+                        "WorldCFrame" => *row = Row::Frame("WorldCFrame", Frame::AttachmentWorldCFrame),
+                        _ => {}
+                    }
+                }
+            }
+        }
         if rows.is_empty() {
             continue;
         }
@@ -241,6 +260,26 @@ mod tests {
             ("Exposure", &["ExposureCompensation"]),
             ("Fog", &["FogColor", "FogEnd", "FogStart"]),
         ]));
+    }
+
+    /// An Attachment's CFrame and WorldCFrame are Position / Orientation
+    /// frame rows (WorldCFrame is computed; editing it writes the local
+    /// CFrame), and Axis / SecondaryAxis stay plain Vector3 rows.
+    #[test]
+    fn attachment_frames_are_composite_rows() {
+        let cats = rows("Attachment", true);
+        let rows_of = |name: &str| {
+            cats.iter()
+                .find(|c| c.name == name)
+                .map(|c| c.rows.clone())
+                .unwrap_or_default()
+        };
+        assert!(rows_of("Transform").contains(&Row::Frame("CFrame", Frame::AttachmentCFrame)));
+        assert!(rows_of("Derived World Data").contains(&Row::Frame("WorldCFrame", Frame::AttachmentWorldCFrame)));
+        assert!(rows_of("Derived Data").contains(&Row::Prop("Axis".into(), false)));
+        assert!(rows_of("Derived Data").contains(&Row::Prop("SecondaryAxis".into(), false)));
+        assert!(rows_of("Derived World Data").contains(&Row::Prop("WorldAxis".into(), false)));
+        assert!(rows_of("Derived World Data").contains(&Row::Prop("WorldSecondaryAxis".into(), false)));
     }
 
     #[test]

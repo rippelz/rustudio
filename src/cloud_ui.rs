@@ -850,6 +850,11 @@ impl Editor {
         }
         self.game.extra_adorn.clear();
         self.game.extra_highlights.clear();
+        // The editor's own 3D overlays for this frame (the attachment widget;
+        // Team Create cameras add theirs below).
+        if !self.game.is_playing() && !self.clean_view {
+            self.collect_attachment_gizmos();
+        }
         self.cloud.collaborator_labels.clear();
         self.poll_live_team_create(ctx);
         self.collect_debug_collaborators();
